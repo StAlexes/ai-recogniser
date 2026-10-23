@@ -342,6 +342,81 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
             </div>
           </section>
 
+          <section className="settings-card surface" aria-labelledby="settings-rag">
+            <h2 id="settings-rag" className="settings-card-title">
+              База знаний
+            </h2>
+            <p className="settings-card-sub">
+              Подключение к локальному ragkb. Интеграцию можно выключить в любой момент.
+            </p>
+
+            <div className="settings-rows">
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Использовать RAG</span>
+                  <span className="settings-hint">
+                    Поиск и ответы по документам в уже запущенном ragkb.
+                  </span>
+                </div>
+                <div className="settings-control">
+                  <Switch
+                    aria-label="Использовать RAG"
+                    checked={settings.rag_enabled}
+                    onChange={(_event, data) => {
+                      update({ rag_enabled: data.checked });
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Адрес ragkb</span>
+                  <span className="settings-hint">
+                    Обычно http://127.0.0.1:8000. Сервис должен быть запущен отдельно.
+                  </span>
+                </div>
+                <div className="settings-control settings-control-rag">
+                  <Input
+                    className="settings-input-wide"
+                    aria-label="Адрес ragkb"
+                    value={settings.rag_url}
+                    disabled={!settings.rag_enabled}
+                    placeholder="http://127.0.0.1:8000"
+                    onChange={(_event, data) => {
+                      update({ rag_url: data.value });
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Фрагментов в ответе</span>
+                  <span className="settings-hint">
+                    Сколько источников запрашивать у ragkb: от 1 до 20.
+                  </span>
+                </div>
+                <div className="settings-control settings-control-rag-k">
+                  <Input
+                    type="number"
+                    min={1}
+                    max={20}
+                    aria-label="Количество фрагментов RAG"
+                    value={String(settings.rag_k)}
+                    disabled={!settings.rag_enabled}
+                    onChange={(_event, data) => {
+                      const parsed = Number.parseInt(data.value, 10);
+                      if (Number.isFinite(parsed)) {
+                        update({ rag_k: Math.min(20, Math.max(1, parsed)) });
+                      }
+                    }}
+                  />
+                </div>
+              </div>
+            </div>
+          </section>
+
           <section className="settings-card surface" aria-labelledby="settings-data">
             <div className="settings-card-head">
               <h2 id="settings-data" className="settings-card-title">

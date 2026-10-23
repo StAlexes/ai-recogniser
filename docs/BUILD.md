@@ -1,15 +1,15 @@
 # Сборка нативного exe
 
-Документ описывает M0-сборку десктопного приложения. Установщик Inno Setup, подпись кода и
-офлайн-бандл моделей появятся на этапе M6; здесь — рабочая one-folder сборка, которую можно
-запускать без Python.
+Документ описывает M1-сборку десктопного приложения: one-folder exe с ядром, UI и ASR-стеком.
+Установщик Inno Setup, подпись кода и офлайн-бандл моделей появятся на этапе M6; здесь — рабочая
+сборка, которую можно запускать без Python.
 
 ## Что получается
 
 ```
 dist\AI Recogniser\
   AI Recogniser.exe      # оболочка + точка входа ядра, без консоли
-  _internal\             # CPython, библиотеки, UI, иконки, .NET-сборки WebView2
+  _internal\             # CPython, библиотеки, UI, иконки, ASR, ffmpeg, .NET-сборки WebView2
 ```
 
 `AI Recogniser.exe` — обычный Windows GUI-процесс. При старте он поднимает ядро тем же exe с
@@ -21,19 +21,23 @@ One-folder выбран осознанно: при one-file PyInstaller расп
 а дочерний процесс ядра распаковывал бы его второй раз. Для архитектуры «shell + core worker»
 это заметно увеличивает старт и расход диска. Готовый установщик сможет упаковать эту папку.
 
+Текущий размер сборки (2026-10-23): **`AI Recogniser.exe` ~14.6 МБ**, `_internal` **~210.8 МБ**,
+769 файлов. Модель GigaAM (~215 МБ) в поставку не входит и скачивается при первом распознавании.
+
 ## Требования к сборочной машине
 
 - Windows 10/11 x64.
 - Python 3.12+ (проверено на 3.13) и venv `.venv`.
 - Node.js 20.19+ и npm — для сборки UI.
-- Зависимости: `pip install -e ".[dev,shell,build]"`.
+- Зависимости: `pip install -e ".[dev,shell,asr,build]"`.
 - WebView2 Runtime на машине разработчика (на Windows 11 есть из коробки).
+- Сеть для первой загрузки модели GigaAM; сам exe собирается офлайн, если модель уже в кэше.
 
 ## Команды
 
 ```powershell
 # из корня репозитория
-.\.venv\Scripts\pip install -e ".[dev,shell,build]"
+.\.venv\Scripts\pip install -e ".[dev,shell,asr,build]"
 
 # UI + PyInstaller
 powershell -ExecutionPolicy Bypass -File tools\build_exe.ps1
@@ -44,7 +48,8 @@ powershell -ExecutionPolicy Bypass -File tools\build_exe.ps1 -SkipUi
 
 Скрипт собирает UI (`npm.cmd run build`), затем запускает PyInstaller со
 [`packaging/airec.spec`](../packaging/airec.spec). Артефакты: `dist\` и `build\pyinstaller\`,
-оба каталога исключены из git.
+оба каталога исключены из git. Полный лог PyInstaller пишется в `build\pyinstaller.log`; скрипт
+проверяет реальный exit code и не маскирует ошибки stderr.
 
 PyInstaller — только сборочная зависимость (extra `build`), в рантайм приложения не входит.
 
@@ -58,6 +63,16 @@ PyInstaller — только сборочная зависимость (extra `b
 | `clr_loader`, `pythonnet` | пакеты | загрузка .NET в pywebview |
 | `pystray` | пакет | трей, backend `_win32` |
 | `uvicorn`/`anyio` | пакеты | динамические импорты ASGI-сервера |
+| `onnxruntime\` | пакет onnxruntime | CPU-инференс ASR (`onnxruntime.dll` ~18.4 МБ) |
+| `onnx_asr\` | пакет onnx-asr | загрузка/запуск GigaAM |
+| `numpy\`, `yaml\`, `huggingface_hub\` | зависимости ASR | массивы, конфиг, загрузка модели |
+| `imageio_ffmpeg\binaries\ffmpeg-*.exe` | imageio-ffmpeg | извлечение аудио из видео и конвертация (ffmpeg ~83.6 МБ) |
+| `multipart\`, `python_multipart\` | python-multipart | приём загруженных файлов |
+
+Спецификация использует `collect_all` для `onnx_asr`, `onnxruntime`, `imageio_ffmpeg` и
+`python-multipart`, потому что часть импортов и бинарников создаётся динамически и не видна
+статическому анализатору PyInstaller. Предупреждение `onnxruntime.quantization requires onnx`
+безвредно: квантование приложению не нужно, ASR-модель уже в int8.
 
 Метаданные exe (версия файла, продукт, copyright) заданы в
 [`packaging/version_info.txt`](../packaging/version_info.txt). При смене версии приложения
@@ -66,7 +81,7 @@ API и UI.
 
 ## Пути в frozen-режиме
 
-- `resource_root()` (`sys._MEIPASS`) — только чтение: UI, иконки, будущие встроенные бинарники.
+- `resource_root()` (`sys._MEIPASS`) — только чтение: UI, иконки, встроенные бинарники.
 - `app_root()` — каталог exe: `portable.flag`, portable-данные, `bin`.
 - `data_root()` — `%LOCALAPPDATA%\AIRecogniser` или `<exe>\data` в portable-режиме.
 - Логи: `<data>\logs\shell.log`, `app.log`, `core.out.log` (stdout ядра), `crash.log`.
@@ -76,35 +91,99 @@ API и UI.
 
 ## Проверка сборки
 
-1. **Smoke-тест** (окно не открывается, ядро и UI проверяются по HTTP):
+### 1. Smoke-тест
 
-   ```powershell
-   $env:AIREC_DATA_DIR = "$env:TEMP\airec-exe-smoke"
-   .\dist\AI Recogniser\AI Recogniser.exe --smoke-test
-   $LASTEXITCODE   # ожидается 0
-   ```
+Окно не открывается; shell поднимает ядро и проверяет health/UI по HTTP.
 
-   Exe собран без консоли, поэтому JSON не печатается; результат и причина ошибки — в
-   `<data>\logs\shell.log`.
+```powershell
+$smoke = Join-Path $env:TEMP "airec-exe-smoke"
+Remove-Item -Recurse -Force $smoke -ErrorAction SilentlyContinue
+$env:AIREC_DATA_DIR = $smoke
+$out = Join-Path $env:TEMP "airec-smoke-out.txt"
+$p = Start-Process -FilePath ".\dist\AI Recogniser\AI Recogniser.exe" `
+    -ArgumentList "--smoke-test" -Wait -PassThru `
+    -RedirectStandardOutput $out
+$p.ExitCode     # ожидается 0
+Get-Content $out -Encoding utf8
+```
 
-2. **GUI**: запустить exe, проверить очередь/базу знаний/модели/настройки, трей и закрытие.
-   При `close_to_tray=false` закрытие окна завершает процесс и ядро; `session.json` удаляется.
+В текущей сборке JSON печатается в stdout, например
+`{"ok": true, "port": 12120, "version": "0.1.0.dev0", "ui_built": true}`; тот же результат
+пишется в `<data>\logs\shell.log`. Используйте `Start-Process -Wait`, потому что GUI-exe,
+запущенный через `&`, не всегда дожидается завершения в PowerShell.
 
-3. **Portable**: скопировать папку в другое место, создать рядом с exe `portable.flag`,
-   запустить. Данные должны появиться в `<папка>\data`, в `%LOCALAPPDATA%` — ничего нового.
+### 2. Распознавание в frozen-ядре
 
-4. **Single instance**: второй запуск exe должен завершиться сразу, оставив одно окно и одно ядро.
+Проверяет, что внутри exe действительно есть ffmpeg, ONNX Runtime и onnx-asr. Запустите ядро
+отдельно (для теста без токена) и отправьте mp3:
 
-5. **Автономность**: проверить папку на машине без Python (чистая Windows VM или Windows Sandbox).
+```powershell
+$data = Join-Path $env:TEMP "airec-exe-run"
+Remove-Item -Recurse -Force $data -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $data | Out-Null
+$env:AIREC_DATA_DIR = $data
+$core = Start-Process -FilePath ".\dist\AI Recogniser\AI Recogniser.exe" `
+    -ArgumentList "--core-worker", "--port", "8766", "--no-auth" `
+    -WorkingDirectory ".\dist\AI Recogniser" -PassThru
+
+Invoke-RestMethod http://127.0.0.1:8766/api/v1/health
+
+$job = curl.exe -s -F "file=@data/poc/gigaam-example.mp3;type=audio/mpeg" `
+    http://127.0.0.1:8766/api/v1/jobs | ConvertFrom-Json
+Invoke-RestMethod "http://127.0.0.1:8766/api/v1/jobs/$($job.id)"
+Get-Content "$data\results\$($job.id)\transcript.txt" -Encoding utf8
+
+Stop-Process -Id $core.Id
+```
+
+Ожидается статус `done`, корректный русский текст и файл `transcript.txt`. Первый запуск
+включает загрузку модели и поэтому медленнее; затем RTFx заметно выше.
+
+### 3. RAG в frozen-ядре
+
+Нужен отдельно запущенный `ragkb` на `http://127.0.0.1:8000`.
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8766/api/v1/rag/status
+Invoke-RestMethod "http://127.0.0.1:8766/api/v1/rag/search?q=SSL&k=2"
+Invoke-RestMethod -Method Post -ContentType "application/json" `
+    -Body '{"question":"Что такое SSL?","k":2}' `
+    http://127.0.0.1:8766/api/v1/rag/ask
+```
+
+Если `ragkb` не запущен, status должен вернуть `reachable: false` с понятной ошибкой, а
+распознавание — продолжать работать.
+
+### 4. GUI и оболочка
+
+Запустить exe, проверить очередь/базу знаний/модели/настройки, трей и закрытие.
+При `close_to_tray=false` закрытие окна завершает процесс и ядро; `session.json` удаляется.
+
+### 5. Portable и single instance
+
+Скопировать папку в другое место, создать рядом с exe `portable.flag`, запустить. Данные должны
+появиться в `<папка>\data`, в `%LOCALAPPDATA%` — ничего нового. Второй запуск exe должен
+завершиться сразу, оставив одно окно и одно ядро.
+
+### 6. Автономность
+
+Проверить папку на машине без Python (чистая Windows VM или Windows Sandbox). Для первого
+распознавания нужна сеть (скачивание GigaAM); после кэширования модели — офлайн.
 
 Для отладки UI внутри WebView2 можно задать `AIREC_DEBUG_PORT=9222`; тогда pywebview включает
 CDP только на loopback. В обычном запуске порт не открывается.
 
-## Ограничения M0-сборки
+## Ограничения текущей сборки
 
-- Нет ASR/ffmpeg/LLM: это каркас M0, распознавание появится в M1. Поэтому exe пока небольшой
-  (~11 МБ exe + ~67 МБ `_internal`).
-- Нет установщика, обновлений и ассоциаций файлов — этап M6.
-- Exe не подписан; SmartScreen может предупредить. Подпись появится при наличии сертификата.
-- На Windows 10 нужен WebView2 Runtime; установщик позже добавит bootstrapper/проверку.
-- One-folder нужно распространять целиком; один exe без `_internal` не работает.
+- **ASR:** только GigaAM v3 e2e CTC int8 на CPU; нет VAD, таймкодов, сегментов и диаризации.
+- **Очередь:** in-memory, один worker; нет SQLite, отмены, повтора и настройки параллелизма.
+  Незавершённая задача после перезапуска помечается как прерванная.
+- **Результаты:** только `.txt`; экспорт SRT/VTT/Markdown — позже.
+- **RAG:** внешний `ragkb`; индекс и модель не входят в exe. Без сервиса доступность RAG
+  показывается как ошибка, остальное приложение работает.
+- **Модель:** GigaAM скачивается при первом запуске; офлайн-бандл — M6.
+- **ffmpeg:** используется GPLv3-бинарник из `imageio-ffmpeg 0.6.0`; до релиза нужна LGPL-сборка
+  или GPL-совместимая поставка (см. `docs/LICENSES.md`).
+- **Установка:** нет установщика, обновлений, ассоциаций файлов и подписи; SmartScreen может
+  предупредить. One-folder нужно распространять целиком; один exe без `_internal` не работает.
+- **Windows 10:** нужен WebView2 Runtime; установщик позже добавит bootstrapper/проверку.

@@ -69,11 +69,39 @@ def test_settings_update_persists(tmp_path: Path) -> None:
         assert (tmp_path / "config.json").exists()
 
 
-def test_jobs_stub(tmp_path: Path) -> None:
+def test_jobs_empty_and_upload_validation(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
         headers = {"Authorization": f"Bearer {TOKEN}"}
         assert client.get("/api/v1/jobs", headers=headers).json()["total"] == 0
-        assert client.post("/api/v1/jobs", headers=headers).status_code == 501
+        assert client.post("/api/v1/jobs", headers=headers).status_code == 422
+        response = client.post(
+            "/api/v1/jobs",
+            headers=headers,
+            files={"file": ("notes.txt", b"not audio", "text/plain")},
+        )
+        assert response.status_code == 400
+        assert "формат" in response.json()["detail"]
+
+
+def test_rag_is_disabled_cleanly(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        headers = {"Authorization": f"Bearer {TOKEN}"}
+        current = client.get("/api/v1/settings", headers=headers).json()
+        current["rag_enabled"] = False
+        assert client.put("/api/v1/settings", json=current, headers=headers).status_code == 200
+
+        status = client.get("/api/v1/rag/status", headers=headers)
+        assert status.status_code == 200
+        assert status.json()["enabled"] is False
+        assert status.json()["reachable"] is False
+        assert client.get("/api/v1/rag/search?q=test", headers=headers).status_code == 409
+
+
+def test_job_result_endpoints_require_ready_job(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        headers = {"Authorization": f"Bearer {TOKEN}"}
+        assert client.get("/api/v1/jobs/missing", headers=headers).status_code == 404
+        assert client.get("/api/v1/jobs/missing/result", headers=headers).status_code == 404
 
 
 def test_models_catalog(tmp_path: Path) -> None:

@@ -1,0 +1,300 @@
+"""In-process ASR job queue.
+
+M1 deliberately keeps the queue small: one worker, in-memory state and a small
+JSON result folder.  That is enough to upload a file, follow progress and get a
+transcript without adding SQLite before the data model is settled.  Metadata is
+persisted per job so finished work survives a restart and can be read again.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+import threading
+import uuid
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from airec.asr.audio import SUPPORTED_EXTENSIONS, find_ffmpeg
+from airec.asr.service import AsrError, TranscriptionResult, transcribe
+from airec.core.config import Settings
+from airec.core.paths import AppPaths
+
+log = logging.getLogger(__name__)
+
+JOB_SCHEMA = 1
+MAX_INPUT_BYTES = 4 * 1024 * 1024 * 1024
+ACTIVE_STATUSES = {"queued", "running"}
+
+Transcriber = Callable[..., TranscriptionResult]
+
+
+class JobValidationError(ValueError):
+    """The uploaded input is not a supported audio/video file."""
+
+
+def utc_now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _safe_name(name: str) -> str:
+    candidate = Path(name or "audio").name.strip()
+    if candidate in {"", ".", ".."}:
+        return "audio"
+    return candidate
+
+
+@dataclass
+class Job:
+    id: str
+    filename: str
+    status: str = "queued"
+    progress: float = 0.0
+    phase: str = "В очереди"
+    created_at: str = field(default_factory=utc_now)
+    started_at: str | None = None
+    finished_at: str | None = None
+    model: str = ""
+    duration_s: float | None = None
+    elapsed_s: float | None = None
+    rtf: float | None = None
+    size_bytes: int = 0
+    audio_format: str = ""
+    text: str = ""
+    error: str | None = None
+    result_file: str | None = None
+
+    def summary(self) -> dict[str, Any]:
+        data = asdict(self)
+        data.pop("text", None)
+        data.pop("result_file", None)
+        return data
+
+    def detail(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["result_url"] = (
+            f"/api/v1/jobs/{self.id}/result" if self.status == "done" else None
+        )
+        return data
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> Job:
+        known = set(cls.__dataclass_fields__)
+        return cls(**{key: value for key, value in payload.items() if key in known})
+
+
+class JobManager:
+    def __init__(
+        self,
+        paths: AppPaths,
+        settings_provider: Callable[[], Settings],
+        *,
+        transcriber: Transcriber = transcribe,
+    ) -> None:
+        self._paths = paths
+        self._settings = settings_provider
+        self._transcriber = transcriber
+        self._jobs: dict[str, Job] = {}
+        self._futures: dict[str, Future[None]] = {}
+        self._lock = threading.RLock()
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="airec-asr")
+        self._ffmpeg = find_ffmpeg(paths.bin)
+        self._load_existing()
+
+    @property
+    def results_dir(self) -> Path:
+        return self._paths.results
+
+    @property
+    def max_input_bytes(self) -> int:
+        return MAX_INPUT_BYTES
+
+    def _job_dir(self, job_id: str) -> Path:
+        return self._paths.results / job_id
+
+    def _job_meta_path(self, job_id: str) -> Path:
+        return self._job_dir(job_id) / "job.json"
+
+    def _persist(self, job: Job) -> None:
+        directory = self._job_dir(job.id)
+        directory.mkdir(parents=True, exist_ok=True)
+        target = self._job_meta_path(job.id)
+        tmp = target.with_suffix(".json.tmp")
+        payload = json.dumps(asdict(job), ensure_ascii=False, indent=2)
+        with tmp.open("w", encoding="utf-8", newline="\n") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+
+    def _load_existing(self) -> None:
+        if not self.results_dir.exists():
+            return
+        for directory in sorted(self.results_dir.iterdir(), reverse=True):
+            if not directory.is_dir():
+                continue
+            meta = directory / "job.json"
+            if not meta.is_file():
+                continue
+            try:
+                payload = json.loads(meta.read_text(encoding="utf-8-sig"))
+                job = Job.from_dict(payload)
+            except (OSError, ValueError, TypeError) as exc:
+                log.warning("cannot read job metadata %s: %s", meta, exc)
+                continue
+            if job.status in ACTIVE_STATUSES:
+                # The process stopped before the worker finished.
+                job.status = "error"
+                job.phase = "Прервано"
+                job.error = "Задача была прервана при закрытии приложения. Запустите её снова."
+                job.finished_at = utc_now()
+                with self._lock:
+                    try:
+                        self._persist(job)
+                    except OSError:
+                        log.exception("cannot persist interrupted job %s", job.id)
+            with self._lock:
+                self._jobs[job.id] = job
+
+    def submit(self, uploaded: Path, original_name: str, model_id: str) -> Job:
+        filename = _safe_name(original_name)
+        suffix = Path(filename).suffix.lower()
+        if suffix not in SUPPORTED_EXTENSIONS:
+            raise JobValidationError(
+                "Неподдерживаемый формат файла. Используйте mp3, mp4, m4a, wav, "
+                "flac, ogg, opus, mkv, mov, webm или avi."
+            )
+        if not uploaded.is_file():
+            raise JobValidationError("Загруженный файл не найден.")
+        size = uploaded.stat().st_size
+        if size <= 0:
+            raise JobValidationError("Файл пуст.")
+        if size > MAX_INPUT_BYTES:
+            raise JobValidationError("Файл больше 4 ГБ.")
+
+        job_id = f"{datetime.now(UTC):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}"
+        work_dir = self._paths.temp / "jobs" / job_id
+        work_dir.mkdir(parents=True, exist_ok=True)
+        source = work_dir / f"input{suffix}"
+        shutil.move(str(uploaded), source)
+
+        job = Job(
+            id=job_id,
+            filename=filename,
+            model=model_id,
+            size_bytes=size,
+            audio_format=suffix.lstrip("."),
+        )
+        with self._lock:
+            self._jobs[job.id] = job
+            try:
+                self._persist(job)
+            except OSError:
+                log.exception("cannot persist new job %s", job.id)
+            future = self._executor.submit(self._run, job.id, source, work_dir)
+            self._futures[job.id] = future
+        return job
+
+    def _run(self, job_id: str, source: Path, work_dir: Path) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            job.status = "running"
+            job.phase = "Запуск"
+            job.started_at = utc_now()
+            job.progress = 0.02
+            try:
+                self._persist(job)
+            except OSError:
+                log.exception("cannot persist started job %s", job.id)
+            settings = self._settings()
+
+        def progress(value: float, phase: str) -> None:
+            with self._lock:
+                current = self._jobs.get(job_id)
+                if current is None:
+                    return
+                current.progress = max(current.progress, min(max(value, 0.0), 0.99))
+                current.phase = phase
+
+        try:
+            result = self._transcriber(
+                source,
+                model_id=job.model,
+                cpu_threads=settings.cpu_threads,
+                ffmpeg=self._ffmpeg,
+                work_dir=work_dir,
+                progress=progress,
+            )
+            transcript_path = self._job_dir(job_id) / "transcript.txt"
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            transcript_path.write_text(result.text + "\n", encoding="utf-8", newline="\n")
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if job is None:
+                    return
+                job.status = "done"
+                job.phase = "Готово"
+                job.progress = 1.0
+                job.finished_at = utc_now()
+                job.text = result.text
+                job.duration_s = result.duration_s
+                job.elapsed_s = result.elapsed_s
+                job.rtf = result.rtf
+                job.result_file = str(transcript_path)
+                try:
+                    self._persist(job)
+                except OSError:
+                    log.exception("cannot persist finished job %s", job.id)
+            if not settings.keep_extracted_audio:
+                self._cleanup_source(work_dir)
+        except Exception as exc:  # worker boundary: never let a job kill the queue
+            message = str(exc) if isinstance(exc, AsrError) else f"Ошибка обработки: {exc}"
+            log.exception("job %s failed: %s", job_id, exc)
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if job is None:
+                    return
+                job.status = "error"
+                job.phase = "Ошибка"
+                job.progress = 1.0
+                job.error = message
+                job.finished_at = utc_now()
+                try:
+                    self._persist(job)
+                except OSError:
+                    log.exception("cannot persist failed job %s", job.id)
+
+    @staticmethod
+    def _cleanup_source(work_dir: Path) -> None:
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except OSError:
+            log.warning("cannot remove temporary job directory %s", work_dir)
+
+    def list(self) -> list[dict[str, Any]]:
+        with self._lock:
+            jobs = sorted(self._jobs.values(), key=lambda item: item.created_at, reverse=True)
+            return [job.summary() for job in jobs]
+
+    def get(self, job_id: str) -> Job | None:
+        with self._lock:
+            return self._jobs.get(job_id)
+
+    def result_path(self, job_id: str) -> Path | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status != "done" or not job.result_file:
+                return None
+            path = Path(job.result_file)
+            return path if path.is_file() else None
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)

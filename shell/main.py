@@ -792,7 +792,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         LOG.exception("fatal shell error")
         message_box(
-            f"Не удалось запустить {APP_TITLE}.\n\n{exc}\n\nПодробности: {log_file}"  # noqa: RUF001
+            f"Не удалось запустить {APP_TITLE}.\n\n{exc}\n\nПодробности: {log_file}"
         )
         return 1
     finally:

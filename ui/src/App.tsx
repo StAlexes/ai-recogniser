@@ -70,9 +70,9 @@ export function App() {
   const renderPage = (): ReactNode => {
     switch (page) {
       case 'queue':
-        return <QueuePage />;
+        return <QueuePage onAuthError={handleAuthError} />;
       case 'knowledge':
-        return <KnowledgePage />;
+        return <KnowledgePage onAuthError={handleAuthError} />;
       case 'models':
         return <ModelsPage onAuthError={handleAuthError} />;
       case 'settings':

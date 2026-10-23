@@ -14,7 +14,7 @@ $Ui = Join-Path $Root "ui"
 $Exe = Join-Path $Root "dist\AI Recogniser\AI Recogniser.exe"
 
 if (-not (Test-Path $Python)) {
-    throw "Python venv not found: $Python. Create it and install '.[dev,shell,build]'."
+    throw "Python venv not found: $Python. Create it and install '.[dev,shell,asr,build]'."
 }
 if (-not (Test-Path $Spec)) {
     throw "PyInstaller spec not found: $Spec"
@@ -39,14 +39,28 @@ if (-not (Test-Path (Join-Path $Ui "dist\index.html"))) {
     throw "UI build is missing: ui\dist\index.html. Run without -SkipUi first."
 }
 
+$BuildDir = Join-Path $Root "build"
+$BuildLog = Join-Path $BuildDir "pyinstaller.log"
+New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
+
+# PyInstaller writes progress and harmless warnings to stderr. Windows
+# PowerShell 5.1 turns native stderr into a NativeCommandError when
+# $ErrorActionPreference is Stop, so temporarily switch to Continue, capture
+# everything in a log and then check the real exit code.
+$PreviousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 & $Python -m PyInstaller `
     --noconfirm `
     --clean `
     --distpath (Join-Path $Root "dist") `
-    --workpath (Join-Path $Root "build\pyinstaller") `
-    $Spec
-if ($LASTEXITCODE -ne 0) {
-    throw "PyInstaller failed with exit code $LASTEXITCODE"
+    --workpath (Join-Path $BuildDir "pyinstaller") `
+    $Spec 2>&1 | Out-File -FilePath $BuildLog -Encoding utf8
+$BuildCode = $LASTEXITCODE
+$ErrorActionPreference = $PreviousErrorActionPreference
+Get-Content $BuildLog -Tail 80 | Write-Host
+if ($BuildCode -ne 0) {
+    Write-Host "Full build log: $BuildLog"
+    throw "PyInstaller failed with exit code $BuildCode"
 }
 if (-not (Test-Path $Exe)) {
     throw "Build finished but exe is missing: $Exe"

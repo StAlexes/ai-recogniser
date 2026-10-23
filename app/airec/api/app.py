@@ -15,7 +15,9 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from airec.api import jobs, models, system
+from airec.api import rag as rag_api
 from airec.api import settings as settings_api
+from airec.asr.manager import JobManager
 from airec.core.config import Settings
 from airec.core.paths import AppPaths
 from airec.core.security import TokenAuthMiddleware
@@ -58,8 +60,13 @@ def create_app(
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         log.info("core started: version=%s port=%s data=%s", __version__, port, paths.data)
-        yield
-        log.info("core stopped")
+        try:
+            yield
+        finally:
+            manager = getattr(application.state, "jobs", None)
+            if manager is not None:
+                manager.shutdown()
+            log.info("core stopped")
 
     app = FastAPI(
         title="AI Recogniser Core",
@@ -75,6 +82,7 @@ def create_app(
     app.state.pid = os.getpid()
     app.state.port = port
     app.state.started_at = time.time()
+    app.state.jobs = JobManager(paths, lambda: app.state.settings)
 
     app.add_middleware(TokenAuthMiddleware, token=token, enabled=auth_enabled)
     app.add_middleware(
@@ -88,6 +96,7 @@ def create_app(
     app.include_router(settings_api.router)
     app.include_router(jobs.router)
     app.include_router(models.router)
+    app.include_router(rag_api.router)
 
     @app.get("/healthz", include_in_schema=False)
     def healthz() -> dict[str, str]:

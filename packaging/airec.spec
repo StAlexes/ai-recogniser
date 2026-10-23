@@ -31,17 +31,37 @@ hiddenimports = [
     "uvicorn.lifespan.off",
     "anyio._backends._asyncio",
     "airec.api.app",
+    "airec.api.rag",
+    "airec.asr.audio",
+    "airec.asr.manager",
+    "airec.asr.service",
+    "airec.rag.client",
+    "multipart",
+    "python_multipart",
 ]
 
 # pywebview ships WebView2 .NET assemblies and helper DLLs; pythonnet/clr_loader
 # load them dynamically, so PyInstaller cannot discover them by static imports.
-for package in ("webview", "clr_loader", "pythonnet", "pystray"):
+# The ASR stack is also dynamic: onnx-asr imports onnxruntime at runtime, and
+# imageio-ffmpeg contains the ffmpeg executable as package data.
+for package in (
+    "webview",
+    "clr_loader",
+    "pythonnet",
+    "pystray",
+    "onnx_asr",
+    "onnxruntime",
+    "imageio_ffmpeg",
+    "multipart",
+    "python_multipart",
+):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(package)
     datas += pkg_datas
     binaries += pkg_binaries
     hiddenimports += pkg_hidden
 
 hiddenimports += collect_submodules("uvicorn")
+hiddenimports += collect_submodules("onnx_asr")
 
 a = Analysis(
     [str(ROOT / "shell" / "main.py")],

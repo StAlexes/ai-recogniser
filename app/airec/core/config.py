@@ -41,6 +41,12 @@ class Settings(BaseModel):
     max_parallel_jobs: int = Field(default=1, ge=1, le=8)
     external_llm_enabled: bool = False
 
+    # ragkb runs as a separate, local HTTP service.  It is optional: when it is
+    # unavailable, transcription and the rest of the core keep working.
+    rag_enabled: bool = True
+    rag_url: str = "http://127.0.0.1:8000"
+    rag_k: int = Field(default=5, ge=1, le=20)
+
 
 def load_settings(path: Path) -> Settings:
     """Read settings, falling back to defaults and preserving a corrupt file."""

@@ -25,6 +25,75 @@ export interface Settings {
   cpu_threads: number;
   max_parallel_jobs: number;
   external_llm_enabled: boolean;
+  rag_enabled: boolean;
+  rag_url: string;
+  rag_k: number;
+}
+
+export type JobStatus = 'queued' | 'running' | 'done' | 'error';
+
+export interface JobSummary {
+  id: string;
+  filename: string;
+  status: JobStatus;
+  progress: number;
+  phase: string;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  model: string;
+  duration_s: number | null;
+  elapsed_s: number | null;
+  rtf: number | null;
+  size_bytes: number;
+  audio_format: string;
+  error: string | null;
+}
+
+export interface JobDetail extends JobSummary {
+  text: string;
+  result_file: string | null;
+  result_url: string | null;
+}
+
+export interface JobsResponse {
+  items: JobSummary[];
+  total: number;
+}
+
+export interface RagStatus {
+  enabled: boolean;
+  configured_url: string;
+  reachable: boolean;
+  latency_ms: number | null;
+  chunks: number | null;
+  indexing: boolean | null;
+  gen_model: string | null;
+  error: string | null;
+}
+
+export interface RagSource {
+  id?: number;
+  source: string;
+  breadcrumb: string;
+  text: string;
+  position?: number;
+  score?: number;
+  dense?: number;
+  lexical?: number;
+  exact?: boolean | string;
+  match?: string;
+}
+
+export interface RagSearchResponse {
+  query: string;
+  results: RagSource[];
+}
+
+export interface RagAskResponse {
+  question: string;
+  answer: string;
+  sources: RagSource[];
 }
 
 export interface HealthResponse {
@@ -295,4 +364,85 @@ export function getSystemProfile(): Promise<SystemProfile> {
   return request<SystemProfile>('/api/v1/system/profile', {
     timeoutMs: 20_000,
   });
+}
+
+export function getRagStatus(): Promise<RagStatus> {
+  return request<RagStatus>('/api/v1/rag/status', { timeoutMs: 8_000 });
+}
+
+export function searchRag(query: string, k?: number): Promise<RagSearchResponse> {
+  const params = new URLSearchParams({ q: query });
+  if (k !== undefined) {
+    params.set('k', String(k));
+  }
+  return request<RagSearchResponse>(`/api/v1/rag/search?${params.toString()}`, {
+    timeoutMs: 50_000,
+  });
+}
+
+export function askRag(question: string, k?: number): Promise<RagAskResponse> {
+  return request<RagAskResponse>('/api/v1/rag/ask', {
+    method: 'POST',
+    body: { question, ...(k === undefined ? {} : { k }) },
+    timeoutMs: 250_000,
+  });
+}
+
+export function getJobs(): Promise<JobsResponse> {
+  return request<JobsResponse>('/api/v1/jobs', { timeoutMs: 10_000 });
+}
+
+export function getJob(jobId: string): Promise<JobDetail> {
+  return request<JobDetail>(`/api/v1/jobs/${encodeURIComponent(jobId)}`, {
+    timeoutMs: 15_000,
+  });
+}
+
+/** Upload one file to the local core and return the queued job. */
+export async function uploadJob(file: File): Promise<JobDetail> {
+  const timeoutMs = 600_000;
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  const headers = new Headers();
+  headers.set('Accept', 'application/json');
+  if (token !== null) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+  const form = new FormData();
+  form.append('file', file, file.name);
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}/api/v1/jobs`, {
+      method: 'POST',
+      headers,
+      body: form,
+      credentials: 'same-origin',
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+  } catch {
+    if (controller.signal.aborted) {
+      throw new ApiError(0, 'Загрузка файла заняла слишком много времени.');
+    }
+    throw new ApiError(0, 'Не удалось передать файл ядру приложения.');
+  } finally {
+    window.clearTimeout(timer);
+  }
+
+  if (response.status === 401) {
+    throw new AuthError();
+  }
+  if (!response.ok) {
+    const detail = await readErrorDetail(response);
+    throw new ApiError(
+      response.status,
+      detail ?? `Ядро вернуло ошибку загрузки (HTTP ${response.status}).`,
+    );
+  }
+  try {
+    return (await response.json()) as JobDetail;
+  } catch {
+    throw new ApiError(response.status, 'Ядро вернуло некорректный ответ на загрузку.');
+  }
 }
