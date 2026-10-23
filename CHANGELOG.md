@@ -29,14 +29,24 @@
   RTFx **56.8**, загрузка 1.7 с, peak RSS **352 МБ**, корректная пунктуация. DirectML (отдельный
   runtime, ORT 1.24.4) — RTFx 49.3 и 622 МБ RSS: iGPU Radeon 780M проигрывает CPU, дефолт CPU.
   Подробности: `docs/M0-NOTES.md`, воспроизводимый скрипт `tools/poc_gigaam.py`.
+- **M0, нативная сборка:** PyInstaller one-folder (`packaging/airec.spec`,
+  `tools/build_exe.ps1`) собирает `AI Recogniser.exe` + `_internal` без Python на целевой машине.
+  В frozen-режиме оболочка запускает ядро тем же exe с внутренним флагом `--core-worker`,
+  UI и иконки читаются из `sys._MEIPASS`, данные — из `%LOCALAPPDATA%` или portable-папки.
+  Добавлены extra `build`, метаданные версии exe и `docs/BUILD.md`; opt-in `AIREC_DEBUG_PORT`
+  для проверки WebView2 через CDP.
 - CI: отдельные job'ы для ядра (ruff + pytest) и UI (typecheck + build); UI-job запускается,
   когда в репозитории есть `ui/package.json`.
 
 ### Changed
 - Проект переведён на лицензию MIT (`LICENSE`, `pyproject.toml`); сторонние компоненты и модели
   перечислены в `docs/LICENSES.md`.
+- Схема поставки уточнена: вместо отдельного `runtime\python.exe` используется one-folder
+  PyInstaller-сборка, где shell и core worker — один и тот же exe (`docs/PLAN.md`).
 
 ### Fixed
+- В frozen-сборке UI и иконки больше не ищутся относительно папки exe: добавлен
+  `resource_root()` (`sys._MEIPASS`), поэтому окно и токен-хендшейк работают из любой папки.
 - Полноэкранные оверлеи тултипов Fluent UI: `FluentProvider` копировал стили корня на mount-узлы
   порталов, из-за чего страницы с подсказками накрывались непрозрачным слоем. Отключено через
   `applyStylesToPortals={false}`; порталы по-прежнему получают переменные темы.

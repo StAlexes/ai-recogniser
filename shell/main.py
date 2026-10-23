@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
-from airec.core.paths import APP_TITLE, AppPaths
+from airec.core.paths import APP_TITLE, AppPaths, resource_root
 from airec.version import __version__
 
 try:  # `python -m shell.main`
@@ -388,15 +388,21 @@ def _spawn_core(paths: AppPaths) -> CoreHandle:
 
     root = repo_root()
     env = os.environ.copy()
-    app_dir = str(root / "app")
-    python_path = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = app_dir + (os.pathsep + python_path if python_path else "")
+    frozen = getattr(sys, "frozen", False)
+    if frozen:
+        # The bundled exe is both the shell and the core worker.
+        command = [sys.executable, "--core-worker"]
+        env.pop("PYTHONPATH", None)
+    else:
+        app_dir = str(root / "app")
+        python_path = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = app_dir + (os.pathsep + python_path if python_path else "")
+        command = [sys.executable, "-m", "airec"]
 
     paths.logs.mkdir(parents=True, exist_ok=True)
     log_path = paths.logs / "core.out.log"
     log_stream = log_path.open("a", encoding="utf-8", buffering=1)
 
-    command = [sys.executable, "-m", "airec"]
     LOG.info("starting core: %s (cwd=%s, log=%s)", subprocess.list2cmdline(command), root, log_path)
     spawn_time = time.time()
     try:
@@ -470,7 +476,10 @@ def start_core(paths: AppPaths) -> CoreHandle:
 
 
 def _asset(name: str) -> Path | None:
-    candidates = [Path(__file__).resolve().parent / "assets" / name]
+    candidates = [
+        resource_root() / "assets" / name,
+        Path(__file__).resolve().parent / "assets" / name,
+    ]
     if getattr(sys, "frozen", False):
         candidates.insert(0, Path(sys.executable).resolve().parent / "assets" / name)
     for path in candidates:
@@ -652,6 +661,15 @@ def run_gui(paths: AppPaths) -> int:
 
     from airec.core.config import load_settings
 
+    # Opt-in CDP endpoint for automated UI checks; never enabled by default.
+    debug_port = os.environ.get("AIREC_DEBUG_PORT", "").strip()
+    if debug_port:
+        try:
+            webview.settings["REMOTE_DEBUGGING_PORT"] = int(debug_port)
+            LOG.info("WebView2 remote debugging on 127.0.0.1:%s", debug_port)
+        except ValueError:
+            LOG.warning("ignoring invalid AIREC_DEBUG_PORT=%r", debug_port)
+
     settings = load_settings(paths.config_file)
     core = start_core(paths)
     LOG.info("core ready: version=%s port=%s", core.version, core.port)
@@ -728,7 +746,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    # In a frozen build the same exe hosts the core in a child process.
+    if raw_args[:1] == ["--core-worker"]:
+        from airec.__main__ import main as core_main
+
+        return core_main(raw_args[1:])
+
+    args = parse_args(raw_args)
 
     if args.autostart is not None:
         return autostart.run_cli(args.autostart)
@@ -737,10 +762,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         paths.ensure()
     except OSError as exc:
-        print(
-            f"{APP_TITLE}: cannot create the data directory {paths.data}: {exc}",
-            file=sys.stderr,
-        )
+        message = f"{APP_TITLE}: cannot create the data directory {paths.data}: {exc}"
+        print(message, file=sys.stderr)
+        if getattr(sys, "frozen", False):
+            message_box(message)
         return 1
 
     log_file = setup_logging(paths, console=not args.smoke_test)

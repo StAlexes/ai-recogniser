@@ -22,6 +22,13 @@ APP_TITLE = "AI Recogniser"
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
+def resource_root() -> Path:
+    """Read-only bundled resources (UI, icons), also inside a PyInstaller build."""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    return PROJECT_ROOT
+
+
 def app_root() -> Path:
     """Directory of the executable in a frozen build, repo root in development."""
     if getattr(sys, "frozen", False):
@@ -61,7 +68,8 @@ class AppPaths:
     def resolve(cls) -> AppPaths:
         root = app_root()
         data = data_root()
-        ui = root / "ui" / "dist"
+        # In a frozen build the UI ships inside _internal (sys._MEIPASS).
+        ui = resource_root() / "ui" / "dist"
         if not ui.exists():
             # Running from source: the UI build lives at the repo root.
             ui = PROJECT_ROOT / "ui" / "dist"

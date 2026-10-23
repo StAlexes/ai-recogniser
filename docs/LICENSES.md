@@ -16,6 +16,8 @@ AI Recogniser распространяется по лицензии MIT (см. 
 | platformdirs | пути данных | MIT | |
 | psutil | телеметрия железа | BSD-3-Clause | |
 | pywebview | окно WebView2 | BSD-3-Clause | |
+| pythonnet / clr-loader | загрузка .NET-сборок WebView2 | MIT | |
+| WebView2 Runtime | движок окна | Microsoft Software License Terms | отдельный компонент Windows, не входит в exe |
 | pystray | иконка в трее | LGPL-3.0 | динамическая линковка, исходники доступны |
 | Pillow | иконки | HPND | |
 | React / Fluent UI v9 | интерфейс | MIT | |
@@ -42,6 +44,8 @@ AI Recogniser распространяется по лицензии MIT (см. 
 | FFmpeg / ffprobe | LGPL-2.1+ (сборка без GPL-модулей) | поставляем отдельными exe, предложение исходников |
 | llama.cpp (`llama-server`) | MIT | |
 | onnx-asr | MIT | |
+| Python | PSF License | рантайм внутри PyInstaller-сборки |
+| PyInstaller | GPL-2.0-or-later с исключением для bootloader | только сборка exe; скомпилированный продукт не становится GPL |
 | Inno Setup | фриварная лицензия | установщик |
 
 ## Правила

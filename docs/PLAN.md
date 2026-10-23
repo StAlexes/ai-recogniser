@@ -198,7 +198,7 @@ Inno Setup 6: мастер с опциями, компонентами, пров
      (GigaAM)    (VAD/diar)     (GGUF, HTTP)    (ONNX)
 ```
 
-**Процессы:** `AI Recogniser.exe` (shell) → запускает `runtime\python.exe -m airec` (core) на свободном порту, ждёт `/health`, затем открывает окно. Падение core → shell перезапускает (до 3 раз) и показывает диагностику.
+**Процессы:** `AI Recogniser.exe` (shell) → запускает тот же exe с `--core-worker` (frozen core) на свободном порту, ждёт `/health`, затем открывает окно. В dev-режиме вместо exe используется `python -m airec`. Падение core → shell перезапускает (до 3 раз) и показывает диагностику.
 
 **Single instance:** именованный mutex + лок-файл с портом; второй запуск открывает окно первого и передаёт ему файлы через named pipe/HTTP.
 
@@ -293,13 +293,13 @@ results/2026-10-23_14-05_Совещание_по_бюджету/
 
 ## 10. Установка, переносимость, обновления
 
-**Состав поставки:**
+**Состав поставки (one-folder PyInstaller):**
 ```
 AI Recogniser\
-  AI Recogniser.exe          # shell
-  runtime\python.exe         # embeddable 3.12 + site-packages
+  AI Recogniser.exe          # shell + core worker (--core-worker)
+  _internal\                 # CPython, зависимости, ui\dist, иконки, WebView2 .NET
   bin\ffmpeg.exe, ffprobe.exe, llama-server.exe
-  ui\                        # собранная статика
+  data\                      # portable-режим; иначе %LOCALAPPDATA%
   models\manifest.json       # реестр (веса — отдельно)
 ```
 
@@ -487,9 +487,13 @@ AI Recogniser/
 - [x] 7. Каркас UI (React + Fluent UI v9): очередь, база знаний, модели, настройки, темы.
 - [x] 8. Демо GigaAM: воспроизводимый POC `tools/poc_gigaam.py` (RTFx 56.8, 352 МБ RSS);
   интеграция распознавания в UI — M1.
+- [x] 9. Нативная one-folder сборка PyInstaller: `AI Recogniser.exe` без Python, frozen core worker,
+  portable-режим, `docs/BUILD.md`; установщик и подпись — M6.
 
 Итог M0: ядро, оболочка и UI-прототип работают вместе; окно 1200×800 (минимум 960×640),
 токен-хендшейк, настройки, трей, автозапуск, CI (ruff, pytest, typecheck, build) — зелёные.
+Нативный exe проверен на чистом запуске: smoke-тест, все страницы WebView2, single-instance,
+portable-данные и остановка ядра при выходе.
 
 ---
 
