@@ -1,0 +1,44 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Node / UI
+node_modules/
+ui/dist/
+*.tsbuildinfo
+
+# Runtime data
+data/
+models/
+cache/
+logs/
+results/
+temp/
+session.json
+config.json
+portable.flag
+
+# Installer output
+packaging/out/
+packaging/build/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local env
+.env
+.env.local
