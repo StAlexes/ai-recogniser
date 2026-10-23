@@ -17,6 +17,12 @@ log = logging.getLogger(__name__)
 DEFAULT_MODEL = "gigaam-v3-e2e-ctc"
 QUANTIZATION = "int8"
 
+# GigaAM ONNX has fixed positional embeddings (~5000 frames).  Audio longer
+# than this limit fails with an ONNX broadcast/shape error instead of a
+# readable message.  Until VAD/chunking is implemented (M1 remainder), reject
+# overly long input up front with a human-friendly error.
+MAX_AUDIO_SECONDS = 300
+
 ProgressCallback = Callable[[float, str], None]
 
 
@@ -111,6 +117,14 @@ def transcribe(
             ffmpeg=ffmpeg,
         )
 
+        if duration and duration > MAX_AUDIO_SECONDS:
+            raise AsrError(
+                f"Аудио слишком длинное для текущей модели "
+                f"({duration:.0f} с, лимит {MAX_AUDIO_SECONDS} с). "
+                "Разбейте файл на части покороче или подождите нарезки по "
+                "сегментам (VAD) в следующем релизе."
+            )
+
         notify(0.2, "Загрузка модели")
         model = _load_model(model_id, cpu_threads)
 
@@ -120,7 +134,10 @@ def transcribe(
         except AudioError:
             raise
         except Exception as exc:
-            raise AsrError(f"Ошибка распознавания: {exc}") from exc
+            raise AsrError(
+                f"Ошибка распознавания: {exc}. "
+                "Если файл длинный, попробуйте разобрать его на части."
+            ) from exc
 
         if not isinstance(text, str):
             raise AsrError("Модель вернула неожиданный результат.")
