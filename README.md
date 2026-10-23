@@ -1,10 +1,26 @@
 # AI Recogniser
 
+[![CI](https://github.com/StAlexes/ai-recogniser/actions/workflows/ci.yml/badge.svg)](https://github.com/StAlexes/ai-recogniser/actions/workflows/ci.yml)
+
 Локальное Windows-приложение для распознавания русской речи из mp3/mp4: очередь задач в трее,
 GigaAM v3, локальные саммари, база знаний и глоссарий. Без облака по умолчанию.
 
-**Статус:** M0 — каркас (ядро + UI + оболочка). Функциональность распознавания появится в M1.
+**Статус:** M0 — каркас готов (ядро + UI-прототип + оболочка). Распознавание файлов появится в M1.
 План: [`docs/PLAN.md`](docs/PLAN.md). История версий: [`CHANGELOG.md`](CHANGELOG.md).
+Замеры GigaAM: [`docs/M0-NOTES.md`](docs/M0-NOTES.md).
+
+## Что уже работает (M0)
+
+- Ядро на `127.0.0.1` со случайным портом и сессионным токеном: health, настройки, профиль ПК, каталог моделей.
+- Окно WebView2 с Fluent UI: очередь (drag&drop файлов), база знаний, модели, настройки, светлая/тёмная тема.
+- Трей, закрытие в трей, уведомления, single-instance, автозапуск.
+- GigaAM v3 e2e CTC int8: **RTFx 56.8** на Ryzen 7 8845H, **352 МБ** RSS — CPU быстрее iGPU Radeon 780M.
+
+## Требования для разработки
+
+- Windows 10 1809+ / Windows 11, WebView2 Runtime (на Windows 11 уже установлен).
+- Python 3.12+ (проверено на 3.13).
+- Node.js 20.19+ и npm — только для сборки UI.
 
 ## Стек
 
@@ -37,7 +53,7 @@ UI в dev-режиме: `npm.cmd run dev` (Vite проксирует `/api` на
 ## Проверки
 
 ```powershell
-.\.venv\Scripts\ruff check app shell
+.\.venv\Scripts\ruff check app shell tools
 .\.venv\Scripts\pytest
 ```
 
