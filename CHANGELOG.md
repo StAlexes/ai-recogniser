@@ -33,7 +33,8 @@
   когда в репозитории есть `ui/package.json`.
 
 ### Changed
-- —
+- Проект переведён на лицензию MIT (`LICENSE`, `pyproject.toml`); сторонние компоненты и модели
+  перечислены в `docs/LICENSES.md`.
 
 ### Fixed
 - Полноэкранные оверлеи тултипов Fluent UI: `FluentProvider` копировал стили корня на mount-узлы
