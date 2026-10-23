@@ -25,17 +25,29 @@ jobs:
   ui:
     name: UI (React)
     runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: ui
     steps:
       - uses: actions/checkout@v4
+      - name: Detect UI
+        id: detect
+        shell: pwsh
+        run: |
+          if (Test-Path "ui/package.json") {
+            "exists=true" >> $env:GITHUB_OUTPUT
+          } else {
+            "exists=false" >> $env:GITHUB_OUTPUT
+            Write-Host "ui/ is not in the repo yet - skipping UI build"
+          }
       - uses: actions/setup-node@v4
+        if: steps.detect.outputs.exists == 'true'
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: ui/package-lock.json
       - name: Install
-        run: npm ci
+        if: steps.detect.outputs.exists == 'true'
+        working-directory: ui
+        run: npm install --no-audit --no-fund
       - name: Build
+        if: steps.detect.outputs.exists == 'true'
+        working-directory: ui
         run: npm run build
