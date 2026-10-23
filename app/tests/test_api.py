@@ -12,7 +12,7 @@ from airec.version import __version__
 TOKEN = "test-token"
 
 
-def make_client(tmp_path: Path) -> TestClient:
+def make_client(tmp_path: Path, ui_dir: Path | None = None) -> TestClient:
     monkeypatch_paths = AppPaths(
         root=tmp_path,
         data=tmp_path,
@@ -22,7 +22,7 @@ def make_client(tmp_path: Path) -> TestClient:
         results=tmp_path / "results",
         temp=tmp_path / "temp",
         bin=tmp_path / "bin",
-        ui=tmp_path / "ui-dist",
+        ui=ui_dir or (tmp_path / "ui-dist"),
     )
     monkeypatch_paths.ensure()
     app = create_app(
@@ -47,6 +47,13 @@ def test_health_requires_token(tmp_path: Path) -> None:
 def test_healthz_is_public(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
         assert client.get("/healthz").json() == {"status": "ok"}
+
+
+def test_static_ui_is_public_but_api_is_not(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        assert client.get("/").status_code == 200
+        assert client.get("/assets/missing.js").status_code == 404
+        assert client.get("/api/v1/settings").status_code == 401
 
 
 def test_settings_update_persists(tmp_path: Path) -> None:
@@ -75,3 +82,13 @@ def test_models_catalog(tmp_path: Path) -> None:
         assert response.status_code == 200
         ids = {item["id"] for item in response.json()["items"]}
         assert "gigaam-v3-e2e-ctc" in ids
+
+
+def test_spa_fallback_does_not_capture_api(tmp_path: Path) -> None:
+    ui = tmp_path / "ui"
+    ui.mkdir()
+    (ui / "index.html").write_text("<html>ui-shell</html>", encoding="utf-8")
+
+    with make_client(tmp_path, ui_dir=ui) as client:
+        assert client.get("/queue").text == "<html>ui-shell</html>"
+        assert client.get("/api/nope", headers={"Authorization": f"Bearer {TOKEN}"}).status_code == 404

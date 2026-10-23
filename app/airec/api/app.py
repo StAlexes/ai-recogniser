@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +14,8 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from airec.api import jobs, models, settings as settings_api, system
+from airec.api import jobs, models, system
+from airec.api import settings as settings_api
 from airec.core.config import Settings
 from airec.core.paths import AppPaths
 from airec.core.security import TokenAuthMiddleware
@@ -40,7 +41,8 @@ class SpaStaticFiles(StaticFiles):
         try:
             return await super().get_response(path, scope)
         except StarletteHTTPException as exc:
-            if exc.status_code == 404 and not path.startswith("api/"):
+            normalized = path.replace("\\", "/")
+            if exc.status_code == 404 and not normalized.startswith("api/"):
                 return await super().get_response("index.html", scope)
             raise
 

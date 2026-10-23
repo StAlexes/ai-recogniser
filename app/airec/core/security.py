@@ -7,6 +7,7 @@ the token to the UI through the URL fragment (never through query strings or log
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import json
 import os
@@ -18,15 +19,6 @@ from pathlib import Path
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
-
-PUBLIC_PREFIXES = (
-    "/healthz",
-    "/assets/",
-    "/favicon.ico",
-    "/favicon.svg",
-    "/icons/",
-)
-PUBLIC_EXACT = {"/", "/index.html"}
 
 
 @dataclass(frozen=True)
@@ -80,10 +72,8 @@ def remove_session(path: Path, *, pid: int | None = None) -> None:
         return
     if pid is not None and current.pid != pid:
         return
-    try:
+    with contextlib.suppress(OSError):
         path.unlink()
-    except OSError:
-        pass
 
 
 def _extract_token(request: Request) -> str | None:
@@ -106,7 +96,8 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         path = request.url.path
-        if path in PUBLIC_EXACT or path.startswith(PUBLIC_PREFIXES):
+        # Static UI is public; every API call must carry the session token.
+        if not path.startswith("/api/"):
             return await call_next(request)
 
         supplied = _extract_token(request)
