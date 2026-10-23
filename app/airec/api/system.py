@@ -9,7 +9,7 @@ import time
 from fastapi import APIRouter, Request
 
 from airec import __version__
-from airec.bench.hardware import hardware_profile
+from airec.bench.profile import load_profile, refresh_profile
 from airec.core.paths import AppPaths
 
 router = APIRouter(prefix="/api/v1", tags=["system"])
@@ -34,5 +34,9 @@ def health(request: Request) -> dict[str, object]:
 
 
 @router.get("/system/profile")
-def profile() -> dict[str, object]:
-    return hardware_profile()
+def profile(request: Request, refresh: bool = False) -> dict[str, object]:
+    path = request.app.state.paths.data / "profile.json"
+    if refresh:
+        return refresh_profile(path)
+    cached = load_profile(path)
+    return cached if cached is not None else refresh_profile(path)
