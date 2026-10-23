@@ -42,3 +42,6 @@ desktop.ini
 # Local env
 .env
 .env.local
+
+# DirectML test venv
+.venv-dml/

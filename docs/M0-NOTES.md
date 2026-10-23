@@ -14,7 +14,7 @@ SHA-256 `D8AAAA18A5098D7C6DE0595AE7AC1E64CACD0D4022AF3595213BDAF23BE77E69`.
 | Провайдер | Load, с | Infer, с (mean) | RTFx | Peak RSS, МБ | Длина текста |
 |---|---|---|---|---|---|
 | CPU (`CPUExecutionProvider`), int8 | 1.674 | 0.199 (прогоны 0.197 / 0.201) | 56.8 | 352.5 | 160 симв. / 26 слов |
-| DirectML (`DmlExecutionProvider`) | — | — | — | — | SKIP: EP отсутствует |
+| DirectML (`DmlExecutionProvider`), int8, отдельный venv | 2.596 | 0.229 | 49.3 | 621.5 | 161 симв. / 26 слов |
 
 Warmup: 0.224 с (не входит в замер). Cold load: 18.562 с, включая скачивание 214.9 МБ
 (3 файла: ONNX int8, yaml, vocab); загрузка с прогретого кэша — 1.674 с.
@@ -34,6 +34,12 @@ Peak RSS процесса за всё время жизни — 359.4 МБ (вк
 # 3) проверка доступных EP (DirectML)
 .\.venv\Scripts\python.exe -c "import onnxruntime as ort; print(ort.get_available_providers())"
 # -> ['AzureExecutionProvider', 'CPUExecutionProvider']
+
+# 4) DirectML в отдельном venv (не заменяет CPU-runtime в основном)
+python -m venv .venv-dml
+.\.venv-dml\Scripts\python.exe -m pip install onnx-asr onnxruntime-directml huggingface-hub numpy psutil
+.\.venv-dml\Scripts\python.exe tools\poc_gigaam.py --wav data\samples\gigaam-example.wav `
+  --provider dml --runs 3 --json data\poc\gigaam-dml.json
 ```
 
 **Транскрипт (первые 300 символов, файл — весь):**
@@ -44,11 +50,11 @@ Peak RSS процесса за всё время жизни — 359.4 МБ (вк
 
 **Оговорки:**
 
-- **DirectML пропущен:** в установленной CPU-сборке onnxruntime 1.31.0 нет `DmlExecutionProvider`
-  (только `AzureExecutionProvider` и `CPUExecutionProvider`). Пакет `onnxruntime-directml` не ставился,
-  чтобы не заменять onnxruntime в venv. Для проверки iGPU нужен отдельный venv с `onnxruntime-directml`;
-  `onnx-asr` принимает `providers=["DmlExecutionProvider"]` (аргумент есть в `load_model`).
-  Вывод о выигрыше iGPU по этому замеру сделать нельзя.
+- **DirectML проверен отдельно:** в основном venv стоит CPU-сборка onnxruntime 1.31.0 без `DmlExecutionProvider`.
+  В отдельном `.venv-dml` с `onnxruntime-directml` 1.24.4 EP доступен и работает: RTFx **49.3** против **56.8** на CPU,
+  peak RSS **621 МБ** против **352 МБ**, загрузка 2.6 с против 1.7 с. Вывод: на Radeon 780M iGPU-ускорение GigaAM v3 int8
+  **не даёт выигрыша**; дефолт — CPU. `onnxruntime-directml` в поставку не берём (плюс ~200 МБ и хуже latency/RAM).
+  Оговорка: версии ORT разные (1.24.4 vs 1.31.0), но разрыв по памяти и скорости устойчивый.
 - **Короткий сэмпл:** 11.3 с, без VAD, чанков и longform-пайплайна. RTFx 56.8 на коротком файле
   близок к паспортным ≈59 (9800X3D) и выше ожидаемых 25–40 из PLAN §5.1; на длинных файлах
   с VAD/нарезкой и постобработкой цифра будет другой — линейно не экстраполировать.
