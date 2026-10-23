@@ -47,7 +47,7 @@ def load_settings(path: Path) -> Settings:
     if not path.exists():
         return Settings()
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
         return Settings.model_validate(raw)
     except (OSError, json.JSONDecodeError, ValidationError) as exc:
         backup = path.with_name(f"config.broken-{datetime.now(UTC):%Y%m%d-%H%M%S}.json")

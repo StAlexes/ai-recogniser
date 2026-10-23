@@ -31,3 +31,16 @@ def test_unknown_keys_are_ignored(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     path.write_text(json.dumps({"theme": "light", "future_option": 42}), encoding="utf-8")
     assert load_settings(path).theme == "light"
+
+
+def test_settings_with_utf8_bom_are_read(tmp_path: Path) -> None:
+    """Notepad and some editors prepend a BOM; that must not reset the settings."""
+    path = tmp_path / "config.json"
+    payload = json.dumps({"theme": "dark", "close_to_tray": False})
+    path.write_text(payload, encoding="utf-8-sig")
+
+    loaded = load_settings(path)
+
+    assert loaded.theme == "dark"
+    assert loaded.close_to_tray is False
+    assert not list(tmp_path.glob("config.broken-*.json"))

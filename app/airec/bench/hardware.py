@@ -16,6 +16,45 @@ log = logging.getLogger(__name__)
 
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
+# Adapters that are not real rendering hardware. They must never be chosen for
+# inference or shown as "the GPU" in the UI (e.g. Parsec creates a virtual
+# display on machines that also have a physical GPU).
+_VIRTUAL_GPU_MARKERS = (
+    "parsec",
+    "virtual",
+    "vmware",
+    "virtualbox",
+    "citrix",
+    "remote",
+    "basic display",
+    "spacedesk",
+    "sunshine",
+    "idd",
+)
+
+
+def _is_virtual_gpu(name: str) -> bool:
+    normalized = name.casefold()
+    return any(marker in normalized for marker in _VIRTUAL_GPU_MARKERS)
+
+
+def _normalize_gpus(data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build GPU records and put physical adapters before virtual ones."""
+    gpus = [
+        {
+            "name": item.get("Name", ""),
+            "vram_gb": round(item.get("AdapterRAM", 0) / 1024**3, 1)
+            if item.get("AdapterRAM")
+            else None,
+            "driver": item.get("DriverVersion", ""),
+            "virtual": _is_virtual_gpu(item.get("Name", "")),
+        }
+        for item in data
+    ]
+    # Stable sort: keep the WMI order inside the physical and virtual groups.
+    gpus.sort(key=lambda gpu: gpu["virtual"])
+    return gpus
+
 
 def _gpu_info() -> list[dict[str, Any]]:
     if os.name != "nt":
@@ -38,16 +77,7 @@ def _gpu_info() -> list[dict[str, Any]]:
         data = json.loads(completed.stdout)
         if isinstance(data, dict):
             data = [data]
-        return [
-            {
-                "name": item.get("Name", ""),
-                "vram_gb": round(item.get("AdapterRAM", 0) / 1024**3, 1)
-                if item.get("AdapterRAM")
-                else None,
-                "driver": item.get("DriverVersion", ""),
-            }
-            for item in data
-        ]
+        return _normalize_gpus(data)
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         log.debug("GPU probe failed: %s", exc)
         return []
