@@ -6,23 +6,11 @@ import {
   DesktopRegular,
 } from '@fluentui/react-icons';
 import { ApiError, AuthError, getModels, getSystemProfile } from '../api';
-import type { ModelInfo, ModelsResponse, SystemProfile } from '../api';
+import type { ModelItem, ModelsResponse, SystemProfile } from '../api';
 import { DisabledAction } from '../components/DisabledAction';
 import { ErrorState, LoadingState } from '../components/PageState';
 import { PageHeader } from '../components/PageHeader';
 import { formatGb, formatModelSize, pluralCores } from '../format';
-
-const LANGUAGE_LABELS: Record<string, string> = {
-  ru: 'Русский',
-  en: 'Английский',
-  kk: 'Казахский',
-  ky: 'Киргизский',
-  uz: 'Узбекский',
-};
-
-function languageLabel(code: string): string {
-  return LANGUAGE_LABELS[code] ?? code.toUpperCase();
-}
 
 function kindLabel(kind: string): string {
   if (kind === 'asr') {
@@ -57,13 +45,11 @@ function profileSummary(profile: SystemProfile): string {
 }
 
 interface ModelCardProps {
-  model: ModelInfo;
+  model: ModelItem;
   installed: boolean;
 }
 
 function ModelCard({ model, installed }: ModelCardProps) {
-  const languages = model.languages.length > 0 ? model.languages : ['—'];
-
   return (
     <article className="model-card surface">
       <div className="model-head">
@@ -75,11 +61,6 @@ function ModelCard({ model, installed }: ModelCardProps) {
           <span className="model-kind">{kindLabel(model.kind)}</span>
         </div>
         <div className="model-badges">
-          {model.default ? (
-            <Badge appearance="tint" color="brand" size="small">
-              По умолчанию
-            </Badge>
-          ) : null}
           {installed ? (
             <Badge appearance="tint" color="success" size="small">
               Установлена
@@ -88,26 +69,18 @@ function ModelCard({ model, installed }: ModelCardProps) {
         </div>
       </div>
 
-      <p className="model-description">{model.description}</p>
+      <p className="model-description">{model.note ?? 'Описание недоступно'}</p>
 
       <dl className="model-facts">
         <div>
           <dt>Размер</dt>
-          <dd>{formatModelSize(model.size_mb)}</dd>
+          <dd>{formatModelSize(model.size_mb ?? 0)}</dd>
         </div>
         <div>
           <dt>Лицензия</dt>
-          <dd>{licenseLabel(model.license)}</dd>
+          <dd>{licenseLabel(model.license ?? '—')}</dd>
         </div>
       </dl>
-
-      <ul className="chips" aria-label="Языки">
-        {languages.map((code) => (
-          <li key={code} className="chip">
-            {code === '—' ? '—' : languageLabel(code)}
-          </li>
-        ))}
-      </ul>
 
       <div className="model-actions">
         <DisabledAction action="Установить" tooltip="Появится в M1">
@@ -183,7 +156,7 @@ export function ModelsPage({ onAuthError }: ModelsPageProps) {
 
   const models = catalog?.items ?? [];
   const installed = catalog?.installed ?? [];
-  const recommended = models.find((model) => model.kind === 'asr' && model.default);
+  const recommended = models.find((model) => model.kind === 'asr');
 
   return (
     <>

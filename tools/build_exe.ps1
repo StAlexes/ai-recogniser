@@ -81,3 +81,39 @@ Write-Host ""
 Write-Host "Built: $Exe"
 Write-Host "Exe size: $SizeMb MB (plus the _internal folder)"
 Write-Host "Run it directly; no Python installation is required on the target PC."
+
+# Generate version.json alongside the exe for build traceability.
+$VersionPy = Join-Path $Root "app\airec\version.py"
+$VersionJson = Join-Path $Root "dist\AI Recogniser\version.json"
+$Version = "0.1.0.dev0"
+if (Test-Path $VersionPy) {
+    $VersionContent = Get-Content $VersionPy -Raw
+    $VersionLine = $VersionContent | Select-String '^__version__\s*='
+    if ($VersionLine) {
+        $Version = ($VersionLine.ToString() -split '=')[-1].Trim().Trim('"').Trim("'")
+    }
+}
+$GitHash = ""
+$GitStatus = "unknown"
+try {
+    $GitHash = (git -C $Root rev-parse --short HEAD 2>$null).Trim()
+    $Status = (git -C $Root status --porcelain 2>$null)
+    if ($Status) {
+        $GitStatus = "dirty"
+    } else {
+        $GitStatus = "clean"
+    }
+} catch {
+    # Git may not be available in all environments.
+}
+$VersionData = @{
+    version = $Version
+    built_at = (Get-Date -Format "yyyy-MM-ddTHH:mm:sszzz")
+    git_commit = $GitHash
+    git_status = $GitStatus
+    exe_name = "AI Recogniser.exe"
+    exe_size_mb = $SizeMb
+} | ConvertTo-Json -Depth 3
+$VersionData | Out-File -Encoding utf8 -FilePath $VersionJson
+Write-Host ""
+Write-Host "Build manifest: $VersionJson"

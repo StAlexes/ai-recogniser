@@ -146,7 +146,7 @@ export interface ModelInfo {
 }
 
 export interface ModelsResponse {
-  items: ModelInfo[];
+  items: ModelItem[];
   installed: string[];
 }
 
@@ -489,4 +489,51 @@ export async function uploadJob(file: File): Promise<JobDetail> {
   } catch {
     throw new ApiError(response.status, 'Ядро вернуло некорректный ответ на загрузку.');
   }
+}
+
+export interface ModelItem {
+  id: string;
+  kind: string;
+  title: string;
+  filename?: string;
+  url?: string;
+  size_bytes?: number;
+  size_mb?: number;
+  license?: string;
+  note?: string;
+  installed: boolean;
+  download_progress?: { value: number; phase: string } | null;
+}
+
+export interface ModelDownloadProgress {
+  id: string;
+  value: number;
+  phase: string;
+}
+
+export interface ModelDownloadResponse {
+  id: string;
+  status: string;
+  url: string;
+}
+
+export function downloadModel(modelId: string): Promise<ModelDownloadResponse> {
+  return request<ModelDownloadResponse>(
+    `/api/v1/models/download/${encodeURIComponent(modelId)}`,
+    { method: 'POST', timeoutMs: 15_000 },
+  );
+}
+
+export function getModelDownloadProgress(modelId: string): Promise<ModelDownloadProgress> {
+  return request<ModelDownloadProgress>(
+    `/api/v1/models/download/${encodeURIComponent(modelId)}/progress`,
+    { timeoutMs: 10_000 },
+  );
+}
+
+export function importModel(path: string, modelId: string): Promise<ModelDownloadResponse> {
+  return request<ModelDownloadResponse>(
+    '/api/v1/models/import',
+    { method: 'POST', body: { path, id: modelId }, timeoutMs: 15_000 },
+  );
 }
