@@ -17,6 +17,7 @@ import {
   ArrowDownloadRegular,
   CopyRegular,
   DismissRegular,
+  HistoryRegular,
   InfoRegular,
   MusicNote2Regular,
   ShieldCheckmarkRegular,
@@ -26,8 +27,10 @@ import {
 import {
   ApiError,
   AuthError,
+  cancelJob,
   getJob,
   getJobs,
+  retryJob,
   token,
   uploadJob,
 } from '../api';
@@ -93,6 +96,8 @@ function statusLabel(status: JobStatus): string {
       return 'Готово';
     case 'error':
       return 'Ошибка';
+    case 'cancelled':
+      return 'Отменено';
   }
 }
 
@@ -105,6 +110,8 @@ function statusColor(status: JobStatus): BadgeColor {
     case 'done':
       return 'success';
     case 'error':
+      return 'danger';
+    case 'cancelled':
       return 'danger';
   }
 }
@@ -383,6 +390,52 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
     }
   };
 
+  const handleCancel = async (jobId: string): Promise<void> => {
+    try {
+      await cancelJob(jobId);
+      setNotice('Задача отменена.');
+    } catch (reason: unknown) {
+      if (reason instanceof AuthError) {
+        onAuthError();
+        return;
+      }
+      setError(
+        reason instanceof ApiError
+          ? reason.message
+          : 'Не удалось отменить задачу.'
+      );
+    }
+    try {
+      const response = await getJobs();
+      setJobs(response.items);
+    } catch {
+      // Игнорируем; следующий poll обновит список.
+    }
+  };
+
+  const handleRetry = async (jobId: string): Promise<void> => {
+    try {
+      await retryJob(jobId);
+      setNotice('Задача отправлена на повторную обработку.');
+    } catch (reason: unknown) {
+      if (reason instanceof AuthError) {
+        onAuthError();
+        return;
+      }
+      setError(
+        reason instanceof ApiError
+          ? reason.message
+          : 'Не удалось повторить задачу.'
+      );
+    }
+    try {
+      const response = await getJobs();
+      setJobs(response.items);
+    } catch {
+      // Игнорируем; следующий poll обновит список.
+    }
+  };
+
   return (
     <>
       <PageHeader
@@ -549,13 +602,38 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
                   </Badge>
                 </button>
                 {isActive(job.status) ? (
-                  <ProgressBar
-                    className="job-progress"
-                    value={job.progress}
-                    thickness="medium"
-                    aria-label={`Прогресс ${job.filename}`}
-                  />
+                  <>
+                    <ProgressBar
+                      className="job-progress"
+                      value={job.progress}
+                      thickness="medium"
+                      aria-label={`Прогресс ${job.filename}`}
+                    />
+                    <Button
+                      appearance="subtle"
+                      size="small"
+                      icon={<DismissRegular />}
+                      disabled={isActive(job.status)}
+                      onClick={() => {
+                        void handleCancel(job.id);
+                      }}
+                    >
+                      Отменить
+                    </Button>
+                  </>
                 ) : null}
+                {(job.status === 'error' || job.status === 'cancelled') && (
+                  <Button
+                    appearance="subtle"
+                    size="small"
+                    icon={<HistoryRegular />}
+                    onClick={() => {
+                      void handleRetry(job.id);
+                    }}
+                  >
+                    Повторить
+                  </Button>
+                )}
                 {job.status === 'error' && job.error !== null ? (
                   <p className="job-error">{job.error}</p>
                 ) : null}
@@ -660,12 +738,39 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
             <div className="transcript-progress" role="status" aria-live="polite">
               <ProgressBar value={detail.progress} thickness="medium" />
               <span>{detail.phase}</span>
+              <Button
+                appearance="subtle"
+                size="small"
+                icon={<DismissRegular />}
+                onClick={() => {
+                  void handleCancel(detail.id);
+                }}
+              >
+                Отменить
+              </Button>
             </div>
           ) : null}
 
-          {detail.status === 'error' ? (
+          {(detail.status === 'error' || detail.status === 'cancelled') ? (
             <MessageBar intent="error" className="transcript-error">
-              <MessageBarBody>{detail.error ?? 'Не удалось распознать файл.'}</MessageBarBody>
+              <MessageBarBody>
+                {detail.status === 'cancelled'
+                  ? 'Задача отменена.'
+                  : detail.error ?? 'Не удалось распознать файл.'}
+              </MessageBarBody>
+              <MessageBarActions
+                containerAction={
+                  <Button
+                    appearance="subtle"
+                    icon={<HistoryRegular />}
+                    onClick={() => {
+                      void handleRetry(detail.id);
+                    }}
+                  >
+                    Повторить
+                  </Button>
+                }
+              />
             </MessageBar>
           ) : null}
 

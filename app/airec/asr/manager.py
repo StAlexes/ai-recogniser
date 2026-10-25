@@ -75,6 +75,7 @@ class Job:
     text: str = ""
     error: str | None = None
     result_file: str | None = None
+    source_path: str | None = None
 
     def summary(self) -> dict[str, Any]:
         data = asdict(self)
@@ -232,12 +233,20 @@ class JobManager:
         source = work_dir / f"input{suffix}"
         shutil.move(str(uploaded), source)
 
+        # Keep a copy of the source file next to the results so the job can be
+        # retried even after the temp folder is cleaned up.
+        result_dir = self._job_dir(job_id)
+        result_dir.mkdir(parents=True, exist_ok=True)
+        source_copy = result_dir / f"source{suffix}"
+        shutil.copy2(source, source_copy)
+
         job = Job(
             id=job_id,
             filename=filename,
             model=model_id,
             size_bytes=size,
             audio_format=suffix.lstrip("."),
+            source_path=str(source_copy),
         )
         with self._lock:
             self._jobs[job.id] = job
@@ -249,6 +258,89 @@ class JobManager:
             self._futures[job.id] = future
         return job
 
+    # ------------------------------------------------------------------ #
+    # Cancel / retry
+    # ------------------------------------------------------------------ #
+    def cancel(self, job_id: str) -> None:
+        """Отменить задачу (queued или running)."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError(f"Job {job_id} not found.")
+            if job.status not in ACTIVE_STATUSES:
+                raise ValueError(
+                    f"Нельзя отменить задачу со статусом '{job.status}'."
+                )
+            future = self._futures.pop(job_id, None)
+            if future is not None:
+                future.cancel()
+            job.status = "cancelled"
+            job.phase = "Отменено"
+            job.finished_at = utc_now()
+            job.error = "Задача отменена пользователем."
+            try:
+                self._persist(job)
+            except OSError:
+                log.exception("cannot persist cancelled job %s", job_id)
+            # Освобождаем временные файлы.
+            work_dir = self._paths.temp / "jobs" / job_id
+            self._cleanup_source(work_dir)
+
+    def retry(self, job_id: str) -> Job:
+        """Повтор задачи со статусом error или cancelled.
+
+        Исходный файл берётся из results/<job_id>/source<ext>, который
+        хранится независимо от временной папки.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError(f"Job {job_id} not found.")
+            if job.status not in {"error", "cancelled"}:
+                raise ValueError(
+                    f"Повтор доступен только для задач со статусом 'error' или "
+                    f"'cancelled', получено '{job.status}'."
+                )
+            if not job.source_path:
+                raise ValueError(
+                    f"У задачи {job_id} нет сохранённого исходного файла."
+                )
+            source = Path(job.source_path)
+            if not source.is_file():
+                raise FileNotFoundError(
+                    f"Исходный файл задачи не найден: {source}"
+                )
+
+            # Создаём новую задачу на основе старой.
+            new_job_id = f"{datetime.now(UTC):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}"
+            new_work_dir = self._paths.temp / "jobs" / new_job_id
+            new_work_dir.mkdir(parents=True, exist_ok=True)
+            new_source = new_work_dir / f"input{source.suffix}"
+            shutil.copy2(source, new_source)
+
+            new_job = Job(
+                id=new_job_id,
+                filename=job.filename,
+                model=job.model,
+                size_bytes=source.stat().st_size,
+                audio_format=job.audio_format,
+                source_path=str(source),
+            )
+            self._jobs[new_job.id] = new_job
+            try:
+                self._persist(new_job)
+            except OSError:
+                log.exception("cannot persist retried job %s", new_job.id)
+            future = self._executor.submit(
+                self._run, new_job.id, new_source, new_work_dir
+            )
+            self._futures[new_job.id] = future
+            log.info("job %s retried as %s", job_id, new_job.id)
+            return new_job
+
+    # ------------------------------------------------------------------ #
+    # Worker
+    # ------------------------------------------------------------------ #
     def _run(self, job_id: str, source: Path, work_dir: Path) -> None:
         with self._lock:
             job = self._jobs.get(job_id)

@@ -98,6 +98,68 @@ def test_manager_transcribes_and_persists(tmp_path: Path) -> None:
     restored.shutdown()
 
 
+def test_manager_cancel_queued_job(tmp_path: Path) -> None:
+    paths = paths_for(tmp_path)
+    manager = JobManager(paths, lambda: Settings(), transcriber=fake_transcriber)
+    upload = tmp_path / "meeting.wav"
+    upload.write_bytes(b"RIFF....WAVEfmt ")
+
+    job = manager.submit(upload, "meeting.wav", "gigaam-v3-e2e-ctc")
+    manager.cancel(job.id)
+
+    cancelled = manager.get(job.id)
+    assert cancelled is not None
+    assert cancelled.status == "cancelled"
+    assert cancelled.phase.startswith("Отмен")
+    assert "отменена" in (cancelled.error or "").lower()
+    manager.shutdown()
+
+
+def test_manager_cancel_non_active_job_raises(tmp_path: Path) -> None:
+    paths = paths_for(tmp_path)
+    manager = JobManager(paths, lambda: Settings(), transcriber=fake_transcriber)
+    upload = tmp_path / "meeting.wav"
+    upload.write_bytes(b"RIFF....WAVEfmt ")
+
+    job = manager.submit(upload, "meeting.wav", "gigaam-v3-e2e-ctc")
+    finished = wait_done(manager, job.id)
+
+    with pytest.raises(ValueError):
+        manager.cancel(finished.id)
+    manager.shutdown()
+
+
+def test_manager_retry_error_job(tmp_path: Path) -> None:
+    paths = paths_for(tmp_path)
+    manager = JobManager(paths, lambda: Settings(), transcriber=fake_transcriber)
+    upload = tmp_path / "meeting.wav"
+    upload.write_bytes(b"RIFF....WAVEfmt ")
+
+    job = manager.submit(upload, "meeting.wav", "gigaam-v3-e2e-ctc")
+    finished = wait_done(manager, job.id)
+    assert finished.status == "done"
+
+    # Повтор выполненной задачи должен быть ошибкой (не error/cancelled).
+    with pytest.raises(ValueError):
+        manager.retry(finished.id)
+
+    # Повтор отмененной задачи — ок.
+    upload2 = tmp_path / "meeting2.wav"
+    upload2.write_bytes(b"RIFF....WAVEfmt ")
+    job2 = manager.submit(upload2, "meeting2.wav", "gigaam-v3-e2e-ctc")
+    manager.cancel(job2.id)
+
+    retried = manager.retry(job2.id)
+    assert retried.status == "queued"
+    assert retried.filename == "meeting2.wav"
+    assert retried.id != job2.id
+
+    retried_done = wait_done(manager, retried.id)
+    assert retried_done.status == "done"
+    assert retried_done.text == "Привет, это тестовая расшифровка."
+    manager.shutdown()
+
+
 def test_manager_rejects_unsupported_extension(tmp_path: Path) -> None:
     paths = paths_for(tmp_path)
     manager = JobManager(paths, lambda: Settings(), transcriber=fake_transcriber)

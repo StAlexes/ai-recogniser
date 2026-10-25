@@ -129,6 +129,33 @@ def get_result_text(request: Request, job_id: str) -> PlainTextResponse:
     return PlainTextResponse(job.text, media_type="text/plain; charset=utf-8")
 
 
+@router.post("/{job_id}/cancel")
+def cancel_job(request: Request, job_id: str) -> dict[str, object]:
+    """Отменить задачу (queued или running)."""
+    manager = _manager(request)
+    try:
+        manager.cancel(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    job = manager.get(job_id)
+    return job.detail() if job else {"id": job_id, "status": "cancelled"}
+
+
+@router.post("/{job_id}/retry")
+def retry_job(request: Request, job_id: str) -> dict[str, object]:
+    """Повтор задачи со статусом error или cancelled."""
+    manager = _manager(request)
+    try:
+        new_job = manager.retry(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return new_job.detail()
+
+
 @router.get("/{job_id}/export")
 def export_job(
     request: Request, job_id: str, format: str = "txt"

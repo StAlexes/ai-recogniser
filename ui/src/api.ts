@@ -37,7 +37,7 @@ export interface Settings {
   rag_k: number;
 }
 
-export type JobStatus = 'queued' | 'running' | 'done' | 'error';
+export type JobStatus = 'queued' | 'running' | 'done' | 'error' | 'cancelled';
 
 export interface JobSummary {
   id: string;
@@ -414,6 +414,20 @@ export function getJob(jobId: string): Promise<JobDetail> {
   return request<JobDetail>(`/api/v1/jobs/${encodeURIComponent(jobId)}`, {
     timeoutMs: 15_000,
   });
+}
+
+export function cancelJob(jobId: string): Promise<JobDetail> {
+  return request<JobDetail>(
+    `/api/v1/jobs/${encodeURIComponent(jobId)}/cancel`,
+    { method: 'POST', timeoutMs: 15_000 },
+  );
+}
+
+export function retryJob(jobId: string): Promise<JobDetail> {
+  return request<JobDetail>(
+    `/api/v1/jobs/${encodeURIComponent(jobId)}/retry`,
+    { method: 'POST', timeoutMs: 15_000 },
+  );
 }
 
 /** Upload one file to the local core and return the queued job. */
