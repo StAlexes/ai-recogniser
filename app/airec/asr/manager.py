@@ -30,6 +30,7 @@ from airec.asr.service import AsrError, TranscriptionResult, transcribe
 from airec.core.config import Settings
 from airec.core.db import Database
 from airec.core.paths import AppPaths
+from airec.notify.notifier import notify_job_done, notify_job_error
 
 log = logging.getLogger(__name__)
 
@@ -406,6 +407,10 @@ class JobManager:
                     self._persist(job)
                 except OSError:
                     log.exception("cannot persist finished job %s", job.id)
+                try:
+                    notify_job_done(job.id, job.filename)
+                except Exception:  # notifications never break the queue
+                    log.exception("cannot send done notification for job %s", job.id)
             if not settings.keep_extracted_audio:
                 self._cleanup_source(work_dir)
         except Exception as exc:  # worker boundary: never let a job kill the queue
@@ -424,6 +429,10 @@ class JobManager:
                     self._persist(job)
                 except OSError:
                     log.exception("cannot persist failed job %s", job.id)
+                try:
+                    notify_job_error(job.id, job.filename, message)
+                except Exception:  # notifications never break the queue
+                    log.exception("cannot send error notification for job %s", job.id)
 
     @staticmethod
     def _cleanup_source(work_dir: Path) -> None:

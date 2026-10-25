@@ -15,6 +15,7 @@ ROOT = Path(SPECPATH).resolve().parent
 datas = [
     (str(ROOT / "ui" / "dist"), "ui/dist"),
     (str(ROOT / "shell" / "assets"), "assets"),
+    (str(ROOT / "models" / "manifest.json"), "models"),
 ]
 binaries = []
 hiddenimports = [

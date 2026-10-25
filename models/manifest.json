@@ -1,0 +1,70 @@
+{
+  "models": [
+    {
+      "id": "gigaam-v3-e2e-ctc",
+      "kind": "asr",
+      "title": "GigaAM v3 e2e CTC int8",
+      "filename": "v3_e2e_ctc.int8.onnx",
+      "url": "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/main/v3_e2e_ctc.int8.onnx",
+      "size_bytes": 224893347,
+      "sha256": "",
+      "license": "MIT",
+      "note": "Основная ASR-модель (скачивается автоматически при первом запуске)"
+    },
+    {
+      "id": "gigaam-multilingual-ctc",
+      "kind": "asr",
+      "title": "GigaAM Multilingual CTC",
+      "filename": "gigaam-multilingual-ctc.int8.onnx",
+      "url": "https://huggingface.co/istupakov/gigaam-multilingual-ctc-onnx/resolve/main/model.int8.onnx",
+      "size_bytes": 224893347,
+      "sha256": "",
+      "license": "MIT",
+      "note": "5 языков (RU, EN, KK, KY, UZ), без пунктуации"
+    },
+    {
+      "id": "t-lite-it-2.1-8b-q4_k_m",
+      "kind": "llm-gguf",
+      "title": "T-lite-it-2.1 8B Q4_K_M (T-Bank)",
+      "filename": "t-lite-it-2.1-8b.Q4_K_M.gguf",
+      "url": "https://huggingface.co/TrustAI-Tech/t-lite-it-2.1-8b/resolve/main/t-lite-it-2.1-8b.Q4_K_M.gguf",
+      "size_bytes": 4935843840,
+      "sha256": "",
+      "license": "Apache-2.0",
+      "note": "Рекомендуемая русская LLM для саммари (8 ГБ RAM)"
+    },
+    {
+      "id": "qwen3-4b-q4_k_m",
+      "kind": "llm-gguf",
+      "title": "Qwen3-4B-Instruct Q4_K_M",
+      "filename": "Qwen3-4B-Instruct-Q4_K_M.gguf",
+      "url": "https://huggingface.co/Qwen/Qwen3-4B-Instruct/resolve/main/Qwen3-4B-Instruct-Q4_K_M.gguf",
+      "size_bytes": 2576980377,
+      "sha256": "",
+      "license": "Apache-2.0",
+      "note": "Лёгкая мультиязычная LLM (4 ГБ RAM)"
+    },
+    {
+      "id": "gigaam-v3-e2e-ctc-int8",
+      "kind": "asr",
+      "title": "GigaAM v3 e2e CTC int8",
+      "filename": "v3_e2e_ctc.int8.onnx",
+      "url": "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/main/v3_e2e_ctc.int8.onnx",
+      "size_bytes": 224893347,
+      "sha256": "",
+      "license": "MIT",
+      "note": "Основная ASR-модель (скачивается автоматически при первом запуске)"
+    },
+    {
+      "id": "silero-vad-v5-onnx",
+      "kind": "vad",
+      "title": "Silero VAD v5 ONNX",
+      "filename": "silero_vad.onnx",
+      "url": "https://huggingface.co/istupakov/silero-vad-onnx/resolve/main/silero_vad.onnx",
+      "size_bytes": 2432648,
+      "sha256": "",
+      "license": "MIT",
+      "note": "Нарезка длинных аудио на речевые сегменты"
+    }
+  ]
+}

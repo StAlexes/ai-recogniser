@@ -16,12 +16,14 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from airec.api import jobs, models, system
 from airec.api import llm as llm_api
+from airec.api import models as models_api
 from airec.api import rag as rag_api
 from airec.api import settings as settings_api
 from airec.asr.manager import JobManager
 from airec.core.config import Settings
 from airec.core.paths import AppPaths
 from airec.core.security import TokenAuthMiddleware
+from airec.models.manager import ModelManager
 from airec.version import __version__
 
 log = logging.getLogger(__name__)
@@ -84,6 +86,7 @@ def create_app(
     app.state.port = port
     app.state.started_at = time.time()
     app.state.jobs = JobManager(paths, lambda: app.state.settings)
+    app.state.models = ModelManager(paths.models)
 
     app.add_middleware(TokenAuthMiddleware, token=token, enabled=auth_enabled)
     app.add_middleware(
@@ -99,6 +102,7 @@ def create_app(
     app.include_router(models.router)
     app.include_router(rag_api.router)
     app.include_router(llm_api.router)
+    app.include_router(models_api.router)
 
     @app.get("/healthz", include_in_schema=False)
     def healthz() -> dict[str, str]:

@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
+import httpx
+
 from airec.core.paths import APP_TITLE, AppPaths, resource_root
 from airec.version import __version__
 
@@ -542,6 +544,9 @@ class TrayIcon:
         self._icon = pystray.Icon(
             "airec", _load_tray_image(), f"{APP_TITLE} — очередь: 0", menu
         )
+        from airec.notify.notifier import set_icon
+
+        set_icon(self._icon)
         self._thread = threading.Thread(target=self._run, name="tray", daemon=True)
         self._thread.start()
 
@@ -654,7 +659,7 @@ class ShellApp:
 # --------------------------------------------------------------------------- #
 
 
-def run_gui(paths: AppPaths) -> int:
+def run_gui(paths: AppPaths, args: argparse.Namespace) -> int:
     # Imported lazily so --help / --smoke-test / --autostart stay fast and work
     # even when WebView2 or pythonnet is unavailable.
     import webview
@@ -673,6 +678,15 @@ def run_gui(paths: AppPaths) -> int:
     settings = load_settings(paths.config_file)
     core = start_core(paths)
     LOG.info("core ready: version=%s port=%s", core.version, core.port)
+
+    # Добавить файлы из контекстного меню в очередь (если переданы).
+    if args.files:
+        threading.Thread(
+            target=enqueue_files,
+            args=(core, args.files, core.token),
+            name="context-menu-enqueue",
+            daemon=True,
+        ).start()
 
     app: ShellApp | None = None
     try:
@@ -701,7 +715,6 @@ def run_gui(paths: AppPaths) -> int:
 
 
 def run_smoke_test(paths: AppPaths) -> int:
-    """Headless end-to-end check: core boot, session.json, /healthz, cleanup."""
     core: CoreHandle | None = None
     try:
         core = start_core(paths)
@@ -723,6 +736,51 @@ def run_smoke_test(paths: AppPaths) -> int:
         stop_core(core, paths)
 
 
+def enqueue_files(
+    core: CoreHandle, files: list[str], token: str | None = None
+) -> list[str]:
+    """Add files to the core job queue via multipart upload.
+
+    Returns list of job ids.  Errors are logged, not raised, so a context-menu
+    launch never crashes the shell.
+    """
+    queued: list[str] = []
+    for file_path in files:
+        path = Path(file_path)
+        if not path.is_file():
+            LOG.warning("context-menu file not found: %s", file_path)
+            continue
+        try:
+            with path.open("rb") as handle:
+                files_payload = {"file": (path.name, handle, "application/octet-stream")}
+                headers: dict[str, str] = {}
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+                resp = httpx.post(
+                    f"{core.base_url}/api/v1/jobs",
+                    files=files_payload,
+                    headers=headers,
+                    timeout=30.0,
+                )
+            if resp.status_code == 202:
+                job_id = resp.json().get("id")
+                if job_id:
+                    queued.append(job_id)
+                    LOG.info("context-menu job queued: %s (%s)", job_id, path.name)
+                else:
+                    LOG.warning("job queued without id for %s", path.name)
+            else:
+                LOG.warning(
+                    "cannot enqueue %s: HTTP %s %s",
+                    path.name,
+                    resp.status_code,
+                    resp.text[:200],
+                )
+        except Exception as exc:  # never crash the shell on context-menu launch
+            LOG.exception("cannot enqueue %s: %s", path.name, exc)
+    return queued
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="AI Recogniser",
@@ -741,6 +799,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--version", action="version", version=f"{APP_TITLE} {__version__}"
+    )
+    parser.add_argument(
+        "files",
+        metavar="FILE",
+        nargs="*",
+        help="файл(ы) для добавления в очередь распознавания (контекстное меню)",
     )
     return parser.parse_args(argv)
 
@@ -788,7 +852,7 @@ def main(argv: list[str] | None = None) -> int:
                 message_box(f"{APP_TITLE} уже запущен.", error=False)
             return 0
 
-        return run_gui(paths)
+        return run_gui(paths, args)
     except Exception as exc:
         LOG.exception("fatal shell error")
         message_box(
