@@ -10,18 +10,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from airec.asr.audio import AudioError, prepare_wav
+from airec.asr.audio import AudioError, prepare_wav, read_pcm16_mono
+from airec.asr.vad import (
+    DEFAULT_MAX_SEGMENT_S,
+    DEFAULT_MIN_SILENCE_MS,
+    DEFAULT_SPEECH_PAD_MS,
+    SAMPLE_RATE,
+    SHORT_AUDIO_SECONDS,
+    SpeechSegment,
+    VadError,
+    join_segments,
+    segment_and_recognize,
+)
 
 log = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "gigaam-v3-e2e-ctc"
 QUANTIZATION = "int8"
 
-# GigaAM ONNX has fixed positional embeddings (~5000 frames).  Audio longer
-# than this limit fails with an ONNX broadcast/shape error instead of a
-# readable message.  Until VAD/chunking is implemented (M1 remainder), reject
-# overly long input up front with a human-friendly error.
-MAX_AUDIO_SECONDS = 300
+# Used only when Silero VAD cannot be loaded.  60 s is well below GigaAM's
+# fixed positional limit (~200 s), so a long file still gets transcribed.
+FALLBACK_WINDOW_SECONDS = 60.0
 
 ProgressCallback = Callable[[float, str], None]
 
@@ -37,6 +46,7 @@ class TranscriptionResult:
     duration_s: float | None
     elapsed_s: float
     rtf: float | None
+    segments: tuple[SpeechSegment, ...] = ()
 
 
 _model: Any | None = None
@@ -91,6 +101,43 @@ def _load_model(model_id: str, cpu_threads: int) -> Any:
         return model
 
 
+def _recognize_fixed_windows(
+    model: Any,
+    wav_path: Path,
+    notify: ProgressCallback,
+    *,
+    window_s: float = FALLBACK_WINDOW_SECONDS,
+) -> tuple[str, tuple[SpeechSegment, ...]]:
+    """Fallback for a missing VAD model: cut the WAV into fixed windows."""
+    audio = read_pcm16_mono(wav_path, sample_rate=SAMPLE_RATE)
+    total = len(audio) / SAMPLE_RATE
+    if total <= 0:
+        return "", ()
+
+    window = max(float(window_s), 5.0)
+    texts: list[str] = []
+    segments: list[SpeechSegment] = []
+    offset = 0.0
+    index = 0
+
+    while offset < total:
+        end = min(offset + window, total)
+        index += 1
+        notify(
+            0.3 + 0.6 * (end / total),
+            f"Распознавание сегментов: {index}",
+        )
+        chunk = audio[int(offset * SAMPLE_RATE) : int(end * SAMPLE_RATE)]
+        text = model.recognize(chunk, sample_rate=SAMPLE_RATE)
+        cleaned = text.strip() if isinstance(text, str) else ""
+        if cleaned:
+            texts.append(cleaned)
+            segments.append(SpeechSegment(offset, end, cleaned))
+        offset = end
+
+    return " ".join(texts).strip(), tuple(segments)
+
+
 def transcribe(
     source: Path,
     *,
@@ -99,8 +146,17 @@ def transcribe(
     ffmpeg: str | None = None,
     work_dir: Path,
     progress: ProgressCallback | None = None,
+    vad_enabled: bool = True,
+    vad_max_segment_s: float = DEFAULT_MAX_SEGMENT_S,
+    vad_min_silence_ms: float = DEFAULT_MIN_SILENCE_MS,
+    vad_speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS,
 ) -> TranscriptionResult:
     """Convert *source* if needed and recognise it on the CPU.
+
+    Files longer than :data:`SHORT_AUDIO_SECONDS` are split by Silero VAD into
+    speech segments, recognised one by one and glued back into one transcript.
+    If VAD is disabled or unavailable, a fixed-window fallback keeps long files
+    working without hitting GigaAM's positional limit.
 
     The caller is responsible for serialising calls: the model and ONNX Runtime
     session are shared, and one worker avoids memory spikes and races.
@@ -117,30 +173,57 @@ def transcribe(
             ffmpeg=ffmpeg,
         )
 
-        if duration and duration > MAX_AUDIO_SECONDS:
-            raise AsrError(
-                f"Аудио слишком длинное для текущей модели "
-                f"({duration:.0f} с, лимит {MAX_AUDIO_SECONDS} с). "
-                "Разбейте файл на части покороче или подождите нарезки по "
-                "сегментам (VAD) в следующем релизе."
-            )
-
         notify(0.2, "Загрузка модели")
         model = _load_model(model_id, cpu_threads)
 
-        notify(0.4, "Распознавание")
-        try:
-            text = model.recognize(str(wav_path), channel="mean")
-        except AudioError:
-            raise
-        except Exception as exc:
-            raise AsrError(
-                f"Ошибка распознавания: {exc}. "
-                "Если файл длинный, попробуйте разобрать его на части."
-            ) from exc
+        segments: tuple[SpeechSegment, ...] = ()
+        used_vad = False
 
-        if not isinstance(text, str):
-            raise AsrError("Модель вернула неожиданный результат.")
+        if vad_enabled and (duration is None or duration > SHORT_AUDIO_SECONDS):
+            notify(0.28, "Нарезка по сегментам")
+            try:
+                collected: list[SpeechSegment] = []
+                for segment in segment_and_recognize(
+                    model,
+                    wav_path,
+                    cpu_threads=cpu_threads,
+                    max_segment_s=vad_max_segment_s,
+                    min_silence_ms=vad_min_silence_ms,
+                    speech_pad_ms=vad_speech_pad_ms,
+                ):
+                    collected.append(segment)
+                    if duration and duration > 0:
+                        value = 0.32 + 0.55 * min(segment.end_s / duration, 1.0)
+                    else:
+                        value = 0.5
+                    notify(value, f"Распознавание сегментов: {len(collected)}")
+                segments = tuple(collected)
+                used_vad = True
+                log.info("VAD segmentation: %d segments for %s", len(segments), source.name)
+            except VadError as exc:
+                log.warning("VAD unavailable, using fixed windows: %s", exc)
+            except Exception as exc:  # fall back instead of failing the whole job
+                log.warning("VAD segmentation failed, using fixed windows: %s", exc)
+
+        if used_vad:
+            text = join_segments(segments)
+        elif duration is not None and duration > FALLBACK_WINDOW_SECONDS:
+            notify(0.3, "Распознавание по окнам")
+            text, segments = _recognize_fixed_windows(model, wav_path, notify)
+        else:
+            notify(0.4, "Распознавание")
+            try:
+                text = model.recognize(str(wav_path), channel="mean")
+            except AudioError:
+                raise
+            except Exception as exc:
+                raise AsrError(f"Ошибка распознавания: {exc}") from exc
+
+            if not isinstance(text, str):
+                raise AsrError("Модель вернула неожиданный результат.")
+            text = text.strip()
+            if text:
+                segments = (SpeechSegment(0.0, duration or 0.0, text),)
 
         elapsed = max(time.perf_counter() - started, 0.001)
         rtf = duration / elapsed if duration and duration > 0 else None
@@ -151,6 +234,7 @@ def transcribe(
             duration_s=duration,
             elapsed_s=elapsed,
             rtf=rtf,
+            segments=segments,
         )
     except AudioError as exc:
         raise AsrError(str(exc)) from exc

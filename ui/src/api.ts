@@ -25,6 +25,10 @@ export interface Settings {
   cpu_threads: number;
   max_parallel_jobs: number;
   external_llm_enabled: boolean;
+  vad_enabled: boolean;
+  vad_max_segment_s: number;
+  vad_min_silence_ms: number;
+  vad_speech_pad_ms: number;
   rag_enabled: boolean;
   rag_url: string;
   rag_k: number;
@@ -45,15 +49,23 @@ export interface JobSummary {
   duration_s: number | null;
   elapsed_s: number | null;
   rtf: number | null;
+  segment_count: number;
   size_bytes: number;
   audio_format: string;
   error: string | null;
+}
+
+export interface JobSegment {
+  start_s: number;
+  end_s: number;
+  text: string;
 }
 
 export interface JobDetail extends JobSummary {
   text: string;
   result_file: string | null;
   result_url: string | null;
+  segments: JobSegment[];
 }
 
 export interface JobsResponse {

@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import wave
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -144,6 +145,36 @@ def prepare_wav(
     if not destination.is_file() or destination.stat().st_size <= 44:
         raise AudioError("ffmpeg создал пустой WAV: в файле нет звуковой дорожки.")
     return destination, wav_duration(destination)
+
+
+def read_pcm16_mono(path: Path, *, sample_rate: int = 16_000) -> Any:
+    """Read a normalised 16 kHz mono PCM16 WAV into a float32 NumPy array.
+
+    This is the fallback path when VAD is unavailable: the caller cuts the
+    array into fixed-length windows and passes each window to onnx-asr
+    directly, so no temporary WAV files are needed.
+    """
+    try:
+        import numpy as np
+    except ImportError as exc:  # pragma: no cover - asr extras are installed
+        raise AudioError("Для нарезки аудио нужен numpy (extras «asr»).") from exc
+
+    try:
+        with wave.open(str(path), "rb") as wav:
+            rate = wav.getframerate()
+            channels = wav.getnchannels()
+            width = wav.getsampwidth()
+            if rate != sample_rate or channels != 1 or width != 2:
+                raise AudioError(
+                    "Ожидался WAV "
+                    f"{sample_rate} Гц mono PCM16, получено {rate} Гц, "
+                    f"каналов {channels}, {width * 8} бит на отсчёт."
+                )
+            frames = wav.readframes(wav.getnframes())
+    except (OSError, EOFError, wave.Error) as exc:
+        raise AudioError(f"Не удалось прочитать WAV: {exc}") from exc
+
+    return np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
 
 
 def format_duration(seconds: float | None) -> str:

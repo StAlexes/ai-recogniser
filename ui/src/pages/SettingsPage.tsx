@@ -339,6 +339,101 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
                   </Dropdown>
                 </div>
               </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Нарезка по сегментам (VAD)</span>
+                  <span className="settings-hint">
+                    Длинные записи делятся по паузам речи перед распознаванием.
+                  </span>
+                </div>
+                <div className="settings-control">
+                  <Switch
+                    aria-label="Нарезка по сегментам VAD"
+                    checked={settings.vad_enabled}
+                    onChange={(_event, data) => {
+                      update({ vad_enabled: data.checked });
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Максимальная длина сегмента</span>
+                  <span className="settings-hint">
+                    От 5 до 120 секунд. Слишком длинный сегмент не влезет в модель.
+                  </span>
+                </div>
+                <div className="settings-control settings-control-rag-k">
+                  <Input
+                    type="number"
+                    min={5}
+                    max={120}
+                    aria-label="Максимальная длина сегмента, секунды"
+                    value={String(settings.vad_max_segment_s)}
+                    disabled={!settings.vad_enabled}
+                    onChange={(_event, data) => {
+                      const parsed = Number.parseInt(data.value, 10);
+                      if (Number.isFinite(parsed)) {
+                        update({ vad_max_segment_s: Math.min(120, Math.max(5, parsed)) });
+                      }
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Минимальная пауза</span>
+                  <span className="settings-hint">
+                    Паузы короче этого значения не разделяют сегменты, мс.
+                  </span>
+                </div>
+                <div className="settings-control settings-control-rag-k">
+                  <Input
+                    type="number"
+                    min={50}
+                    max={5000}
+                    step={50}
+                    aria-label="Минимальная пауза, миллисекунды"
+                    value={String(settings.vad_min_silence_ms)}
+                    disabled={!settings.vad_enabled}
+                    onChange={(_event, data) => {
+                      const parsed = Number.parseInt(data.value, 10);
+                      if (Number.isFinite(parsed)) {
+                        update({ vad_min_silence_ms: Math.min(5000, Math.max(50, parsed)) });
+                      }
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Отступ вокруг речи</span>
+                  <span className="settings-hint">
+                    Сколько миллисекунд речи оставлять до и после сегмента.
+                  </span>
+                </div>
+                <div className="settings-control settings-control-rag-k">
+                  <Input
+                    type="number"
+                    min={0}
+                    max={1000}
+                    step={10}
+                    aria-label="Отступ вокруг речи, миллисекунды"
+                    value={String(settings.vad_speech_pad_ms)}
+                    disabled={!settings.vad_enabled}
+                    onChange={(_event, data) => {
+                      const parsed = Number.parseInt(data.value, 10);
+                      if (Number.isFinite(parsed)) {
+                        update({ vad_speech_pad_ms: Math.min(1000, Math.max(0, parsed)) });
+                      }
+                    }}
+                  />
+                </div>
+              </div>
             </div>
           </section>
 

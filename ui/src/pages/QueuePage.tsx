@@ -537,6 +537,9 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
                 {detail.rtf !== null
                   ? ` · RTFx ${detail.rtf.toFixed(1).replace('.', ',')}`
                   : ''}
+                {detail.status === 'done' && detail.segments.length > 0
+                  ? ` · сегментов: ${detail.segments.length}`
+                  : ''}
               </p>
             </div>
             <div className="transcript-actions">
@@ -597,7 +600,8 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
 
       <div className="info-grid">
         <InfoCard tone="brand" icon={<SparkleRegular fontSize={18} />} title="GigaAM v3 · 214 МБ">
-          Русский язык, пунктуация и нормализация из коробки. Модель загружается один раз.
+          Русский язык, пунктуация и нормализация из коробки. Длинные записи режутся
+          Silero VAD на сегменты по паузам.
         </InfoCard>
         <InfoCard
           tone="teal"

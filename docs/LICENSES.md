@@ -28,7 +28,7 @@ AI Recogniser распространяется по лицензии MIT (см. 
 | onnx-asr | загрузка и запуск ASR-моделей | MIT | |
 | ONNX Runtime | инференс ASR на CPU | MIT | |
 | NumPy | массивы/аудио | BSD-3-Clause | |
-| huggingface-hub | загрузка модели GigaAM | Apache-2.0 | |
+| huggingface-hub | загрузка моделей GigaAM и Silero VAD | Apache-2.0 | |
 | PyYAML | конфигурация onnx-asr | MIT | |
 | certifi | CA-сертификаты httpx | MPL-2.0 | |
 
@@ -38,7 +38,7 @@ AI Recogniser распространяется по лицензии MIT (см. 
 |---|---|---|
 | GigaAM v3 e2e CTC (ai-sage / salute-developers) | MIT | основная ASR-модель, 214 МБ int8, скачивается при первом запуске |
 | GigaAM Multilingual (220M/600M) | MIT | опциональный ASR для KZ/KG/UZ/EN (план) |
-| Silero VAD | MIT | нарезка аудио (план) |
+| Silero VAD v5 (ONNX, `istupakov/silero-vad-onnx`) | MIT | нарезка длинных записей; ~2 МБ, скачивается при первом длинном файле |
 | pyannote segmentation-3.0 + CAM++ (3D-Speaker) | MIT / Apache-2.0 | диаризация, beta (план) |
 | multilingual-e5 | MIT | эмбеддинги базы знаний (план) |
 | Qwen3-4B-Instruct | Apache-2.0 | локальная LLM, лёгкий профиль (план) |

@@ -41,6 +41,13 @@ class Settings(BaseModel):
     max_parallel_jobs: int = Field(default=1, ge=1, le=8)
     external_llm_enabled: bool = False
 
+    # Long recordings are split into speech segments with Silero VAD.  The
+    # segment cap is deliberately far below GigaAM's positional limit (~200 s).
+    vad_enabled: bool = True
+    vad_max_segment_s: int = Field(default=30, ge=5, le=120)
+    vad_min_silence_ms: int = Field(default=300, ge=50, le=5000)
+    vad_speech_pad_ms: int = Field(default=100, ge=0, le=1000)
+
     # ragkb runs as a separate, local HTTP service.  It is optional: when it is
     # unavailable, transcription and the rest of the core keep working.
     rag_enabled: bool = True

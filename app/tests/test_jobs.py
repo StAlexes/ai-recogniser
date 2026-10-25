@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from airec.api.app import create_app
 from airec.asr.manager import Job, JobManager, JobValidationError
 from airec.asr.service import TranscriptionResult
+from airec.asr.vad import SpeechSegment
 from airec.core.config import Settings
 from airec.core.paths import AppPaths
 
@@ -43,6 +44,10 @@ def fake_transcriber(source: Path, **kwargs: object) -> TranscriptionResult:
         duration_s=12.0,
         elapsed_s=1.1,
         rtf=10.9,
+        segments=(
+            SpeechSegment(0.0, 6.0, "Привет, это"),
+            SpeechSegment(6.0, 12.0, "тестовая расшифровка."),
+        ),
     )
 
 
@@ -69,6 +74,8 @@ def test_manager_transcribes_and_persists(tmp_path: Path) -> None:
     assert finished.status == "done"
     assert finished.text == "Привет, это тестовая расшифровка."
     assert finished.rtf == 10.9
+    assert len(finished.segments) == 2
+    assert finished.detail()["segments"][0]["text"] == "Привет, это"
     assert finished.detail()["result_url"] == f"/api/v1/jobs/{job.id}/result"
     result = manager.result_path(job.id)
     assert result is not None
@@ -76,6 +83,8 @@ def test_manager_transcribes_and_persists(tmp_path: Path) -> None:
     summary = manager.list()[0]
     assert "text" not in summary
     assert "result_file" not in summary
+    assert "segments" not in summary
+    assert summary["segment_count"] == 2
 
     manager.shutdown()
     restored = JobManager(paths, lambda: Settings())

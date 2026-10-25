@@ -35,6 +35,7 @@ hiddenimports = [
     "airec.asr.audio",
     "airec.asr.manager",
     "airec.asr.service",
+    "airec.asr.vad",
     "airec.rag.client",
     "multipart",
     "python_multipart",

@@ -1,5 +1,7 @@
 # Builds the native Windows app: UI bundle + PyInstaller one-folder exe.
 # Usage:
+#   build.cmd
+#   build.cmd -SkipUi
 #   powershell -ExecutionPolicy Bypass -File tools\build_exe.ps1
 #   powershell -ExecutionPolicy Bypass -File tools\build_exe.ps1 -SkipUi
 param(
@@ -37,6 +39,14 @@ if (-not $SkipUi) {
 
 if (-not (Test-Path (Join-Path $Ui "dist\index.html"))) {
     throw "UI build is missing: ui\dist\index.html. Run without -SkipUi first."
+}
+
+# The previous build may still be running from dist and hold
+# _internal\...\ClrLoader.dll, which makes PyInstaller fail with PermissionError.
+$Running = Get-Process -Name "AI Recogniser" -ErrorAction SilentlyContinue
+if ($Running) {
+    $Pids = ($Running | Select-Object -ExpandProperty Id) -join ", "
+    throw "Close AI Recogniser before building (running PIDs: $Pids)."
 }
 
 $BuildDir = Join-Path $Root "build"

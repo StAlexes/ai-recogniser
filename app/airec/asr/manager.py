@@ -64,6 +64,7 @@ class Job:
     duration_s: float | None = None
     elapsed_s: float | None = None
     rtf: float | None = None
+    segments: list[dict[str, Any]] = field(default_factory=list)
     size_bytes: int = 0
     audio_format: str = ""
     text: str = ""
@@ -74,6 +75,8 @@ class Job:
         data = asdict(self)
         data.pop("text", None)
         data.pop("result_file", None)
+        data["segment_count"] = len(self.segments)
+        data.pop("segments", None)
         return data
 
     def detail(self) -> dict[str, Any]:
@@ -232,6 +235,10 @@ class JobManager:
                 ffmpeg=self._ffmpeg,
                 work_dir=work_dir,
                 progress=progress,
+                vad_enabled=settings.vad_enabled,
+                vad_max_segment_s=settings.vad_max_segment_s,
+                vad_min_silence_ms=settings.vad_min_silence_ms,
+                vad_speech_pad_ms=settings.vad_speech_pad_ms,
             )
             transcript_path = self._job_dir(job_id) / "transcript.txt"
             transcript_path.parent.mkdir(parents=True, exist_ok=True)
@@ -248,6 +255,7 @@ class JobManager:
                 job.duration_s = result.duration_s
                 job.elapsed_s = result.elapsed_s
                 job.rtf = result.rtf
+                job.segments = [asdict(segment) for segment in result.segments]
                 job.result_file = str(transcript_path)
                 try:
                     self._persist(job)

@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from airec.core.config import Settings, load_settings, save_settings
 
 
@@ -31,6 +34,20 @@ def test_unknown_keys_are_ignored(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     path.write_text(json.dumps({"theme": "light", "future_option": 42}), encoding="utf-8")
     assert load_settings(path).theme == "light"
+
+
+def test_vad_settings_defaults_and_bounds() -> None:
+    settings = Settings()
+
+    assert settings.vad_enabled is True
+    assert settings.vad_max_segment_s == 30
+    assert settings.vad_min_silence_ms == 300
+    assert settings.vad_speech_pad_ms == 100
+
+    with pytest.raises(ValidationError):
+        Settings(vad_max_segment_s=1000)
+    with pytest.raises(ValidationError):
+        Settings(vad_min_silence_ms=0)
 
 
 def test_settings_with_utf8_bom_are_read(tmp_path: Path) -> None:

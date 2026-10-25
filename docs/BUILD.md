@@ -35,16 +35,23 @@ One-folder выбран осознанно: при one-file PyInstaller расп
 
 ## Команды
 
-```powershell
-# из корня репозитория
-.\.venv\Scripts\pip install -e ".[dev,shell,asr,build]"
+```bat
+REM из корня репозитория
+REM запуск из исходников «на лету»: ядро + окно + трей
+run.cmd
 
-# UI + PyInstaller
-powershell -ExecutionPolicy Bypass -File tools\build_exe.ps1
+REM сборка нативного exe в dist: UI + PyInstaller
+build.cmd
 
-# только exe, если ui\dist уже собран
-powershell -ExecutionPolicy Bypass -File tools\build_exe.ps1 -SkipUi
+REM только exe, если ui\dist уже собран
+build.cmd -SkipUi
 ```
+
+`run.cmd` проверяет `.venv`, при отсутствии `ui\dist\index.html` собирает UI и запускает
+`shell\main.py`; остальные аргументы передаются в оболочку. `build.cmd` — тонкая обёртка над
+`tools\build_exe.ps1`: передаёт аргументы (`-SkipUi`), возвращает его код выхода и печатает путь
+к готовому exe. Если приложение запущено из `dist`, скрипт остановится с понятной ошибкой:
+процесс держит `_internal\...\ClrLoader.dll` и PyInstaller не сможет перезаписать папку.
 
 Скрипт собирает UI (`npm.cmd run build`), затем запускает PyInstaller со
 [`packaging/airec.spec`](../packaging/airec.spec). Артефакты: `dist\` и `build\pyinstaller\`,
@@ -73,6 +80,11 @@ PyInstaller — только сборочная зависимость (extra `b
 `python-multipart`, потому что часть импортов и бинарников создаётся динамически и не видна
 статическому анализатору PyInstaller. Предупреждение `onnxruntime.quantization requires onnx`
 безвредно: квантование приложению не нужно, ASR-модель уже в int8.
+
+Silero VAD (~2 МБ) в поставку не входит: `onnx-asr` скачивает его из
+`istupakov/silero-vad-onnx` при первом длинном файле и кэширует рядом с GigaAM. После этого
+нарезка работает офлайн. Если VAD-модель недоступна, ядро переходит на фиксированные окна по
+60 секунд, поэтому длинный файл всё равно будет распознан.
 
 Метаданные exe (версия файла, продукт, copyright) заданы в
 [`packaging/version_info.txt`](../packaging/version_info.txt). При смене версии приложения
@@ -139,6 +151,27 @@ Stop-Process -Id $core.Id
 Ожидается статус `done`, корректный русский текст и файл `transcript.txt`. Первый запуск
 включает загрузку модели и поэтому медленнее; затем RTFx заметно выше.
 
+### 2a. Длинный файл и VAD
+
+Проверяет, что запись длиннее прежнего лимита 300 с не падает с ошибкой ONNX, а режется на
+сегменты. Можно склеить тестовый файл из `data/poc/gigaam-example.mp3`:
+
+```powershell
+$ff = (Resolve-Path ".\.venv\Lib\site-packages\imageio_ffmpeg\binaries\ffmpeg-*.exe").Path
+& $ff -nostdin -hide_banner -loglevel error -y -stream_loop 30 `
+    -i "data\poc\gigaam-example.mp3" -t 678 -vn -ac 1 -ar 16000 -c:a pcm_s16le `
+    "$env:TEMP\airec-long-678s.wav"
+
+$job = curl.exe -s -F "file=@$env:TEMP\airec-long-678s.wav;type=audio/wav" `
+    http://127.0.0.1:8766/api/v1/jobs | ConvertFrom-Json
+Invoke-RestMethod "http://127.0.0.1:8766/api/v1/jobs/$($job.id)"
+```
+
+Ожидается `status: done`, `duration_s` около 678, несколько десятков сегментов
+(`segments`), непустой `text` и корректный `transcript.txt`. В `job.json` фазы проходят через
+«Нарезка по сегментам» и «Распознавание сегментов». Первый длинный файл дополнительно скачивает
+Silero VAD (~2 МБ); после кэширования VAD работает офлайн.
+
 ### 3. RAG в frozen-ядре
 
 Нужен отдельно запущенный `ragkb` на `http://127.0.0.1:8000`.
@@ -175,7 +208,8 @@ CDP только на loopback. В обычном запуске порт не �
 
 ## Ограничения текущей сборки
 
-- **ASR:** только GigaAM v3 e2e CTC int8 на CPU; нет VAD, таймкодов, сегментов и диаризации.
+- **ASR:** GigaAM v3 e2e CTC int8 на CPU, Silero VAD для длинных записей. Таймкодов в
+  `transcript.txt` и диаризации пока нет; сегменты сохраняются в `job.json` для будущего экспорта.
 - **Очередь:** in-memory, один worker; нет SQLite, отмены, повтора и настройки параллелизма.
   Незавершённая задача после перезапуска помечается как прерванная.
 - **Результаты:** только `.txt`; экспорт SRT/VTT/Markdown — позже.
