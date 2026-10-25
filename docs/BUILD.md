@@ -215,6 +215,9 @@ CDP только на loopback. В обычном запуске порт не �
   API `POST /api/v1/jobs/{id}/cancel` и `POST /api/v1/jobs/{id}/retry`. Исходный файл
   хранится в `results/<job_id>/source<ext>`. Незавершённая задача после перезапуска
   помечается как прерванная.
+- **Менеджер моделей:** каталог и скачивание моделей с проверкой SHA-256
+  (`app/airec/models/`, API `GET /api/v1/models`, `POST /api/v1/models/download/{id}`).
+- **Оповещения:** Windows toast-уведомления через иконку трея при завершении и ошибке задач.
 - **Экспорт:** только `.txt` в `transcript.txt`; через API `GET /api/v1/jobs/{id}/export`
   доступны SRT, VTT, Markdown, JSON с тайм-кодами сегментов VAD.
 - **Результаты:** только `.txt`; экспорт SRT/VTT/Markdown — позже.

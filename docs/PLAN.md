@@ -411,7 +411,7 @@ AI Recogniser/
 | Этап | Результат | Дни |
 |---|---|---|
 | **M0. Каркас** | репо, git, версия, логи, конфиг, FastAPI, окно WebView2, трей, single-instance, автозапуск, CI | 2–3 |
-| **M1. Пайплайн** (в работе) | готово: ffmpeg, mp3/mp4, GigaAM v3 e2e, VAD-нарезка Silero, диаризация Wespeaker, экспорт SRT/VTT/MD/JSON, отмена/повтор, очередь на SQLite с прогрессом, txt, UI, frozen exe, `run.cmd`/`build.cmd` | 5–7 |
+| **M1. Пайплайн** (в работе) | готово: ffmpeg, mp3/mp4, GigaAM v3 e2e, VAD-нарезка Silero, диаризация Wespeaker, экспорт SRT/VTT/MD/JSON, отмена/повтор, менеджер моделей, оповещения, контекстное меню Windows, очередь на SQLite с прогрессом, txt, UI, frozen exe, `run.cmd`/`build.cmd` | 5–7 |
 | **M2. UI v1** | очередь, карточки, drag&drop, экран результата, настройки, тосты, иконка прогресса | 4–6 |
 | **M3. LLM** | llama-server, менеджер моделей, саммари map-reduce + схема, Q&A, глоссарий | 5–7 |
 | **M4. RAG** | импорт, чанкинг, эмбеддинги, sqlite-vec, цитаты, переиндексация | 4–6 |
