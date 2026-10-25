@@ -92,6 +92,8 @@ def test_manager_transcribes_and_persists(tmp_path: Path) -> None:
     assert restored_job is not None
     assert restored_job.status == "done"
     assert restored_job.text == finished.text
+    assert len(restored_job.segments) == 2
+    assert restored_job.segments[0]["text"] == "Привет, это"
     assert restored.result_path(job.id) is not None
     restored.shutdown()
 

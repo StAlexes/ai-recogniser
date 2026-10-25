@@ -1,9 +1,13 @@
-"""In-process ASR job queue.
+"""ASR job queue backed by SQLite.
 
-M1 deliberately keeps the queue small: one worker, in-memory state and a small
-JSON result folder.  That is enough to upload a file, follow progress and get a
-transcript without adding SQLite before the data model is settled.  Metadata is
-persisted per job so finished work survives a restart and can be read again.
+State lives in ``data/airec_jobs.sqlite`` (WAL mode) so jobs survive process
+restarts and crashes.  In-flight futures remain in memory (process-local); on
+startup any jobs left ``queued``/``running`` are marked ``error`` with a clear
+message so the user can re-upload them.
+
+Per-job result folders (``data/results/<job_id>/`` with ``job.json`` and
+``transcript.txt``) are kept for compatibility; ``job.json`` is now written as a
+side-effect of the SQLite upsert so existing tooling keeps working.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from typing import Any
 from airec.asr.audio import SUPPORTED_EXTENSIONS, find_ffmpeg
 from airec.asr.service import AsrError, TranscriptionResult, transcribe
 from airec.core.config import Settings
+from airec.core.db import Database
 from airec.core.paths import AppPaths
 
 log = logging.getLogger(__name__)
@@ -108,6 +113,7 @@ class JobManager:
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="airec-asr")
         self._ffmpeg = find_ffmpeg(paths.bin)
+        self._db = Database(paths.data / "airec_jobs.sqlite")
         self._load_existing()
 
     @property
@@ -124,21 +130,42 @@ class JobManager:
     def _job_meta_path(self, job_id: str) -> Path:
         return self._job_dir(job_id) / "job.json"
 
+    # ------------------------------------------------------------------ #
+    # Persistence
+    # ------------------------------------------------------------------ #
     def _persist(self, job: Job) -> None:
-        directory = self._job_dir(job.id)
-        directory.mkdir(parents=True, exist_ok=True)
-        target = self._job_meta_path(job.id)
-        tmp = target.with_suffix(".json.tmp")
-        payload = json.dumps(asdict(job), ensure_ascii=False, indent=2)
-        with tmp.open("w", encoding="utf-8", newline="\n") as fh:
-            fh.write(payload)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, target)
+        """Write job state to SQLite and keep job.json in sync."""
+        self._db.upsert_job(asdict(job))
+        self._write_job_json(job)
+
+    def _write_job_json(self, job: Job) -> None:
+        """Side-car JSON for external tooling; best-effort, never fatal."""
+        try:
+            directory = self._job_dir(job.id)
+            directory.mkdir(parents=True, exist_ok=True)
+            target = self._job_meta_path(job.id)
+            tmp = target.with_suffix(".json.tmp")
+            payload = json.dumps(asdict(job), ensure_ascii=False, indent=2)
+            with tmp.open("w", encoding="utf-8", newline="\n") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, target)
+        except OSError:
+            log.exception("cannot write side-car job.json for %s", job.id)
 
     def _load_existing(self) -> None:
+        """Load jobs from SQLite; migrate legacy job.json files on first run."""
+        db_jobs = self._db.list_jobs()
+        if db_jobs:
+            for row in db_jobs:
+                self._rehydrate(row)
+            return
+
+        # First run with SQLite: migrate any legacy per-job job.json files.
         if not self.results_dir.exists():
             return
+        migrated = 0
         for directory in sorted(self.results_dir.iterdir(), reverse=True):
             if not directory.is_dir():
                 continue
@@ -149,22 +176,40 @@ class JobManager:
                 payload = json.loads(meta.read_text(encoding="utf-8-sig"))
                 job = Job.from_dict(payload)
             except (OSError, ValueError, TypeError) as exc:
-                log.warning("cannot read job metadata %s: %s", meta, exc)
+                log.warning("cannot read legacy job metadata %s: %s", meta, exc)
                 continue
             if job.status in ACTIVE_STATUSES:
-                # The process stopped before the worker finished.
                 job.status = "error"
                 job.phase = "Прервано"
-                job.error = "Задача была прервана при закрытии приложения. Запустите её снова."
+                job.error = (
+                    "Задача была прервана при закрытии приложения. Запустите её снова."
+                )
                 job.finished_at = utc_now()
-                with self._lock:
-                    try:
-                        self._persist(job)
-                    except OSError:
-                        log.exception("cannot persist interrupted job %s", job.id)
-            with self._lock:
-                self._jobs[job.id] = job
+            self._db.upsert_job(asdict(job))
+            self._write_job_json(job)
+            self._rehydrate(asdict(job))
+            migrated += 1
+        if migrated:
+            log.info("migrated %d legacy job.json files to SQLite", migrated)
 
+    def _rehydrate(self, row: dict[str, Any]) -> None:
+        """Add a job row from SQLite into the in-memory index (metadata only)."""
+        segments = row.get("segments")
+        if isinstance(segments, str):
+            try:
+                segments = json.loads(segments)
+            except (TypeError, ValueError):
+                segments = []
+        elif not isinstance(segments, list):
+            segments = []
+        row["segments"] = segments
+        job = Job.from_dict(row)
+        with self._lock:
+            self._jobs[job.id] = job
+
+    # ------------------------------------------------------------------ #
+    # Submission
+    # ------------------------------------------------------------------ #
     def submit(self, uploaded: Path, original_name: str, model_id: str) -> Job:
         filename = _safe_name(original_name)
         suffix = Path(filename).suffix.lower()
@@ -226,6 +271,10 @@ class JobManager:
                     return
                 current.progress = max(current.progress, min(max(value, 0.0), 0.99))
                 current.phase = phase
+                try:
+                    self._db.upsert_job(asdict(current))
+                except OSError:
+                    log.exception("cannot persist progress for job %s", job_id)
 
         try:
             result = self._transcriber(
@@ -289,16 +338,33 @@ class JobManager:
 
     def list(self) -> list[dict[str, Any]]:
         with self._lock:
-            jobs = sorted(self._jobs.values(), key=lambda item: item.created_at, reverse=True)
+            # Prefer the authoritative SQLite state, merged with in-memory jobs
+            # (freshly submitted ones that may not be committed yet).
+            rows = self._db.list_jobs()
+            jobs = [Job.from_dict(row) for row in rows]
+            for job in self._jobs.values():
+                if job.id not in {j.id for j in jobs}:
+                    jobs.append(job)
+            jobs.sort(key=lambda item: item.created_at, reverse=True)
             return [job.summary() for job in jobs]
 
     def get(self, job_id: str) -> Job | None:
         with self._lock:
-            return self._jobs.get(job_id)
+            job = self._jobs.get(job_id)
+            if job is not None:
+                return job
+            row = self._db.get_job(job_id)
+            if row is None:
+                return None
+            job = Job.from_dict(row)
+            self._jobs[job.id] = job
+            return job
 
     def result_path(self, job_id: str) -> Path | None:
         with self._lock:
             job = self._jobs.get(job_id)
+            if job is None:
+                job = self.get(job_id)
             if job is None or job.status != "done" or not job.result_file:
                 return None
             path = Path(job.result_file)
@@ -306,3 +372,7 @@ class JobManager:
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
+        try:
+            self._db.close()
+        except Exception:  # never crash the shell on shutdown
+            log.exception("cannot close job database")
