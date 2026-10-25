@@ -48,6 +48,12 @@ class Settings(BaseModel):
     vad_min_silence_ms: int = Field(default=300, ge=50, le=5000)
     vad_speech_pad_ms: int = Field(default=100, ge=0, le=1000)
 
+    # Speaker diarization: cluster VAD segments by speaker identity using
+    # Wespeaker embeddings (optional, disabled by default).
+    diarize_enabled: bool = False
+    diarize_threshold: float = Field(default=0.70, ge=0.1, le=0.99)
+    diarize_model_path: str = ""
+
     # ragkb runs as a separate, local HTTP service.  It is optional: when it is
     # unavailable, transcription and the rest of the core keep working.
     rag_enabled: bool = True

@@ -16,6 +16,8 @@ from airec.asr.manager import ACTIVE_STATUSES, JobManager, JobValidationError
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
 
+EXPORT_FORMATS = {"txt", "srt", "vtt", "md", "json"}
+
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 
@@ -125,3 +127,32 @@ def get_result_text(request: Request, job_id: str) -> PlainTextResponse:
     if job.status in ACTIVE_STATUSES:
         raise HTTPException(status_code=409, detail="Задача ещё выполняется.")
     return PlainTextResponse(job.text, media_type="text/plain; charset=utf-8")
+
+
+@router.get("/{job_id}/export")
+def export_job(
+    request: Request, job_id: str, format: str = "txt"
+) -> FileResponse:
+    """Export a finished job transcript in the requested format.
+
+    Supported formats: txt, srt, vtt, md, json.  Defaults to txt.
+    """
+    if format not in EXPORT_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Неизвестный формат экспорта. Доступно: {', '.join(sorted(EXPORT_FORMATS))}.",
+        )
+
+    manager = _manager(request)
+    try:
+        path, download_name, content_type = manager.export_result(job_id, format)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return FileResponse(
+        path,
+        media_type=content_type,
+        filename=download_name,
+    )

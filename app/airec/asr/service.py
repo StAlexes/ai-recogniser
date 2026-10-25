@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from airec.asr.audio import AudioError, prepare_wav, read_pcm16_mono
+from airec.asr.diarization import DiarizationError, diarize_segments
 from airec.asr.vad import (
     DEFAULT_MAX_SEGMENT_S,
     DEFAULT_MIN_SILENCE_MS,
@@ -150,6 +151,9 @@ def transcribe(
     vad_max_segment_s: float = DEFAULT_MAX_SEGMENT_S,
     vad_min_silence_ms: float = DEFAULT_MIN_SILENCE_MS,
     vad_speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS,
+    diarize_enabled: bool = False,
+    diarize_threshold: float = 0.70,
+    diarize_model_path: str = "",
 ) -> TranscriptionResult:
     """Convert *source* if needed and recognise it on the CPU.
 
@@ -157,6 +161,9 @@ def transcribe(
     speech segments, recognised one by one and glued back into one transcript.
     If VAD is disabled or unavailable, a fixed-window fallback keeps long files
     working without hitting GigaAM's positional limit.
+
+    When *diarize_enabled* is true, recognised segments are clustered by
+    speaker (Wespeaker embeddings) so each segment gets a ``speaker`` label.
 
     The caller is responsible for serialising calls: the model and ONNX Runtime
     session are shared, and one worker avoids memory spikes and races.
@@ -224,6 +231,34 @@ def transcribe(
             text = text.strip()
             if text:
                 segments = (SpeechSegment(0.0, duration or 0.0, text),)
+
+        # Диаризация: кластеризация сегментов по спикерам (Wespeaker embeddings).
+        if diarize_enabled and segments:
+            notify(0.88, "Разбор по участникам")
+            try:
+                audio = read_pcm16_mono(wav_path, sample_rate=SAMPLE_RATE)
+                segment_dicts = [s.as_dict() for s in segments]
+                diarized = diarize_segments(
+                    segment_dicts,
+                    audio,
+                    SAMPLE_RATE,
+                    cpu_threads=cpu_threads,
+                    threshold=diarize_threshold,
+                    model_path=diarize_model_path or None,
+                )
+                segments = tuple(
+                    SpeechSegment(
+                        s["start_s"], s["end_s"], s["text"], speaker=s.get("speaker")
+                    )
+                    for s in diarized
+                )
+                log.info(
+                    "Diarization: %d segments, %d speakers",
+                    len(segments),
+                    len({s.speaker for s in segments if s.speaker}),
+                )
+            except DiarizationError as exc:
+                log.warning("Diarization unavailable: %s", exc)
 
         elapsed = max(time.perf_counter() - started, 0.001)
         rtf = duration / elapsed if duration and duration > 0 else None

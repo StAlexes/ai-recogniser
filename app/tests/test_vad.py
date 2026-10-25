@@ -20,4 +20,5 @@ def test_speech_segment_rounding() -> None:
         "start_s": 1.235,
         "end_s": 7.89,
         "text": "текст",
+        "speaker": None,
     }

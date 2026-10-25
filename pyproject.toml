@@ -63,7 +63,7 @@ src = ["app", "shell"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
-ignore = ["E501", "RUF001"]
+ignore = ["E501", "RUF001", "RUF002"]
 
 [tool.pytest.ini_options]
 testpaths = ["app/tests"]

@@ -437,6 +437,83 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
             </div>
           </section>
 
+          <section className="settings-card surface" aria-labelledby="settings-diarization">
+            <h2 id="settings-diarization" className="settings-card-title">
+              Диаризация (кто говорит)
+            </h2>
+            <p className="settings-card-sub">
+              Определяет участников разговора по голосу и помечает каждый сегмент
+              именем спикера. Требует загрузки модели эмбеддингов (~50 МБ).
+            </p>
+
+            <div className="settings-rows">
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Разбор по участникам</span>
+                  <span className="settings-hint">
+                    Помечать сегменты именами спикеров (Спикер 1, Спикер 2…).
+                  </span>
+                </div>
+                <div className="settings-control">
+                  <Switch
+                    aria-label="Диаризация спикеров"
+                    checked={settings.diarize_enabled}
+                    onChange={(_event, data) => {
+                      update({ diarize_enabled: data.checked });
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Порог сходства</span>
+                  <span className="settings-hint">
+                    От 0.1 до 0.99. Выше — строже группировка по одному спикеру.
+                  </span>
+                </div>
+                <div className="settings-control settings-control-rag-k">
+                  <Input
+                    type="number"
+                    min={0.1}
+                    max={0.99}
+                    step={0.05}
+                    aria-label="Порог сходства диаризации"
+                    value={String(settings.diarize_threshold)}
+                    disabled={!settings.diarize_enabled}
+                    onChange={(_event, data) => {
+                      const parsed = Number.parseFloat(data.value);
+                      if (Number.isFinite(parsed)) {
+                        update({ diarize_threshold: Math.min(0.99, Math.max(0.1, parsed)) });
+                      }
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Путь к модели диаризации</span>
+                  <span className="settings-hint">
+                    Папка с моделью Wespeaker ONNX (оставьте пустым для автоматической загрузки).
+                  </span>
+                </div>
+                <div className="settings-control settings-control-rag">
+                  <Input
+                    className="settings-input-wide"
+                    aria-label="Путь к модели диаризации"
+                    value={settings.diarize_model_path}
+                    disabled={!settings.diarize_enabled}
+                    placeholder="Пусто — автозагрузка из Hugging Face"
+                    onChange={(_event, data) => {
+                      update({ diarize_model_path: data.value });
+                    }}
+                  />
+                </div>
+              </div>
+            </div>
+          </section>
+
           <section className="settings-card surface" aria-labelledby="settings-rag">
             <h2 id="settings-rag" className="settings-card-title">
               База знаний

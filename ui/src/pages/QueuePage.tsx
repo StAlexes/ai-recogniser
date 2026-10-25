@@ -3,9 +3,11 @@ import type { ChangeEvent } from 'react';
 import {
   Badge,
   Button,
+  Dropdown,
   MessageBar,
   MessageBarActions,
   MessageBarBody,
+  Option,
   ProgressBar,
   Spinner,
   Textarea,
@@ -26,6 +28,7 @@ import {
   AuthError,
   getJob,
   getJobs,
+  token,
   uploadJob,
 } from '../api';
 import type { JobDetail, JobStatus, JobSummary } from '../api';
@@ -141,6 +144,8 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [rejectedCount, setRejectedCount] = useState(0);
+  const [exporting, setExporting] = useState(false);
+  const [exportFormat, setExportFormat] = useState<'txt' | 'srt' | 'vtt' | 'md' | 'json'>('txt');
   const inputRef = useRef<HTMLInputElement>(null);
   const nextId = useRef(0);
 
@@ -337,6 +342,45 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
     link.download = `${base || 'transcript'}.txt`;
     link.click();
     URL.revokeObjectURL(url);
+  };
+
+  const handleExport = async (): Promise<void> => {
+    if (detail === null || detail.status !== 'done') {
+      return;
+    }
+    setExporting(true);
+    try {
+      const response = await fetch(
+        `${''}/api/v1/jobs/${encodeURIComponent(detail.id)}/export?format=${exportFormat}`,
+        {
+          method: 'GET',
+          credentials: 'same-origin',
+          headers: {
+            Accept: '*/*',
+            ...(token !== null ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          cache: 'no-store',
+        }
+      );
+      if (!response.ok) {
+        setError(`Экспорт не удался (HTTP ${response.status}).`);
+        return;
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      const base = detail.filename.replace(/\.[^.]+$/, '');
+      const ext = exportFormat === 'txt' ? '.txt' : `.${exportFormat}`;
+      link.href = url;
+      link.download = `${base || 'transcript'}${ext}`;
+      link.click();
+      URL.revokeObjectURL(url);
+      setNotice(`Экспорт в ${exportFormat.toUpperCase()} сохранён.`);
+    } catch {
+      setError('Не удалось выполнить экспорт результата.');
+    } finally {
+      setExporting(false);
+    }
   };
 
   return (
@@ -561,6 +605,43 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
               >
                 Скачать .txt
               </Button>
+              <Dropdown
+                aria-label="Формат экспорта"
+                value={exportFormat}
+                selectedOptions={[exportFormat]}
+                onOptionSelect={(_event, data) => {
+                  if (data.optionValue !== undefined) {
+                    setExportFormat(data.optionValue as typeof exportFormat);
+                  }
+                }}
+                disabled={exporting || detail.text === ''}
+              >
+                <Option key="txt" value="txt">
+                  TXT
+                </Option>
+                <Option key="srt" value="srt">
+                  SRT
+                </Option>
+                <Option key="vtt" value="vtt">
+                  VTT
+                </Option>
+                <Option key="md" value="md">
+                  Markdown
+                </Option>
+                <Option key="json" value="json">
+                  JSON
+                </Option>
+              </Dropdown>
+              <Button
+                size="small"
+                icon={exporting ? <Spinner size="tiny" /> : <ArrowDownloadRegular />}
+                disabled={exporting || detail.text === ''}
+                onClick={() => {
+                  void handleExport();
+                }}
+              >
+                {exporting ? 'Экспорт…' : 'Экспорт'}
+              </Button>
               <Button
                 appearance="subtle"
                 size="small"
@@ -569,7 +650,9 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
                 onClick={() => {
                   setDetail(null);
                 }}
-              />
+              >
+                Закрыть
+              </Button>
             </div>
           </div>
 
@@ -587,13 +670,41 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
           ) : null}
 
           {detail.status === 'done' ? (
-            <Textarea
-              className="transcript-box"
-              readOnly
-              resize="vertical"
-              value={detail.text === '' ? 'Речь не распознана.' : detail.text}
-              aria-label="Результат распознавания"
-            />
+            <>
+              <Textarea
+                className="transcript-box"
+                readOnly
+                resize="vertical"
+                value={detail.text === '' ? 'Речь не распознана.' : detail.text}
+                aria-label="Результат распознавания"
+              />
+              {detail.segments.length > 0 ? (
+                <div className="segments-panel" aria-labelledby="segments-title">
+                  <h3 id="segments-title" className="segments-title">
+                    Сегменты ({detail.segments.length})
+                  </h3>
+                  <ul className="segments-list">
+                    {detail.segments.map((segment, index) => {
+                      const start = segment.start_s !== null
+                        ? formatSeconds(segment.start_s)
+                        : '—';
+                      const end = segment.end_s !== null
+                        ? formatSeconds(segment.end_s)
+                        : '—';
+                      const speaker = segment.speaker
+                        ? ` <span className="segment-speaker">{segment.speaker}</span>`
+                        : '';
+                      return (
+                        <li key={index} className="segment-row">
+                          <span className="segment-timer">{start} → {end}</span>
+                          <span className="segment-text">{segment.text}{speaker}</span>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              ) : null}
+            </>
           ) : null}
         </section>
       ) : null}

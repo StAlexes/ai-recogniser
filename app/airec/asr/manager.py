@@ -288,6 +288,9 @@ class JobManager:
                 vad_max_segment_s=settings.vad_max_segment_s,
                 vad_min_silence_ms=settings.vad_min_silence_ms,
                 vad_speech_pad_ms=settings.vad_speech_pad_ms,
+                diarize_enabled=settings.diarize_enabled,
+                diarize_threshold=settings.diarize_threshold,
+                diarize_model_path=settings.diarize_model_path,
             )
             transcript_path = self._job_dir(job_id) / "transcript.txt"
             transcript_path.parent.mkdir(parents=True, exist_ok=True)
@@ -369,6 +372,40 @@ class JobManager:
                 return None
             path = Path(job.result_file)
             return path if path.is_file() else None
+
+    def export_result(self, job_id: str, format: str) -> tuple[Path, str, str]:
+        """Export a finished job in *format*.
+
+        Returns ``(file_path, download_name, content_type)``.  The exported
+        file is written to the job's results folder next to ``transcript.txt``.
+        """
+        from airec.asr.export import EXPORT_CONTENT_TYPES, EXPORT_DOWNLOAD_NAMES, export
+
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                job = self.get(job_id)
+            if job is None:
+                raise FileNotFoundError(f"Job {job_id} not found.")
+            if job.status != "done":
+                raise ValueError(f"Job {job_id} is not finished (status={job.status}).")
+
+        segments = job.segments or []
+        content = export(segments, format, metadata={
+            "job_id": job.id,
+            "filename": job.filename,
+            "model": job.model,
+            "duration_s": job.duration_s,
+            "speaker_count": len({s.get("speaker") for s in segments if s.get("speaker")}),
+        })
+
+        job_dir = self._job_dir(job_id)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        stem = Path(job.filename).stem or "transcript"
+        ext = EXPORT_DOWNLOAD_NAMES[format]
+        out_path = job_dir / f"{stem}{ext}"
+        out_path.write_text(content, encoding="utf-8", newline="\n")
+        return out_path, EXPORT_DOWNLOAD_NAMES[format], EXPORT_CONTENT_TYPES[format]
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)

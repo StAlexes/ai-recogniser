@@ -29,6 +29,9 @@ export interface Settings {
   vad_max_segment_s: number;
   vad_min_silence_ms: number;
   vad_speech_pad_ms: number;
+  diarize_enabled: boolean;
+  diarize_threshold: number;
+  diarize_model_path: string;
   rag_enabled: boolean;
   rag_url: string;
   rag_k: number;
@@ -59,6 +62,7 @@ export interface JobSegment {
   start_s: number;
   end_s: number;
   text: string;
+  speaker: string | null;
 }
 
 export interface JobDetail extends JobSummary {
@@ -250,6 +254,8 @@ if (bootToken !== null) {
   storeToken(bootToken);
 }
 const token = bootToken ?? readStoredToken();
+
+export { token };
 
 const API_BASE = resolveBaseUrl();
 const DEFAULT_TIMEOUT_MS = 15_000;

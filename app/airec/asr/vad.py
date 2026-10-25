@@ -49,14 +49,20 @@ class SpeechSegment:
     """One recognised speech region with its position in the source audio."""
 
     start_s: float
+    """Segment start time."""
     end_s: float
+    """Segment end time."""
     text: str
+    """Segment recognized text."""
+    speaker: str | None = None
+    """Optional speaker label (e.g. «Спикер 1») after diarization."""
 
-    def as_dict(self) -> dict[str, float | str]:
+    def as_dict(self) -> dict[str, float | str | None]:
         return {
             "start_s": round(self.start_s, 3),
             "end_s": round(self.end_s, 3),
             "text": self.text,
+            "speaker": self.speaker,
         }
 
 
