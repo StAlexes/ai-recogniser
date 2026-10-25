@@ -25,6 +25,11 @@ export interface Settings {
   cpu_threads: number;
   max_parallel_jobs: number;
   external_llm_enabled: boolean;
+  external_llm_base_url: string;
+  external_llm_api_key: string;
+  llm_provider: string;
+  llm_ctx_size: number;
+  llm_threads: number;
   vad_enabled: boolean;
   vad_max_segment_s: number;
   vad_min_silence_ms: number;

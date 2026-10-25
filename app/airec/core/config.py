@@ -40,6 +40,11 @@ class Settings(BaseModel):
     cpu_threads: int = Field(default=0, ge=0, le=256)
     max_parallel_jobs: int = Field(default=1, ge=1, le=8)
     external_llm_enabled: bool = False
+    external_llm_base_url: str = "http://127.0.0.1:11434"
+    external_llm_api_key: str = ""
+    llm_provider: str = "llamacpp-local"
+    llm_ctx_size: int = Field(default=4096, ge=512, le=131072)
+    llm_threads: int = Field(default=0, ge=0, le=256)
 
     # Long recordings are split into speech segments with Silero VAD.  The
     # segment cap is deliberately far below GigaAM's positional limit (~200 s).

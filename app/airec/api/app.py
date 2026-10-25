@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from airec.api import jobs, models, system
+from airec.api import llm as llm_api
 from airec.api import rag as rag_api
 from airec.api import settings as settings_api
 from airec.asr.manager import JobManager
@@ -97,6 +98,7 @@ def create_app(
     app.include_router(jobs.router)
     app.include_router(models.router)
     app.include_router(rag_api.router)
+    app.include_router(llm_api.router)
 
     @app.get("/healthz", include_in_schema=False)
     def healthz() -> dict[str, str]:

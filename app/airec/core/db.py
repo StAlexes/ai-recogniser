@@ -39,6 +39,8 @@ JOB_COLUMNS = (
     "text",
     "error",
     "result_file",
+    "source_path",
+    "summary",
 )
 
 CREATE_JOBS_TABLE = """
@@ -61,6 +63,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     text TEXT NOT NULL DEFAULT '',
     error TEXT,
     result_file TEXT,
+    source_path TEXT,
+    summary TEXT,
     segment_count INTEGER NOT NULL DEFAULT 0
 );
 """
@@ -146,20 +150,24 @@ class Database:
                     audio_format=excluded.audio_format,
                     text=excluded.text,
                     error=excluded.error,
-                    result_file=excluded.result_file
+                    result_file=excluded.result_file,
+                    source_path=excluded.source_path,
+                    summary=excluded.summary,
+                    segment_count=excluded.segment_count
                 """,
                 values,
             )
 
     def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         data = dict(row)
-        if data.get("segments"):
-            try:
-                data["segments"] = json.loads(data["segments"])
-            except (TypeError, ValueError):
-                data["segments"] = []
-        else:
-            data["segments"] = []
+        for json_column in ("segments", "summary"):
+            if data.get(json_column):
+                try:
+                    data[json_column] = json.loads(data[json_column])
+                except (TypeError, ValueError):
+                    data[json_column] = []
+            else:
+                data[json_column] = [] if json_column == "segments" else None
         return data
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:

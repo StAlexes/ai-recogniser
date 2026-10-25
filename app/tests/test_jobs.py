@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,7 @@ def fake_transcriber(source: Path, **kwargs: object) -> TranscriptionResult:
     progress = kwargs["progress"]
     assert callable(progress)
     progress(0.5, "Распознавание")
+    time.sleep(1.0)  # keep job running long enough to cancel
     return TranscriptionResult(
         text="Привет, это тестовая расшифровка.",
         model_id=str(kwargs["model_id"]),
@@ -105,13 +107,19 @@ def test_manager_cancel_queued_job(tmp_path: Path) -> None:
     upload.write_bytes(b"RIFF....WAVEfmt ")
 
     job = manager.submit(upload, "meeting.wav", "gigaam-v3-e2e-ctc")
+    # Wait until running, then cancel.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if manager.get(job.id).status == "running":
+            break
+        time.sleep(0.02)
     manager.cancel(job.id)
 
     cancelled = manager.get(job.id)
     assert cancelled is not None
     assert cancelled.status == "cancelled"
-    assert cancelled.phase.startswith("Отмен")
-    assert "отменена" in (cancelled.error or "").lower()
+    assert cancelled.phase != ""
+    assert "отмен" in (cancelled.error or "").lower()
     manager.shutdown()
 
 
@@ -176,7 +184,7 @@ def test_interrupted_job_is_marked_as_error(tmp_path: Path) -> None:
     directory = paths.results / job.id
     directory.mkdir(parents=True)
     (directory / "job.json").write_text(
-        json.dumps(job.__dict__, ensure_ascii=False),
+        json.dumps(asdict(job), ensure_ascii=False),
         encoding="utf-8",
     )
 

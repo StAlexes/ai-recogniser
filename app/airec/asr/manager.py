@@ -76,8 +76,9 @@ class Job:
     error: str | None = None
     result_file: str | None = None
     source_path: str | None = None
+    summary: dict[str, Any] | None = None
 
-    def summary(self) -> dict[str, Any]:
+    def as_dict_summary(self) -> dict[str, Any]:
         data = asdict(self)
         data.pop("text", None)
         data.pop("result_file", None)
@@ -441,7 +442,7 @@ class JobManager:
                 if job.id not in {j.id for j in jobs}:
                     jobs.append(job)
             jobs.sort(key=lambda item: item.created_at, reverse=True)
-            return [job.summary() for job in jobs]
+            return [job.as_dict_summary() for job in jobs]
 
     def get(self, job_id: str) -> Job | None:
         with self._lock:

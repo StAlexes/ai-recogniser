@@ -514,6 +514,161 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
             </div>
           </section>
 
+          <section className="settings-card surface" aria-labelledby="settings-llm">
+            <h2 id="settings-llm" className="settings-card-title">
+              LLM-саммари
+            </h2>
+            <p className="settings-card-sub">
+              Локальная LLM через llama-server (llama.cpp) или внешний OpenAI-совместимый API.
+              Саммари и ответы на вопросы по транскрипту.
+            </p>
+
+            <div className="settings-rows">
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Провайдер LLM</span>
+                  <span className="settings-hint">
+                    «llamacpp-local» — локальный llama-server на этом ПК;
+                    «external» — внешний API (только по явному включению).
+                  </span>
+                </div>
+                <div className="settings-control settings-control-model">
+                  <Dropdown
+                    aria-label="Провайдер LLM"
+                    value={settings.llm_provider}
+                    selectedOptions={[settings.llm_provider]}
+                    onOptionSelect={(_event, data) => {
+                      if (data.optionValue !== undefined) {
+                        update({ llm_provider: data.optionValue });
+                      }
+                    }}
+                  >
+                    <Option key="llamacpp-local" value="llamacpp-local">
+                      llama.cpp (локально)
+                    </Option>
+                    <Option key="external" value="external">
+                      Внешний OpenAI-совместимый API
+                    </Option>
+                  </Dropdown>
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Модель LLM</span>
+                  <span className="settings-hint">
+                    Имя GGUF-модели для llama-server или модель внешнего API.
+                  </span>
+                </div>
+                <div className="settings-control settings-control-model">
+                  <Input
+                    className="settings-input-wide"
+                    aria-label="Модель LLM"
+                    value={settings.llm_model}
+                    placeholder="Например, t-lite-it-2.1-8b.Q4_K_M.gguf"
+                    onChange={(_event, data) => {
+                      update({ llm_model: data.value });
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Адрес внешнего API</span>
+                  <span className="settings-hint">
+                    Для ollama / OpenAI-совместимого API. Например http://127.0.0.1:11434.
+                  </span>
+                </div>
+                <div className="settings-control settings-control-rag">
+                  <Input
+                    className="settings-input-wide"
+                    aria-label="Адрес внешнего LLM API"
+                    value={settings.external_llm_base_url}
+                    disabled={settings.llm_provider !== "external"}
+                    placeholder="http://127.0.0.1:11434"
+                    onChange={(_event, data) => {
+                      update({ external_llm_base_url: data.value });
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Ключ API</span>
+                  <span className="settings-hint">
+                    Для внешнего API (если требуется авторизация).
+                  </span>
+                </div>
+                <div className="settings-control settings-control-rag">
+                  <Input
+                    type="password"
+                    aria-label="Ключ API LLM"
+                    value={settings.external_llm_api_key}
+                    disabled={settings.llm_provider !== "external"}
+                    placeholder="••••••••"
+                    onChange={(_event, data) => {
+                      update({ external_llm_api_key: data.value });
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Размер контекста</span>
+                  <span className="settings-hint">
+                    Контекстное окно модели в токенах (512–131072).
+                  </span>
+                </div>
+                <div className="settings-control settings-control-rag-k">
+                  <Input
+                    type="number"
+                    min={512}
+                    max={131072}
+                    step={512}
+                    aria-label="Размер контекста LLM"
+                    value={String(settings.llm_ctx_size)}
+                    disabled={settings.llm_provider === "external"}
+                    onChange={(_event, data) => {
+                      const parsed = Number.parseInt(data.value, 10);
+                      if (Number.isFinite(parsed)) {
+                        update({ llm_ctx_size: Math.min(131072, Math.max(512, parsed)) });
+                      }
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Потоки CPU</span>
+                  <span className="settings-hint">
+                    Количество потоков для llama-server (0 = автоматически).
+                  </span>
+                </div>
+                <div className="settings-control settings-control-rag-k">
+                  <Input
+                    type="number"
+                    min={0}
+                    max={256}
+                    step={1}
+                    aria-label="Потоки CPU для LLM"
+                    value={String(settings.llm_threads)}
+                    disabled={settings.llm_provider === "external"}
+                    onChange={(_event, data) => {
+                      const parsed = Number.parseInt(data.value, 10);
+                      if (Number.isFinite(parsed)) {
+                        update({ llm_threads: Math.min(256, Math.max(0, parsed)) });
+                      }
+                    }}
+                  />
+                </div>
+              </div>
+            </div>
+          </section>
+
           <section className="settings-card surface" aria-labelledby="settings-rag">
             <h2 id="settings-rag" className="settings-card-title">
               База знаний
