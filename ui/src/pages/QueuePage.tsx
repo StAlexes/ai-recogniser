@@ -31,6 +31,7 @@ import {
   getJob,
   getJobs,
   retryJob,
+  summarizeJob,
   token,
   uploadJob,
 } from '../api';
@@ -153,6 +154,8 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
   const [rejectedCount, setRejectedCount] = useState(0);
   const [exporting, setExporting] = useState(false);
   const [exportFormat, setExportFormat] = useState<'txt' | 'srt' | 'vtt' | 'md' | 'json'>('txt');
+  const [summary, setSummary] = useState<any>(null);
+  const [summarizing, setSummarizing] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const nextId = useRef(0);
 
@@ -433,6 +436,31 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
       setJobs(response.items);
     } catch {
       // Игнорируем; следующий poll обновит список.
+    }
+  };
+
+  const handleSummarize = async (): Promise<void> => {
+    if (detail === null || detail.status !== 'done') {
+      return;
+    }
+    setSummarizing(true);
+    setSummary(null);
+    try {
+      const response = await summarizeJob(detail.id);
+      setSummary(response.summary);
+      setNotice('Саммари готово.');
+    } catch (reason: unknown) {
+      if (reason instanceof AuthError) {
+        onAuthError();
+        return;
+      }
+      setError(
+        reason instanceof ApiError
+          ? reason.message
+          : 'Не удалось составить саммари.'
+      );
+    } finally {
+      setSummarizing(false);
     }
   };
 
@@ -721,6 +749,16 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
                 {exporting ? 'Экспорт…' : 'Экспорт'}
               </Button>
               <Button
+                size="small"
+                icon={summarizing ? <Spinner size="tiny" /> : <SparkleRegular />}
+                disabled={summarizing || detail.text === ''}
+                onClick={() => {
+                  void handleSummarize();
+                }}
+              >
+                {summarizing ? 'Саммари…' : 'Саммари'}
+              </Button>
+              <Button
                 appearance="subtle"
                 size="small"
                 icon={<DismissRegular />}
@@ -807,6 +845,61 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
                       );
                     })}
                   </ul>
+                </div>
+              ) : null}
+              {detail.status === 'done' && summary !== null ? (
+                <div className="summary-panel" aria-labelledby="summary-title">
+                  <h3 id="summary-title" className="segments-title">
+                    Саммари ({summary.tl_dr ? summary.tl_dr.slice(0, 60) : '…'})
+                  </h3>
+                  <div className="summary-tldr">{summary.tl_dr || ''}</div>
+                  {summary.topics && summary.topics.length > 0 ? (
+                    <>
+                      <div className="summary-subtitle">Темы</div>
+                      <ul className="summary-list">
+                        {summary.topics.map((t: string, i: number) => (
+                          <li key={i}>{t}</li>
+                        ))}
+                      </ul>
+                    </>
+                  ) : null}
+                  {summary.decisions && summary.decisions.length > 0 ? (
+                    <>
+                      <div className="summary-subtitle">Решения</div>
+                      <ul className="summary-list">
+                        {summary.decisions.map((d: any, i: number) => (
+                          <li key={i}>
+                            {d.formulation}
+                            {d.timecode ? ` <span className="segment-timer">[${d.timecode}]</span>` : ''}
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  ) : null}
+                  {summary.action_items && summary.action_items.length > 0 ? (
+                    <>
+                      <div className="summary-subtitle">Задачи</div>
+                      <ul className="summary-list">
+                        {summary.action_items.map((a: any, i: number) => (
+                          <li key={i}>
+                            {a.formulation}
+                            {a.owner ? ` <span className="segment-speaker">(${a.owner})</span>` : ''}
+                            {a.timecode ? ` <span className="segment-timer">[${a.timecode}]</span>` : ''}
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  ) : null}
+                  {summary.risks && summary.risks.length > 0 ? (
+                    <>
+                      <div className="summary-subtitle">Риски</div>
+                      <ul className="summary-list">
+                        {summary.risks.map((r: string, i: number) => (
+                          <li key={i}>{r}</li>
+                        ))}
+                      </ul>
+                    </>
+                  ) : null}
                 </div>
               ) : null}
             </>

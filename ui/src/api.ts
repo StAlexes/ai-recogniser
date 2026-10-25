@@ -435,6 +435,13 @@ export function retryJob(jobId: string): Promise<JobDetail> {
   );
 }
 
+export function summarizeJob(jobId: string): Promise<any> {
+  return request<any>(
+    `/api/v1/llm/summarize/${encodeURIComponent(jobId)}`,
+    { method: 'POST', timeoutMs: 300_000 },
+  );
+}
+
 /** Upload one file to the local core and return the queued job. */
 export async function uploadJob(file: File): Promise<JobDetail> {
   const timeoutMs = 600_000;
