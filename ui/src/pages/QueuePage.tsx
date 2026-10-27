@@ -20,6 +20,7 @@ import {
   HistoryRegular,
   InfoRegular,
   MusicNote2Regular,
+  PlayRegular,
   ShieldCheckmarkRegular,
   SparkleRegular,
   VideoRegular,
@@ -31,6 +32,7 @@ import {
   getJob,
   getJobs,
   retryJob,
+  startJob,
   summarizeJob,
   token,
   uploadJob,
@@ -439,6 +441,29 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
     }
   };
 
+  const handleStart = async (jobId: string): Promise<void> => {
+    try {
+      await startJob(jobId);
+      setNotice('Задача запущена.');
+    } catch (reason: unknown) {
+      if (reason instanceof AuthError) {
+        onAuthError();
+        return;
+      }
+      setError(
+        reason instanceof ApiError
+          ? reason.message
+          : 'Не удалось запустить задачу.'
+      );
+    }
+    try {
+      const response = await getJobs();
+      setJobs(response.items);
+    } catch {
+      // Игнорируем; следующий poll обновит список.
+    }
+  };
+
   const handleSummarize = async (): Promise<void> => {
     if (detail === null || detail.status !== 'done') {
       return;
@@ -641,7 +666,6 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
                       appearance="subtle"
                       size="small"
                       icon={<DismissRegular />}
-                      disabled={isActive(job.status)}
                       onClick={() => {
                         void handleCancel(job.id);
                       }}
@@ -649,6 +673,18 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
                       Отменить
                     </Button>
                   </>
+                ) : null}
+                {job.status === 'queued' && job.paused ? (
+                  <Button
+                    appearance="subtle"
+                    size="small"
+                    icon={<PlayRegular />}
+                    onClick={() => {
+                      void handleStart(job.id);
+                    }}
+                  >
+                    Запустить
+                  </Button>
                 ) : null}
                 {(job.status === 'error' || job.status === 'cancelled') && (
                   <Button
@@ -786,6 +822,18 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
               >
                 Отменить
               </Button>
+              {detail.paused ? (
+                <Button
+                  appearance="subtle"
+                  size="small"
+                  icon={<PlayRegular />}
+                  onClick={() => {
+                    void handleStart(detail.id);
+                  }}
+                >
+                  Запустить
+                </Button>
+              ) : null}
             </div>
           ) : null}
 

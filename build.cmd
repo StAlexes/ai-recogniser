@@ -18,5 +18,5 @@ if not "%BUILD_CODE%"=="0" (
   exit /b %BUILD_CODE%
 )
 
-echo [AI Recogniser] Done: dist\AI Recogniser\AI Recogniser.exe
+echo [AI Recogniser] Done. The build is in a versioned folder under dist\.
 exit /b 0

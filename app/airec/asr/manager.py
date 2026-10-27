@@ -78,6 +78,7 @@ class Job:
     result_file: str | None = None
     source_path: str | None = None
     summary: dict[str, Any] | None = None
+    paused: bool = False
 
     def as_dict_summary(self) -> dict[str, Any]:
         data = asdict(self)
@@ -250,15 +251,62 @@ class JobManager:
             audio_format=suffix.lstrip("."),
             source_path=str(source_copy),
         )
+        settings = self._settings()
+        if not settings.recognize_immediately:
+            job.paused = True
+            job.phase = "Ожидает запуска"
         with self._lock:
             self._jobs[job.id] = job
             try:
                 self._persist(job)
             except OSError:
                 log.exception("cannot persist new job %s", job.id)
+            if not job.paused:
+                future = self._executor.submit(self._run, job.id, source, work_dir)
+                self._futures[job.id] = future
+        return job
+
+    def start(self, job_id: str) -> Job:
+        """Start a job that was queued but not auto-started.
+
+        Jobs are paused when ``recognize_immediately`` is disabled.  Calling
+        this for a job that is already scheduled is a no-op.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id) or self.get(job_id)
+            if job is None:
+                raise KeyError(f"Job {job_id} not found.")
+            if job.status != "queued":
+                raise ValueError(
+                    f"Запустить можно только задачу в очереди (статус '{job.status}')."
+                )
+            if not job.paused:
+                return job
+
+            work_dir = self._paths.temp / "jobs" / job_id
+            work_dir.mkdir(parents=True, exist_ok=True)
+            candidates = [path for path in work_dir.glob("input.*") if path.is_file()]
+            if candidates:
+                source = candidates[0]
+            elif job.source_path and Path(job.source_path).is_file():
+                stored = Path(job.source_path)
+                source = work_dir / f"input{stored.suffix}"
+                shutil.copy2(stored, source)
+            else:
+                raise FileNotFoundError(
+                    f"Исходный файл задачи не найден: {job.filename}"
+                )
+
+            job.paused = False
+            job.phase = "В очереди"
+            try:
+                self._persist(job)
+            except OSError:
+                log.exception("cannot persist started job %s", job.id)
             future = self._executor.submit(self._run, job.id, source, work_dir)
             self._futures[job.id] = future
-        return job
+            log.info("job %s started manually", job_id)
+            return job
 
     # ------------------------------------------------------------------ #
     # Cancel / retry

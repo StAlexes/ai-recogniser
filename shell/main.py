@@ -594,6 +594,22 @@ class TrayIcon:
             LOG.debug("cannot stop the tray icon", exc_info=True)
 
 
+class ShellBridge:
+    """Small JS API exposed to the embedded UI (window.pywebview.api)."""
+
+    def __init__(self, app: ShellApp) -> None:
+        self._app = app
+
+    def quit(self) -> None:
+        """Close the application completely (not just hide to tray)."""
+        threading.Thread(target=self._app.request_quit, name="ui-quit", daemon=True).start()
+
+    def minimize(self) -> None:
+        """Hide the window to the tray."""
+        with contextlib.suppress(Exception):
+            self._app.window.hide()
+
+
 class ShellApp:
     """Window/tray glue shared by the close handler and the tray menu."""
 
@@ -701,6 +717,9 @@ def run_gui(paths: AppPaths, args: argparse.Namespace) -> int:
         )
         app = ShellApp(window, core, paths, close_to_tray=settings.close_to_tray)
         window.events.closing += app.on_closing
+        bridge = ShellBridge(app)
+        with contextlib.suppress(Exception):
+            window.expose(bridge.quit, bridge.minimize)
         app.tray.start()
 
         icon = _asset("icon.ico")

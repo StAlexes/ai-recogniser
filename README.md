@@ -112,9 +112,10 @@ build.cmd
 build.cmd -SkipUi
 ```
 
-Результат — папка `dist\AI Recogniser\` с `AI Recogniser.exe` и `_internal\`. Запускайте exe
-из этой папки; переносить нужно папку целиком. Portable-режим: положите пустой файл
-`portable.flag` рядом с exe — данные будут в `.\data`, реестр не используется.
+Результат — папка `dist\AI Recogniser <версия>\` с `AI Recogniser.exe`, `_internal\` и
+`version.json`. Каждая версия получает свою папку. Запускайте exe из этой папки; переносить
+нужно папку целиком. Portable-режим: положите пустой файл `portable.flag` рядом с exe —
+данные будут в `.\data`, реестр не используется.
 
 Текущая сборка: `AI Recogniser.exe` ~15 МБ, `_internal` ~211 МБ; внутри есть ONNX Runtime,
 `onnx-asr`, GigaAM-зависимости и ffmpeg. Модель GigaAM в exe не входит и скачивается при первом

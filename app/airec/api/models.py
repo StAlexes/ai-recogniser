@@ -4,14 +4,13 @@ and Ollama models detection."""
 from __future__ import annotations
 
 import logging
-import sys
 from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
-from airec.core.paths import app_root
+from airec.core.paths import app_root, resource_root
 from airec.models.manager import ModelError, ModelManager
 from airec.models.manifest import find_model, load_manifest
 
@@ -20,12 +19,22 @@ router = APIRouter(prefix="/api/v1/models", tags=["models"])
 
 _DOWNLOAD_PROGRESS: dict[str, dict[str, Any]] = {}
 
-# Manifest lives in models/ next to the repo root in dev, and in _internal/models/
-# next to the exe in frozen one-folder builds.
-if getattr(sys, "frozen", False):
-    MANIFEST_DIR = app_root() / "_internal" / "models"
-else:
-    MANIFEST_DIR = app_root() / "models"
+# Manifest lives next to the repo root in development and inside the
+# PyInstaller bundle (_internal/models) in a frozen build.  Probe the known
+# locations so a moved/copied build keeps working.
+def _manifest_dir() -> Path:
+    candidates = (
+        resource_root() / "models",
+        app_root() / "_internal" / "models",
+        app_root() / "models",
+    )
+    for candidate in candidates:
+        if (candidate / "manifest.json").is_file():
+            return candidate
+    return candidates[0]
+
+
+MANIFEST_DIR = _manifest_dir()
 
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 
@@ -95,7 +104,7 @@ def list_models(request: Request) -> dict[str, Any]:
 
 @router.post("/download/{model_id}")
 async def download_model_by_id(
-    request: Request, model_id: str
+    request: Request, model_id: str, background: BackgroundTasks
 ) -> dict[str, Any]:
     """Start downloading *model_id* (manifest entry) or custom {id, url, sha256}."""
     manager = _manager(request)
@@ -126,11 +135,18 @@ async def download_model_by_id(
     def progress(value: float, phase: str) -> None:
         _DOWNLOAD_PROGRESS[model_id] = {"value": value, "phase": phase}
 
-    try:
-        manager.download(model_id, url, sha256=sha256, progress=progress)
-    except ModelError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    def run_download() -> None:
+        try:
+            manager.download(model_id, url, sha256=sha256, progress=progress)
+        except Exception as exc:  # background task: report instead of crashing
+            _DOWNLOAD_PROGRESS[model_id] = {
+                "value": 0.0,
+                "phase": f"ошибка: {exc}",
+            }
+            log.exception("model download failed: %s", model_id)
 
+    _DOWNLOAD_PROGRESS[model_id] = {"value": 0.0, "phase": "подготовка"}
+    background.add_task(run_download)
     return {"id": model_id, "status": "downloading", "url": url}
 
 
@@ -149,11 +165,11 @@ def download_progress(request: Request, model_id: str) -> dict[str, Any]:
 
 
 @router.post("/import")
-def import_model(request: Request) -> dict[str, Any]:
+async def import_model(request: Request) -> dict[str, Any]:
     """Import a model from a local path (body: {path, id})."""
     manager = _manager(request)
     try:
-        body = request.json() if hasattr(request, "json") else {}
+        body = await request.json()
     except Exception:
         body = {}
     source = body.get("path")

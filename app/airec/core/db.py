@@ -17,7 +17,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # All Job dataclass fields that are persisted, in column order.
 JOB_COLUMNS = (
@@ -41,7 +41,18 @@ JOB_COLUMNS = (
     "result_file",
     "source_path",
     "summary",
+    "paused",
 )
+
+# Columns that may be missing in databases created by older releases.
+# CREATE TABLE IF NOT EXISTS never alters an existing table, so every new
+# column must be added explicitly here as well as to CREATE_JOBS_TABLE.
+JOB_COLUMN_MIGRATIONS: dict[str, str] = {
+    "source_path": "TEXT",
+    "summary": "TEXT",
+    "segment_count": "INTEGER NOT NULL DEFAULT 0",
+    "paused": "INTEGER NOT NULL DEFAULT 0",
+}
 
 CREATE_JOBS_TABLE = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -65,6 +76,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     result_file TEXT,
     source_path TEXT,
     summary TEXT,
+    paused INTEGER NOT NULL DEFAULT 0,
     segment_count INTEGER NOT NULL DEFAULT 0
 );
 """
@@ -100,16 +112,25 @@ class Database:
         with self._lock:
             self._conn.execute(CREATE_META_TABLE)
             self._conn.execute(CREATE_JOBS_TABLE)
+            self._migrate_jobs_table()
             # Record schema version so migrations can be added later.
-            row = self._conn.execute(
-                "SELECT value FROM meta WHERE key = ?", ("schema_version",)
-            ).fetchone()
-            if row is None:
-                self._conn.execute(
-                    "INSERT INTO meta(key, value) VALUES (?, ?)",
-                    ("schema_version", str(SCHEMA_VERSION)),
-                )
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(SCHEMA_VERSION),),
+            )
             log.info("SQLite job store initialised at %s (schema v%s)", self._path, SCHEMA_VERSION)
+
+    def _migrate_jobs_table(self) -> None:
+        """Add columns introduced after the table was first created."""
+        existing = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(jobs)")
+        }
+        for column, definition in JOB_COLUMN_MIGRATIONS.items():
+            if column in existing:
+                continue
+            self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {definition}")
+            log.info("migrated jobs table: added column %s", column)
 
     def close(self) -> None:
         with self._lock:
@@ -153,6 +174,7 @@ class Database:
                     result_file=excluded.result_file,
                     source_path=excluded.source_path,
                     summary=excluded.summary,
+                    paused=excluded.paused,
                     segment_count=excluded.segment_count
                 """,
                 values,
@@ -168,6 +190,7 @@ class Database:
                     data[json_column] = []
             else:
                 data[json_column] = [] if json_column == "segments" else None
+        data["paused"] = bool(data.get("paused"))
         return data
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:

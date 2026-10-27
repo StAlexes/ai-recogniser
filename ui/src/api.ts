@@ -62,6 +62,7 @@ export interface JobSummary {
   size_bytes: number;
   audio_format: string;
   error: string | null;
+  paused?: boolean;
 }
 
 export interface JobSegment {
@@ -436,6 +437,13 @@ export function retryJob(jobId: string): Promise<JobDetail> {
   );
 }
 
+export function startJob(jobId: string): Promise<JobDetail> {
+  return request<JobDetail>(
+    `/api/v1/jobs/${encodeURIComponent(jobId)}/start`,
+    { method: 'POST', timeoutMs: 15_000 },
+  );
+}
+
 export function summarizeJob(jobId: string): Promise<any> {
   return request<any>(
     `/api/v1/llm/summarize/${encodeURIComponent(jobId)}`,
@@ -502,6 +510,7 @@ export interface ModelItem {
   size_mb?: number;
   license?: string;
   note?: string;
+  purpose?: string;
   installed: boolean;
   download_progress?: { value: number; phase: string } | null;
 }

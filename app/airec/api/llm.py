@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
 from typing import Any
 
-from dataclasses import asdict
 from fastapi import APIRouter, HTTPException, Request
 
 from airec.asr.manager import JobManager
@@ -27,34 +27,64 @@ def _manager(request: Request) -> JobManager:
 
 
 def _provider(request: Request, settings: Settings) -> Any:
-    provider = getattr(request.app.state, PROVIDER_STATE_KEY, None)
-    if provider is None:
-        kind = settings.llm_provider
-        if settings.external_llm_enabled and kind == "llamacpp-local":
-            kind = "external"
-        provider = create_provider(
-            kind=kind,
-            model=settings.llm_model,
-            base_url=settings.external_llm_base_url,
-            api_key=settings.external_llm_api_key or None,
-            ctx_size=settings.llm_ctx_size,
-            threads=settings.llm_threads,
-        )
-        setattr(request.app.state, PROVIDER_STATE_KEY, provider)
+    kind = settings.llm_provider
+    if settings.external_llm_enabled and kind == "llamacpp-local":
+        kind = "external"
+    signature = (
+        kind,
+        settings.llm_model,
+        settings.external_llm_base_url,
+        settings.external_llm_api_key,
+        settings.llm_ctx_size,
+        settings.llm_threads,
+    )
+    cached = getattr(request.app.state, PROVIDER_STATE_KEY, None)
+    if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == signature:
+        return cached[1]
+    if cached is not None:
+        old = cached[1] if isinstance(cached, tuple) else cached
+        close = getattr(old, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # pragma: no cover - best effort cleanup
+                log.debug("cannot close previous LLM provider", exc_info=True)
+    provider = create_provider(
+        kind=kind,
+        model=settings.llm_model,
+        base_url=settings.external_llm_base_url,
+        api_key=settings.external_llm_api_key or None,
+        ctx_size=settings.llm_ctx_size,
+        threads=settings.llm_threads,
+    )
+    setattr(request.app.state, PROVIDER_STATE_KEY, (signature, provider))
     return provider
 
 
 @router.get("/providers")
-def list_providers(request: Request, settings: Settings = None) -> dict[str, Any]:  # type: ignore[assignment]
+def list_providers(request: Request) -> dict[str, Any]:
     """Available LLM providers and their health."""
     s = request.app.state.settings
-    kind = "external" if s.external_llm_enabled else "llamacpp-local"
+    kind = s.llm_provider
+    if kind == "llamacpp-local" and s.external_llm_enabled:
+        kind = "external"
     provider = create_provider(
         kind=kind,
         model=s.llm_model,
-        base_url=s.rag_url,
+        base_url=s.external_llm_base_url,
+        api_key=s.external_llm_api_key or None,
     )
-    return {"active": kind, "health": provider.health()}
+    try:
+        health = provider.health()
+    finally:
+        close = getattr(provider, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # pragma: no cover - best effort cleanup
+                log.debug("cannot close probe provider", exc_info=True)
+    return {"active": kind, "health": health}
+
 
 
 @router.post("/summarize/{job_id}")

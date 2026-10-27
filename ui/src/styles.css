@@ -1335,6 +1335,23 @@ textarea {
   padding-bottom: 12px;
 }
 
+.about-close {
+  margin-left: auto;
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--colorNeutralForeground2, var(--text-2));
+  cursor: pointer;
+}
+.about-close:hover {
+  background: var(--colorNeutralBackground2, #f3f3f3);
+}
+
 .about-name {
   color: var(--colorNeutralForeground1, var(--text-1));
   font-size: 13.5px;
@@ -1724,7 +1741,7 @@ textarea {
 
 /* Кнопка выхода в поповере о программе */
 .about-exit {
-  margin-top: 16px;
+  margin: 0 0 12px;
   padding: 8px 16px;
   border: 1px solid var(--colorNeutralStroke2, #e1e1e1);
   border-radius: 6px;
@@ -1734,6 +1751,9 @@ textarea {
   cursor: pointer;
   width: 100%;
   text-align: left;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 .about-exit:hover {
   background: var(--colorNeutralBackground2, #f3f3f3);
@@ -1743,47 +1763,13 @@ textarea {
   margin-right: 8px;
 }
 
-/* Модели */
-.settings-models-table {
-  width: 100%;
-  border-collapse: collapse;
-  margin-top: 8px;
+.settings-autosave {
+  font-size: 12.5px;
+  color: var(--colorNeutralForeground3, #616161);
 }
-.settings-models-table th {
-  text-align: left;
-  padding: 8px 12px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--colorNeutralForeground2, #595959);
-  border-bottom: 1px solid var(--colorNeutralStroke2, #e1e1e1);
-  white-space: nowrap;
+.settings-autosave-saved {
+  color: var(--colorPaletteGreenForeground1, #0e700e);
 }
-.settings-models-table td {
-  padding: 10px 12px;
-  font-size: 13px;
-  border-bottom: 1px solid var(--colorNeutralStroke1, #e8e8e8);
-  vertical-align: top;
-}
-.settings-models-table tr:last-child td {
-  border-bottom: none;
-}
-.model-title {
-  font-weight: 600;
-  color: var(--colorNeutralForeground1, #1b1b1b);
-}
-.model-note {
-  font-size: 11.5px;
-  color: var(--colorNeutralForeground3, var(--text-3));
-  margin-top: 2px;
-}
-.model-phase {
-  font-size: 11.5px;
-  color: var(--colorNeutralForeground2, #595959);
-}
-.model-status-installed {
-  color: var(--colorSubtleForeground1, #0078d4);
-  font-weight: 600;
-}
-.model-status-not-installed {
-  color: var(--colorNeutralForeground2, #595959);
+.settings-autosave-error {
+  color: var(--colorPaletteRedForeground1, #b10e1c);
 }

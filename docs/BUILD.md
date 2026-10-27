@@ -7,10 +7,15 @@
 ## Что получается
 
 ```
-dist\AI Recogniser\
-  AI Recogniser.exe      # оболочка + точка входа ядра, без консоли
-  _internal\             # CPython, библиотеки, UI, иконки, ASR, ffmpeg, .NET-сборки WebView2
+dist\
+  AI Recogniser <версия>\
+    AI Recogniser.exe    # оболочка + точка входа ядра, без консоли
+    _internal\           # CPython, библиотеки, UI, иконки, ASR, ffmpeg, .NET-сборки WebView2
+    version.json         # версия, дата сборки, git-коммит и статус дерева
 ```
+
+Каждая сборка попадает в отдельную папку `dist\AI Recogniser <версия>\`. Версия берётся из
+`app/airec/version.py`; старые папки не перезаписываются.
 
 `AI Recogniser.exe` — обычный Windows GUI-процесс. При старте он поднимает ядро тем же exe с
 внутренним флагом `--core-worker`, ждёт `session.json` и `/healthz`, затем открывает окно
@@ -112,7 +117,8 @@ $smoke = Join-Path $env:TEMP "airec-exe-smoke"
 Remove-Item -Recurse -Force $smoke -ErrorAction SilentlyContinue
 $env:AIREC_DATA_DIR = $smoke
 $out = Join-Path $env:TEMP "airec-smoke-out.txt"
-$p = Start-Process -FilePath ".\dist\AI Recogniser\AI Recogniser.exe" `
+$exe = ".\dist\AI Recogniser 0.2.1\AI Recogniser.exe"
+$p = Start-Process -FilePath $exe `
     -ArgumentList "--smoke-test" -Wait -PassThru `
     -RedirectStandardOutput $out
 $p.ExitCode     # ожидается 0
@@ -120,9 +126,10 @@ Get-Content $out -Encoding utf8
 ```
 
 В текущей сборке JSON печатается в stdout, например
-`{"ok": true, "port": 12120, "version": "0.1.0.dev0", "ui_built": true}`; тот же результат
+`{"ok": true, "port": 12120, "version": "0.2.1", "ui_built": true}`; тот же результат
 пишется в `<data>\logs\shell.log`. Используйте `Start-Process -Wait`, потому что GUI-exe,
-запущенный через `&`, не всегда дожидается завершения в PowerShell.
+запущенный через `&`, не всегда дожидается завершения в PowerShell. Подставьте свою версию:
+папка сборки называется `dist\AI Recogniser <версия>`.
 
 ### 2. Распознавание в frozen-ядре
 
@@ -134,9 +141,10 @@ $data = Join-Path $env:TEMP "airec-exe-run"
 Remove-Item -Recurse -Force $data -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $data | Out-Null
 $env:AIREC_DATA_DIR = $data
-$core = Start-Process -FilePath ".\dist\AI Recogniser\AI Recogniser.exe" `
+$dist = ".\dist\AI Recogniser 0.2.1"
+$core = Start-Process -FilePath "$dist\AI Recogniser.exe" `
     -ArgumentList "--core-worker", "--port", "8766", "--no-auth" `
-    -WorkingDirectory ".\dist\AI Recogniser" -PassThru
+    -WorkingDirectory $dist -PassThru
 
 Invoke-RestMethod http://127.0.0.1:8766/api/v1/health
 

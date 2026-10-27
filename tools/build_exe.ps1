@@ -26,9 +26,12 @@ $VersionPy = Join-Path $Root "app\airec\version.py"
 $Version = "0.1.0.dev0"
 if (Test-Path $VersionPy) {
     $VersionContent = Get-Content $VersionPy -Raw
-    $VersionLine = $VersionContent | Select-String '^__version__\s*='
-    if ($VersionLine) {
-        $Version = ($VersionLine.ToString() -split '=')[-1].Trim().Trim('"').Trim("'")
+    $VersionMatch = [regex]::Match(
+        $VersionContent,
+        '(?m)^__version__\s*=\s*["'']([^"'']+)["'']'
+    )
+    if ($VersionMatch.Success) {
+        $Version = $VersionMatch.Groups[1].Value
     }
 }
 

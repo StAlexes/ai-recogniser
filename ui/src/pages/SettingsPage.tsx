@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Badge,
   Button,
@@ -9,7 +9,6 @@ import {
   MessageBarBody,
   Option,
   ProgressBar,
-  Spinner,
   Switch,
 } from '@fluentui/react-components';
 import {
@@ -17,7 +16,6 @@ import {
   ArrowDownloadRegular,
   DismissRegular,
   FolderRegular,
-  SaveRegular,
 } from '@fluentui/react-icons';
 import {
   ApiError,
@@ -74,9 +72,12 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
   );
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
   const [saveResult, setSaveResult] = useState<SaveResult | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const [autosave, setAutosave] = useState<'idle' | 'saving' | 'saved' | 'error'>(
+    'idle'
+  );
+  const savedPayload = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -106,6 +107,8 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
       }
 
       setSettings(settingsResult.value);
+      savedPayload.current = JSON.stringify(settingsResult.value);
+      setAutosave('idle');
       onThemeModeChange(settingsResult.value.theme);
 
       if (healthResult.status === 'fulfilled') {
@@ -144,35 +147,46 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
     onThemeModeChange(value);
   };
 
-  const save = async (): Promise<void> => {
-    if (settings === null || saving) {
+  // Settings are applied immediately: debounce changes and persist them
+  // automatically.  The explicit "Сохранить" button was removed on purpose.
+  useEffect(() => {
+    if (settings === null) {
+      return;
+    }
+    const payload = JSON.stringify(settings);
+    if (payload === savedPayload.current) {
       return;
     }
 
-    setSaving(true);
-    setSaveResult(null);
+    setAutosave('saving');
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          await putSettings(settings);
+          savedPayload.current = payload;
+          setAutosave('saved');
+          setSaveResult(null);
+        } catch (reason: unknown) {
+          if (reason instanceof AuthError) {
+            onAuthError();
+            return;
+          }
+          setAutosave('error');
+          setSaveResult({
+            intent: 'error',
+            text:
+              reason instanceof ApiError
+                ? reason.message
+                : 'Не удалось сохранить настройки.',
+          });
+        }
+      })();
+    }, 400);
 
-    try {
-      const updated = await putSettings(settings);
-      setSettings(updated);
-      onThemeModeChange(updated.theme);
-      setSaveResult({ intent: 'success', text: 'Настройки сохранены.' });
-    } catch (reason: unknown) {
-      if (reason instanceof AuthError) {
-        onAuthError();
-        return;
-      }
-      setSaveResult({
-        intent: 'error',
-        text:
-          reason instanceof ApiError
-            ? reason.message
-            : 'Не удалось сохранить настройки.',
-      });
-    } finally {
-      setSaving(false);
-    }
-  };
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [settings, onAuthError]);
 
   // Model download progress polling
   useEffect(() => {
@@ -235,6 +249,33 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
   }
   const asrLabel =
     asrOptions.find((option) => option.value === currentAsr)?.label ?? currentAsr;
+
+  // LLM models: locally downloaded GGUF files plus models already installed
+  // in the user's Ollama instance.
+  const ollamaModels = allModels.filter((model) => model.kind === 'ollama');
+  const localLlmModels = allModels.filter((model) => model.kind === 'llm-gguf');
+  const relevantLlmModels =
+    settings?.llm_provider === 'ollama' ? ollamaModels : localLlmModels;
+  const llmOptions: Array<{ value: string; label: string }> = [
+    { value: 'auto', label: 'Авто (по умолчанию)' },
+    ...relevantLlmModels.map((model) => ({
+      value: model.kind === 'ollama' ? model.title : model.filename || model.title,
+      label:
+        model.kind === 'ollama'
+          ? `${model.title} · Ollama`
+          : `${model.title}${model.installed ? '' : ' · не скачана'}`,
+    })),
+  ];
+  const currentLlm = settings?.llm_model ?? 'auto';
+  if (!llmOptions.some((option) => option.value === currentLlm)) {
+    llmOptions.unshift({ value: currentLlm, label: currentLlm });
+  }
+  const llmLabel =
+    llmOptions.find((option) => option.value === currentLlm)?.label ?? currentLlm;
+  const isExternalLlm = settings?.llm_provider === 'external';
+  const usesHttpLlm =
+    settings?.llm_provider === 'external' || settings?.llm_provider === 'ollama';
+
   const themeLabel =
     THEME_OPTIONS.find((option) => option.value === settings?.theme)?.label ?? 'Системная';
 
@@ -242,18 +283,21 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
     <>
       <PageHeader
         title="Настройки"
-        subtitle="Поведение приложения, модель распознавания и папка данных"
+        subtitle="Изменения применяются и сохраняются сразу"
         actions={
-          <Button
-            appearance="primary"
-            icon={saving ? <Spinner size="tiny" /> : <SaveRegular />}
-            disabled={settings === null || loading || saving}
-            onClick={() => {
-              void save();
-            }}
+          <span
+            className={`settings-autosave settings-autosave-${autosave}`}
+            role="status"
+            aria-live="polite"
           >
-            {saving ? 'Сохранение…' : 'Сохранить'}
-          </Button>
+            {autosave === 'saving'
+              ? 'Сохранение…'
+              : autosave === 'saved'
+                ? 'Сохранено'
+                : autosave === 'error'
+                  ? 'Ошибка сохранения'
+                  : ''}
+          </span>
         }
       />
 
@@ -642,6 +686,9 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
                     <Option key="llamacpp-local" value="llamacpp-local">
                       llama.cpp (локально)
                     </Option>
+                    <Option key="ollama" value="ollama">
+                      Ollama (локально)
+                    </Option>
                     <Option key="external" value="external">
                       Внешний OpenAI-совместимый API
                     </Option>
@@ -653,19 +700,28 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
                 <div className="settings-row-text">
                   <span className="settings-label">Модель LLM</span>
                   <span className="settings-hint">
-                    Имя GGUF-модели для llama-server или модель внешнего API.
+                    {settings.llm_provider === 'ollama'
+                      ? 'Модели, уже установленные в Ollama.'
+                      : 'GGUF-модель для llama-server или модель внешнего API.'}
                   </span>
                 </div>
                 <div className="settings-control settings-control-model">
-                  <Input
-                    className="settings-input-wide"
+                  <Dropdown
                     aria-label="Модель LLM"
-                    value={settings.llm_model}
-                    placeholder="Например, t-lite-it-2.1-8b.Q4_K_M.gguf"
-                    onChange={(_event, data) => {
-                      update({ llm_model: data.value });
+                    value={llmLabel}
+                    selectedOptions={[currentLlm]}
+                    onOptionSelect={(_event, data) => {
+                      if (data.optionValue !== undefined) {
+                        update({ llm_model: data.optionValue });
+                      }
                     }}
-                  />
+                  >
+                    {llmOptions.map((option) => (
+                      <Option key={option.value} value={option.value}>
+                        {option.label}
+                      </Option>
+                    ))}
+                  </Dropdown>
                 </div>
               </div>
 
@@ -681,7 +737,7 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
                     className="settings-input-wide"
                     aria-label="Адрес внешнего LLM API"
                     value={settings.external_llm_base_url}
-                    disabled={settings.llm_provider !== "external"}
+                    disabled={!usesHttpLlm}
                     placeholder="http://127.0.0.1:11434"
                     onChange={(_event, data) => {
                       update({ external_llm_base_url: data.value });
@@ -702,7 +758,7 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
                     type="password"
                     aria-label="Ключ API LLM"
                     value={settings.external_llm_api_key}
-                    disabled={settings.llm_provider !== "external"}
+                    disabled={!isExternalLlm}
                     placeholder="••••••••"
                     onChange={(_event, data) => {
                       update({ external_llm_api_key: data.value });
@@ -726,7 +782,7 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
                     step={512}
                     aria-label="Размер контекста LLM"
                     value={String(settings.llm_ctx_size)}
-                    disabled={settings.llm_provider === "external"}
+                    disabled={usesHttpLlm}
                     onChange={(_event, data) => {
                       const parsed = Number.parseInt(data.value, 10);
                       if (Number.isFinite(parsed)) {
@@ -752,7 +808,7 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
                     step={1}
                     aria-label="Потоки CPU для LLM"
                     value={String(settings.llm_threads)}
-                    disabled={settings.llm_provider === "external"}
+                    disabled={usesHttpLlm}
                     onChange={(_event, data) => {
                       const parsed = Number.parseInt(data.value, 10);
                       if (Number.isFinite(parsed)) {
@@ -963,7 +1019,7 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
           </section>
 
           <p className="settings-footnote">
-            Настройки хранятся локально и применяются после нажатия «Сохранить».
+            Настройки хранятся локально и применяются сразу после изменения.
           </p>
         </div>
       )}

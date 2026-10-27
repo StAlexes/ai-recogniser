@@ -6,11 +6,13 @@ import {
 } from '@fluentui/react-components';
 import {
   BookOpenRegular,
+  DismissRegular,
   DoorRegular,
   InfoRegular,
   ListRegular,
   SettingsRegular,
 } from '@fluentui/react-icons';
+import { minimizeToTray, quitApp } from '../desktop';
 import { StatusDot } from './StatusDot';
 
 export type PageKey = 'queue' | 'knowledge' | 'settings';
@@ -103,9 +105,31 @@ export function Sidebar({
             </span>
             <div>
               <div className="about-name">AI Recogniser</div>
-              <div className="about-note">M0 · прототип интерфейса</div>
+              <div className="about-note">Локальное распознавание</div>
             </div>
+            <button
+              type="button"
+              className="about-close"
+              aria-label="Свернуть в трей"
+              title="Свернуть в трей"
+              onClick={() => {
+                minimizeToTray();
+              }}
+            >
+              <DismissRegular fontSize={16} aria-hidden="true" />
+            </button>
           </div>
+
+          <button
+            type="button"
+            className="about-exit"
+            onClick={() => {
+              quitApp();
+            }}
+          >
+            <DoorRegular fontSize={16} aria-hidden="true" />
+            Выход
+          </button>
 
           <dl className="about-list">
             <div className="about-row">
@@ -131,16 +155,6 @@ export function Sidebar({
             <InfoRegular aria-hidden="true" />
             <span>Данные остаются на этом компьютере.</span>
           </div>
-          <button
-            type="button"
-            className="about-exit"
-            onClick={() => {
-              window.close();
-            }}
-          >
-            <DoorRegular fontSize={16} aria-hidden="true" />
-            Выход
-          </button>
         </PopoverSurface>
       </Popover>
     </aside>

@@ -156,6 +156,19 @@ def retry_job(request: Request, job_id: str) -> dict[str, object]:
     return new_job.detail()
 
 
+@router.post("/{job_id}/start")
+def start_job(request: Request, job_id: str) -> dict[str, object]:
+    """Запустить задачу, добавленную без автозапуска."""
+    manager = _manager(request)
+    try:
+        job = manager.start(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return job.detail()
+
+
 @router.get("/{job_id}/export")
 def export_job(
     request: Request, job_id: str, format: str = "txt"
