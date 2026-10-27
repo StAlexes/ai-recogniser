@@ -65,6 +65,11 @@ class Settings(BaseModel):
     rag_url: str = "http://127.0.0.1:8000"
     rag_k: int = Field(default=5, ge=1, le=20)
 
+    # Automatically start recognition when a file is added via drag-drop or
+    # context menu.  When disabled, files are queued but not started until the
+    # user clicks "Распознать".
+    recognize_immediately: bool = True
+
 
 def load_settings(path: Path) -> Settings:
     """Read settings, falling back to defaults and preserving a corrupt file."""

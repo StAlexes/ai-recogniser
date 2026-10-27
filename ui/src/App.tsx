@@ -10,7 +10,6 @@ import type { PageKey } from './components/Sidebar';
 import { useAppTheme } from './hooks/useAppTheme';
 import { useCoreStatus } from './hooks/useCoreStatus';
 import { KnowledgePage } from './pages/KnowledgePage';
-import { ModelsPage } from './pages/ModelsPage';
 import { QueuePage } from './pages/QueuePage';
 import { SettingsPage } from './pages/SettingsPage';
 import { darkTheme, lightTheme } from './theme';
@@ -20,7 +19,6 @@ const FALLBACK_VERSION = '0.1.0-dev';
 const PAGE_TITLES: Record<PageKey, string> = {
   queue: 'Очередь',
   knowledge: 'База знаний',
-  models: 'Модели',
   settings: 'Настройки',
 };
 
@@ -73,8 +71,6 @@ export function App() {
         return <QueuePage onAuthError={handleAuthError} />;
       case 'knowledge':
         return <KnowledgePage onAuthError={handleAuthError} />;
-      case 'models':
-        return <ModelsPage onAuthError={handleAuthError} />;
       case 'settings':
         return (
           <SettingsPage

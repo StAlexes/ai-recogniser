@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from dataclasses import asdict
 from fastapi import APIRouter, HTTPException, Request
 
 from airec.asr.manager import JobManager
@@ -77,7 +78,7 @@ def summarize_job(request: Request, job_id: str) -> dict[str, Any]:
         summary = summarizer.summarize(text)
         # Persist summary on the job.
         job.summary = summary  # type: ignore[attr-defined]
-        manager._db.upsert_job(job.asdict())  # type: ignore[attr-defined]
+        manager._db.upsert_job(asdict(job))  # type: ignore[attr-defined]
         manager._write_job_json(job)
         return {"job_id": job_id, "summary": summary}
     except LLMError as exc:

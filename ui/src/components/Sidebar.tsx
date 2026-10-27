@@ -6,14 +6,14 @@ import {
 } from '@fluentui/react-components';
 import {
   BookOpenRegular,
-  CubeRegular,
+  DoorRegular,
   InfoRegular,
   ListRegular,
   SettingsRegular,
 } from '@fluentui/react-icons';
 import { StatusDot } from './StatusDot';
 
-export type PageKey = 'queue' | 'knowledge' | 'models' | 'settings';
+export type PageKey = 'queue' | 'knowledge' | 'settings';
 
 interface NavItem {
   key: PageKey;
@@ -24,7 +24,6 @@ interface NavItem {
 const NAV_ITEMS: readonly NavItem[] = [
   { key: 'queue', label: 'Очередь', icon: <ListRegular /> },
   { key: 'knowledge', label: 'База знаний', icon: <BookOpenRegular /> },
-  { key: 'models', label: 'Модели', icon: <CubeRegular /> },
   { key: 'settings', label: 'Настройки', icon: <SettingsRegular /> },
 ];
 
@@ -132,6 +131,16 @@ export function Sidebar({
             <InfoRegular aria-hidden="true" />
             <span>Данные остаются на этом компьютере.</span>
           </div>
+          <button
+            type="button"
+            className="about-exit"
+            onClick={() => {
+              window.close();
+            }}
+          >
+            <DoorRegular fontSize={16} aria-hidden="true" />
+            Выход
+          </button>
         </PopoverSurface>
       </Popover>
     </aside>

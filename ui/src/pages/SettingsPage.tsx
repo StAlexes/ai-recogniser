@@ -502,6 +502,37 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
             </div>
           </section>
 
+          <section className="settings-card surface" aria-labelledby="settings-autostart-recognition">
+            <h2 id="settings-autostart-recognition" className="settings-card-title">
+              Автозапуск распознавания
+            </h2>
+            <p className="settings-card-sub">
+              Если включено, файлы начинают распознаваться сразу после добавления
+              в очередь (перетаскиванием или контекстным меню).
+            </p>
+
+            <div className="settings-rows">
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Распознавать файл немедленно при добавлении</span>
+                  <span className="settings-hint">
+                    При отключении файлы добавляются в очередь, но не начинаются
+                    до нажатия «Распознать».
+                  </span>
+                </div>
+                <div className="settings-control">
+                  <Switch
+                    aria-label="Распознавать файл немедленно при добавлении"
+                    checked={settings.recognize_immediately}
+                    onChange={(_event, data) => {
+                      update({ recognize_immediately: data.checked });
+                    }}
+                  />
+                </div>
+              </div>
+            </div>
+          </section>
+
           <section className="settings-card surface" aria-labelledby="settings-diarization">
             <h2 id="settings-diarization" className="settings-card-title">
               Диаризация (кто говорит)

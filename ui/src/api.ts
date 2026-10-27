@@ -37,6 +37,7 @@ export interface Settings {
   diarize_enabled: boolean;
   diarize_threshold: number;
   diarize_model_path: string;
+  recognize_immediately: boolean;
   rag_enabled: boolean;
   rag_url: string;
   rag_k: number;

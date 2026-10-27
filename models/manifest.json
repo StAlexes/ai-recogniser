@@ -9,7 +9,8 @@
       "size_bytes": 224893347,
       "sha256": "",
       "license": "MIT",
-      "note": "Основная ASR-модель (скачивается автоматически при первом запуске)"
+      "note": "Основная ASR-модель (скачивается автоматически при первом запуске)",
+      "purpose": "расшифровка"
     },
     {
       "id": "gigaam-multilingual-ctc",
@@ -20,7 +21,8 @@
       "size_bytes": 224893347,
       "sha256": "",
       "license": "MIT",
-      "note": "5 языков (RU, EN, KK, KY, UZ), без пунктуации"
+      "note": "5 языков (RU, EN, KK, KY, UZ), без пунктуации",
+      "purpose": "расшифровка"
     },
     {
       "id": "t-lite-it-2.1-8b-q4_k_m",
@@ -31,7 +33,8 @@
       "size_bytes": 4935843840,
       "sha256": "",
       "license": "Apache-2.0",
-      "note": "Рекомендуемая русская LLM для саммари (8 ГБ RAM)"
+      "note": "Рекомендуемая русская LLM для саммари (8 ГБ RAM)",
+      "purpose": "саммаризация"
     },
     {
       "id": "qwen3-4b-q4_k_m",
@@ -42,18 +45,8 @@
       "size_bytes": 2576980377,
       "sha256": "",
       "license": "Apache-2.0",
-      "note": "Лёгкая мультиязычная LLM (4 ГБ RAM)"
-    },
-    {
-      "id": "gigaam-v3-e2e-ctc-int8",
-      "kind": "asr",
-      "title": "GigaAM v3 e2e CTC int8",
-      "filename": "v3_e2e_ctc.int8.onnx",
-      "url": "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/main/v3_e2e_ctc.int8.onnx",
-      "size_bytes": 224893347,
-      "sha256": "",
-      "license": "MIT",
-      "note": "Основная ASR-модель (скачивается автоматически при первом запуске)"
+      "note": "Лёгкая мультиязычная LLM (4 ГБ RAM)",
+      "purpose": "саммаризация, вопросы"
     },
     {
       "id": "silero-vad-v5-onnx",
@@ -64,7 +57,8 @@
       "size_bytes": 2432648,
       "sha256": "",
       "license": "MIT",
-      "note": "Нарезка длинных аудио на речевые сегменты"
+      "note": "Нарезка длинных аудио на речевые сегменты",
+      "purpose": "VAD-нарезка"
     }
   ]
 }

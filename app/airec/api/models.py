@@ -1,11 +1,14 @@
-"""Models API: list installed models, download with progress, offline import."""
+"""Models API: list installed models, download with progress, offline import,
+and Ollama models detection."""
 
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 
 from airec.core.paths import app_root
@@ -17,11 +20,50 @@ router = APIRouter(prefix="/api/v1/models", tags=["models"])
 
 _DOWNLOAD_PROGRESS: dict[str, dict[str, Any]] = {}
 
-MANIFEST_DIR = app_root() / "models"
+# Manifest lives in models/ next to the repo root in dev, and in _internal/models/
+# next to the exe in frozen one-folder builds.
+if getattr(sys, "frozen", False):
+    MANIFEST_DIR = app_root() / "_internal" / "models"
+else:
+    MANIFEST_DIR = app_root() / "models"
+
+OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 
 
 def _manager(request: Request) -> ModelManager:
     return request.app.state.models
+
+
+def _detect_ollama_models() -> list[dict[str, Any]]:
+    """Try to detect models installed in a local Ollama instance."""
+    try:
+        with httpx.Client(timeout=httpx.Timeout(2.0, connect=1.0)) as client:
+            resp = client.get(f"{OLLAMA_BASE_URL}/api/tags")
+            if resp.status_code == 200:
+                data = resp.json()
+                models = []
+                for m in data.get("models", []):
+                    models.append(
+                        {
+                            "id": f"ollama:{m.get('name', 'unknown')}",
+                            "kind": "ollama",
+                            "title": m.get("name", "unknown"),
+                            "filename": None,
+                            "url": None,
+                            "size_bytes": m.get("size", 0),
+                            "sha256": m.get("digest", ""),
+                            "license": "unknown",
+                            "note": "Модель Ollama (уже установлена на компьютере)",
+                            "purpose": "саммаризация, вопросы",
+                            "installed": True,
+                            "download_progress": None,
+                        }
+                    )
+                return models
+    except Exception:
+        # Ollama not running or not installed — silently ignore
+        pass
+    return []
 
 
 @router.get("")
@@ -39,7 +81,16 @@ def list_models(request: Request) -> dict[str, Any]:
         info["size_mb"] = round((inst["size_bytes"] if inst else entry.get("size_bytes", 0)) / (1024 * 1024), 1)
         info["download_progress"] = _DOWNLOAD_PROGRESS.get(model_id)
         items.append(info)
-    return {"items": items, "installed": [m["id"] for m in manager.installed_models()]}
+
+    # Add Ollama models (already installed on the computer)
+    ollama_models = _detect_ollama_models()
+    items.extend(ollama_models)
+
+    return {
+        "items": items,
+        "installed": [m["id"] for m in manager.installed_models()]
+        + [m["id"] for m in ollama_models],
+    }
 
 
 @router.post("/download/{model_id}")
