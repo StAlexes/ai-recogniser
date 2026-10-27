@@ -276,6 +276,46 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
   const usesHttpLlm =
     settings?.llm_provider === 'external' || settings?.llm_provider === 'ollama';
 
+  // Diarization models come from the manifest (kind: "diarization").  The
+  // "custom" entry keeps the old local-folder workflow for advanced users.
+  const diarizationModels = allModels.filter((model) => model.kind === 'diarization');
+  const diarizationOptions: Array<{ value: string; label: string }> = [
+    ...diarizationModels.map((model) => ({
+      value: model.id,
+      label: `${model.title}${model.installed ? '' : ' · не скачана'}`,
+    })),
+    { value: 'custom', label: 'Своя модель (локальная папка)' },
+  ];
+  const currentDiarization = settings?.diarize_model ?? '';
+  const diarizationValue =
+    currentDiarization !== '' ? currentDiarization : diarizationModels[0]?.id ?? 'custom';
+  if (!diarizationOptions.some((option) => option.value === diarizationValue)) {
+    diarizationOptions.unshift({ value: diarizationValue, label: diarizationValue });
+  }
+  const diarizationLabel =
+    diarizationOptions.find((option) => option.value === diarizationValue)?.label ??
+    diarizationValue;
+  const selectedDiarizationModel = diarizationModels.find(
+    (model) => model.id === diarizationValue,
+  );
+  const diarizationHint =
+    diarizationValue === 'custom'
+      ? 'Папка с одной моделью WeSpeaker в формате ONNX (файл .onnx).'
+      : selectedDiarizationModel
+        ? [
+            selectedDiarizationModel.note,
+            selectedDiarizationModel.license,
+            selectedDiarizationModel.size_mb
+              ? `${selectedDiarizationModel.size_mb} МБ`
+              : null,
+            selectedDiarizationModel.installed
+              ? 'скачана'
+              : 'загрузится при первом запуске',
+          ]
+            .filter(Boolean)
+            .join(' · ')
+        : 'Модель загрузится автоматически при первом запуске.';
+
   const themeLabel =
     THEME_OPTIONS.find((option) => option.value === settings?.theme)?.label ?? 'Системная';
 
@@ -583,7 +623,8 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
             </h2>
             <p className="settings-card-sub">
               Определяет участников разговора по голосу и помечает каждый сегмент
-              именем спикера. Требует загрузки модели эмбеддингов (~50 МБ).
+              именем спикера. Модель эмбеддингов (25–115 МБ) можно выбрать ниже;
+              она скачивается автоматически при первом использовании.
             </p>
 
             <div className="settings-rows">
@@ -633,24 +674,59 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
 
               <div className="settings-row">
                 <div className="settings-row-text">
-                  <span className="settings-label">Путь к модели диаризации</span>
-                  <span className="settings-hint">
-                    Папка с моделью Wespeaker ONNX (оставьте пустым для автоматической загрузки).
-                  </span>
+                  <span className="settings-label">Модель диаризации</span>
+                  <span className="settings-hint">{diarizationHint}</span>
                 </div>
-                <div className="settings-control settings-control-rag">
-                  <Input
-                    className="settings-input-wide"
-                    aria-label="Путь к модели диаризации"
-                    value={settings.diarize_model_path}
+                <div className="settings-control settings-control-model">
+                  <Dropdown
+                    aria-label="Модель диаризации"
+                    value={diarizationLabel}
+                    selectedOptions={[diarizationValue]}
                     disabled={!settings.diarize_enabled}
-                    placeholder="Пусто — автозагрузка из Hugging Face"
-                    onChange={(_event, data) => {
-                      update({ diarize_model_path: data.value });
+                    onOptionSelect={(_event, data) => {
+                      if (data.optionValue === undefined) {
+                        return;
+                      }
+                      update({
+                        diarize_model: data.optionValue,
+                        ...(data.optionValue === 'custom'
+                          ? {}
+                          : { diarize_model_path: '' }),
+                      });
                     }}
-                  />
+                  >
+                    {diarizationOptions.map((option) => (
+                      <Option key={option.value} value={option.value}>
+                        {option.label}
+                      </Option>
+                    ))}
+                  </Dropdown>
                 </div>
               </div>
+
+              {diarizationValue === 'custom' ? (
+                <div className="settings-row">
+                  <div className="settings-row-text">
+                    <span className="settings-label">Папка с моделью</span>
+                    <span className="settings-hint">
+                      Локальная папка с одним ONNX-файлом WeSpeaker. Используется
+                      вместо модели из каталога.
+                    </span>
+                  </div>
+                  <div className="settings-control settings-control-rag">
+                    <Input
+                      className="settings-input-wide"
+                      aria-label="Папка с моделью диаризации"
+                      value={settings.diarize_model_path}
+                      disabled={!settings.diarize_enabled}
+                      placeholder="Например, D:\models\wespeaker"
+                      onChange={(_event, data) => {
+                        update({ diarize_model_path: data.value });
+                      }}
+                    />
+                  </div>
+                </div>
+              ) : null}
             </div>
           </section>
 

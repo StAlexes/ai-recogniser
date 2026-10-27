@@ -7,7 +7,7 @@ rem Регистрирует контекстное меню Windows "Распо
 rem для поддерживаемых аудио/видео форматов. Запись в HKCU — не требует прав админа.
 rem Использование: register_context_menu.cmd
 
-rem Builds live in versioned folders (dist\AI Recogniser 0.2.2\).  Pick the
+rem Builds live in versioned folders (dist\AI Recogniser X.Y.Z\).  Pick the
 rem newest one, with a fallback to the legacy non-versioned layout.
 set "EXE=%ROOT%\dist\AI Recogniser\AI Recogniser.exe"
 if exist "%EXE%" goto :exe_found

@@ -432,7 +432,9 @@ class JobManager:
                 vad_speech_pad_ms=settings.vad_speech_pad_ms,
                 diarize_enabled=settings.diarize_enabled,
                 diarize_threshold=settings.diarize_threshold,
+                diarize_model=settings.diarize_model,
                 diarize_model_path=settings.diarize_model_path,
+                models_dir=self._paths.models,
             )
             transcript_path = self._job_dir(job_id) / "transcript.txt"
             transcript_path.parent.mkdir(parents=True, exist_ok=True)

@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 log = logging.getLogger(__name__)
 
@@ -54,9 +54,12 @@ class Settings(BaseModel):
     vad_speech_pad_ms: int = Field(default=100, ge=0, le=1000)
 
     # Speaker diarization: cluster VAD segments by speaker identity using
-    # Wespeaker embeddings (optional, disabled by default).
+    # WeSpeaker embeddings (optional, disabled by default).  ``diarize_model``
+    # is a manifest id; ``diarize_model_path`` is an optional local ONNX folder
+    # that overrides it (kept for advanced/offline use).
     diarize_enabled: bool = False
     diarize_threshold: float = Field(default=0.70, ge=0.1, le=0.99)
+    diarize_model: str = "wespeaker-voxceleb-resnet34"
     diarize_model_path: str = ""
 
     # ragkb runs as a separate, local HTTP service.  It is optional: when it is
@@ -69,6 +72,13 @@ class Settings(BaseModel):
     # context menu.  When disabled, files are queued but not started until the
     # user clicks "Распознать".
     recognize_immediately: bool = True
+
+    @model_validator(mode="after")
+    def _migrate_legacy_diarization_path(self) -> Settings:
+        """Old configs only had ``diarize_model_path``; keep them working."""
+        if self.diarize_model_path and "diarize_model" not in self.model_fields_set:
+            self.diarize_model = "custom"
+        return self
 
 
 def load_settings(path: Path) -> Settings:

@@ -23,6 +23,7 @@ from airec.asr.vad import (
     join_segments,
     segment_and_recognize,
 )
+from airec.models.manifest import find_model, load_manifest, manifest_dir
 
 log = logging.getLogger(__name__)
 
@@ -102,6 +103,39 @@ def _load_model(model_id: str, cpu_threads: int) -> Any:
         return model
 
 
+def _resolve_diarization(
+    model_id: str,
+    model_path: str,
+    models_dir: Path | None,
+) -> tuple[str | None, Path | None]:
+    """Resolve the selected diarization model to (HF repo, local dir).
+
+    Precedence: explicit local path (``custom``) → model downloaded through the
+    catalogue → Hugging Face repository from the manifest.  Returns
+    ``(None, None)`` when nothing is known, which makes diarization use the
+    built-in default.
+    """
+    use_custom = model_id == "custom" or (not model_id and bool(model_path))
+    if use_custom and model_path:
+        candidate = Path(model_path)
+        if candidate.is_dir():
+            return None, candidate
+        log.warning("diarization model path does not exist: %s", candidate)
+
+    repo_id: str | None = None
+    if model_id and model_id != "custom":
+        entry = find_model(load_manifest(manifest_dir()), model_id)
+        if entry is not None:
+            repo_id = str(entry.get("repo") or "") or None
+
+    if models_dir is not None and model_id and model_id != "custom":
+        candidate = Path(models_dir) / model_id
+        if candidate.is_dir() and any(candidate.glob("*.onnx")):
+            return repo_id, candidate
+
+    return repo_id, None
+
+
 def _recognize_fixed_windows(
     model: Any,
     wav_path: Path,
@@ -153,7 +187,9 @@ def transcribe(
     vad_speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS,
     diarize_enabled: bool = False,
     diarize_threshold: float = 0.70,
+    diarize_model: str = "",
     diarize_model_path: str = "",
+    models_dir: Path | None = None,
 ) -> TranscriptionResult:
     """Convert *source* if needed and recognise it on the CPU.
 
@@ -238,13 +274,17 @@ def transcribe(
             try:
                 audio = read_pcm16_mono(wav_path, sample_rate=SAMPLE_RATE)
                 segment_dicts = [s.as_dict() for s in segments]
+                repo_id, model_path = _resolve_diarization(
+                    diarize_model, diarize_model_path, models_dir
+                )
                 diarized = diarize_segments(
                     segment_dicts,
                     audio,
                     SAMPLE_RATE,
                     cpu_threads=cpu_threads,
                     threshold=diarize_threshold,
-                    model_path=diarize_model_path or None,
+                    model_path=model_path,
+                    repo_id=repo_id,
                 )
                 segments = tuple(
                     SpeechSegment(

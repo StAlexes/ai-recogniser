@@ -36,6 +36,7 @@ export interface Settings {
   vad_speech_pad_ms: number;
   diarize_enabled: boolean;
   diarize_threshold: number;
+  diarize_model: string;
   diarize_model_path: string;
   recognize_immediately: boolean;
   rag_enabled: boolean;

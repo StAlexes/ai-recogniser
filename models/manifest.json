@@ -25,6 +25,58 @@
       "purpose": "расшифровка"
     },
     {
+      "id": "wespeaker-voxceleb-resnet34",
+      "kind": "diarization",
+      "title": "WeSpeaker ResNet34 (VoxCeleb)",
+      "repo": "Wespeaker/wespeaker-voxceleb-resnet34",
+      "filename": "voxceleb_resnet34.onnx",
+      "url": "https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34/resolve/main/voxceleb_resnet34.onnx",
+      "size_bytes": 26534127,
+      "sha256": "",
+      "license": "Apache-2.0",
+      "note": "Базовая модель: быстрая, надёжно разделяет 2–4 спикеров",
+      "purpose": "диаризация"
+    },
+    {
+      "id": "wespeaker-voxceleb-campplus",
+      "kind": "diarization",
+      "title": "WeSpeaker CAM++ (VoxCeleb)",
+      "repo": "Wespeaker/wespeaker-voxceleb-campplus",
+      "filename": "voxceleb_CAM++.onnx",
+      "url": "https://huggingface.co/Wespeaker/wespeaker-voxceleb-campplus/resolve/main/voxceleb_CAM++.onnx",
+      "size_bytes": 29292449,
+      "sha256": "",
+      "license": "Apache-2.0",
+      "note": "Быстрая CAM++: устойчива к коротким репликам",
+      "purpose": "диаризация"
+    },
+    {
+      "id": "wespeaker-voxceleb-ecapa-tdnn512",
+      "kind": "diarization",
+      "title": "WeSpeaker ECAPA-TDNN512 (VoxCeleb)",
+      "repo": "Wespeaker/wespeaker-voxceleb-ecapa-tdnn512",
+      "filename": "voxceleb_ECAPA512.onnx",
+      "url": "https://huggingface.co/Wespeaker/wespeaker-voxceleb-ecapa-tdnn512/resolve/main/voxceleb_ECAPA512.onnx",
+      "size_bytes": 24861931,
+      "sha256": "",
+      "license": "Apache-2.0",
+      "note": "Компактная ECAPA-TDNN: баланс скорости и точности",
+      "purpose": "диаризация"
+    },
+    {
+      "id": "wespeaker-voxceleb-resnet293-LM",
+      "kind": "diarization",
+      "title": "WeSpeaker ResNet293-LM (VoxCeleb)",
+      "repo": "Wespeaker/wespeaker-voxceleb-resnet293-LM",
+      "filename": "voxceleb_resnet293_LM.onnx",
+      "url": "https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet293-LM/resolve/main/voxceleb_resnet293_LM.onnx",
+      "size_bytes": 114336285,
+      "sha256": "",
+      "license": "CC-BY-4.0",
+      "note": "Максимальное качество, но крупнее и медленнее",
+      "purpose": "диаризация"
+    },
+    {
       "id": "t-lite-it-2.1-8b-q4_k_m",
       "kind": "llm-gguf",
       "title": "T-lite-it-2.1 8B Q4_K_M (T-Bank)",

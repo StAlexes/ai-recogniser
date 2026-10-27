@@ -50,6 +50,20 @@ def test_vad_settings_defaults_and_bounds() -> None:
         Settings(vad_min_silence_ms=0)
 
 
+def test_diarization_model_default_and_legacy_path() -> None:
+    assert Settings().diarize_model == "wespeaker-voxceleb-resnet34"
+
+    legacy = Settings.model_validate({"diarize_model_path": "D:/models/wespeaker"})
+
+    assert legacy.diarize_model == "custom"
+    assert legacy.diarize_model_path == "D:/models/wespeaker"
+
+    explicit = Settings.model_validate(
+        {"diarize_model": "wespeaker-voxceleb-campplus", "diarize_model_path": "D:/old"}
+    )
+    assert explicit.diarize_model == "wespeaker-voxceleb-campplus"
+
+
 def test_settings_with_utf8_bom_are_read(tmp_path: Path) -> None:
     """Notepad and some editors prepend a BOM; that must not reset the settings."""
     path = tmp_path / "config.json"

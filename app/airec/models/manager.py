@@ -53,7 +53,10 @@ class ModelManager:
         for directory in sorted(self.models_dir.iterdir()):
             if not directory.is_dir():
                 continue
-            size = sum(f.stat().st_size for f in directory.rglob("*") if f.is_file())
+            complete = [f for f in directory.rglob("*") if f.is_file() and f.suffix != ".partial"]
+            if not complete:
+                continue
+            size = sum(f.stat().st_size for f in complete)
             installed.append(
                 {
                     "id": directory.name,
@@ -68,7 +71,12 @@ class ModelManager:
         return self.models_dir / model_id
 
     def is_installed(self, model_id: str) -> bool:
-        return (self.models_dir / model_id).is_dir()
+        directory = self.models_dir / model_id
+        if not directory.is_dir():
+            return False
+        return any(
+            f.is_file() and f.suffix != ".partial" for f in directory.rglob("*")
+        )
 
     # ------------------------------------------------------------------ #
     # Download
@@ -79,18 +87,22 @@ class ModelManager:
         url: str,
         *,
         sha256: str | None = None,
+        filename: str | None = None,
         progress: Callable[[float, str], None] | None = None,
     ) -> None:
         """Download *url* into ``models_dir/<model_id>/`` with resume.
 
         Runs in a background thread; progress callback receives (0..1, phase).
+        *filename* keeps the original model file name (``model.onnx``,
+        ``*.gguf``) so onnx-asr and llama.cpp can use the downloaded folder
+        directly.
         """
         with self._lock:
             if model_id in self._downloads:
                 raise ModelError(f"model {model_id} is already being downloaded")
             thread = threading.Thread(
                 target=self._download_thread,
-                args=(model_id, url, sha256, progress),
+                args=(model_id, url, sha256, filename, progress),
                 name=f"model-download-{model_id}",
                 daemon=True,
             )
@@ -102,15 +114,17 @@ class ModelManager:
         model_id: str,
         url: str,
         sha256: str | None,
+        filename: str | None,
         progress: Callable[[float, str], None] | None,
     ) -> None:
         notify = progress or (lambda _value, _phase: None)
         target_dir = self.model_path(model_id)
         target_dir.mkdir(parents=True, exist_ok=True)
-        # Download into a single file named after model id; the consumer can
-        # rename/unpack afterwards.
-        target_file = target_dir / f"{model_id}.bin"
-        tmp_file = target_dir / f"{model_id}.bin.partial"
+        # Keep the real filename (onnx-asr resolves `*.onnx`, llama.cpp needs a
+        # `.gguf`).  Fall back to `<id>.bin` for entries without a filename.
+        safe_name = Path(filename).name if filename else f"{model_id}.bin"
+        target_file = target_dir / safe_name
+        tmp_file = target_dir / f"{safe_name}.partial"
 
         notify(0.0, "Скачивание модели")
         try:
