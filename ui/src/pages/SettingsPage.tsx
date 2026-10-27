@@ -944,6 +944,7 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
                 <thead>
                   <tr>
                     <th>Модель</th>
+                    <th>Назначение</th>
                     <th>Тип</th>
                     <th>Размер</th>
                     <th>Лицензия</th>
@@ -970,6 +971,7 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
                           <div className="model-title">{model.title}</div>
                           <div className="model-note">{model.note}</div>
                         </td>
+                        <td>{model.purpose ?? '—'}</td>
                         <td>{model.kind}</td>
                         <td>{sizeText}</td>
                         <td>{model.license}</td>
