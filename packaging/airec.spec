@@ -37,6 +37,8 @@ hiddenimports = [
     "airec.asr.manager",
     "airec.asr.service",
     "airec.asr.vad",
+    "airec.integrations.windows",
+    "airec.notify.windows_toast",
     "airec.rag.client",
     "multipart",
     "python_multipart",

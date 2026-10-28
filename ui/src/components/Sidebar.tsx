@@ -15,7 +15,7 @@ import {
 import { minimizeToTray, quitApp } from '../desktop';
 import { StatusDot } from './StatusDot';
 
-export type PageKey = 'queue' | 'knowledge' | 'settings';
+export type PageKey = 'queue' | 'knowledge' | 'settings' | 'models';
 
 interface NavItem {
   key: PageKey;

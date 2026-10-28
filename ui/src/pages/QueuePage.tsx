@@ -17,10 +17,12 @@ import {
   ArrowDownloadRegular,
   CopyRegular,
   DismissRegular,
+  FolderOpenRegular,
   HistoryRegular,
   InfoRegular,
   MusicNote2Regular,
   PlayRegular,
+  SaveRegular,
   ShieldCheckmarkRegular,
   SparkleRegular,
   VideoRegular,
@@ -32,15 +34,17 @@ import {
   getJob,
   getJobs,
   retryJob,
+  revealJobFolder,
   startJob,
   summarizeJob,
   token,
   uploadJob,
 } from '../api';
-import type { JobDetail, JobStatus, JobSummary } from '../api';
+import type { JobDetail, JobStage, JobStatus, JobSummary, StageKey } from '../api';
 import { Dropzone } from '../components/Dropzone';
 import { InfoCard } from '../components/InfoCard';
 import { PageHeader } from '../components/PageHeader';
+import { openResultFolder, saveResultAs } from '../desktop';
 import { formatBytes, pluralFiles } from '../format';
 
 const ACCEPTED_EXTENSIONS = new Set([
@@ -75,7 +79,15 @@ interface SelectedFile {
 
 interface QueuePageProps {
   onAuthError: () => void;
+  initialJobId?: string | null;
+  onInitialJobOpened?: () => void;
 }
+
+const STAGE_LABELS: Record<StageKey, string> = {
+  recognition: 'Распознавание',
+  diarization: 'Диаризация',
+  summary: 'Саммаризация',
+};
 
 function extensionOf(name: string): string {
   const dot = name.lastIndexOf('.');
@@ -146,7 +158,75 @@ function formatDate(value: string): string {
   });
 }
 
-export function QueuePage({ onAuthError }: QueuePageProps) {
+/** Human-readable duration for job cards (seconds → mm:ss / h:mm:ss). */
+function formatDuration(value: number | null): string {
+  if (value === null || !Number.isFinite(value) || value < 0) {
+    return '—';
+  }
+  const total = Math.round(value);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+  if (minutes > 0) {
+    return `${minutes}:${String(seconds).padStart(2, '0')}`;
+  }
+  return `${seconds} с`;
+}
+
+function jobElapsedSeconds(job: JobSummary, now: number): number | null {
+  if (job.elapsed_s !== null) {
+    return job.elapsed_s;
+  }
+  if (isActive(job.status) && job.started_at !== null) {
+    const started = new Date(job.started_at).getTime();
+    if (Number.isFinite(started)) {
+      return Math.max((now - started) / 1000, 0);
+    }
+  }
+  return null;
+}
+
+function stageStatusText(stage: JobStage): string {
+  switch (stage.status) {
+    case 'pending':
+      return 'ожидает';
+    case 'running':
+      return stage.phase || 'выполняется';
+    case 'done':
+      return 'готово';
+    case 'error':
+      return 'ошибка';
+    case 'skipped':
+      return stage.phase || 'пропущено';
+  }
+}
+
+function StageProgress({ name, stage }: { name: StageKey; stage: JobStage }) {
+  const percent = Math.round(Math.max(0, Math.min(stage.progress, 1)) * 100);
+  return (
+    <div className="job-stage" data-status={stage.status}>
+      <span className="job-stage-label">{STAGE_LABELS[name]}</span>
+      <ProgressBar
+        className="job-stage-bar"
+        value={stage.progress}
+        thickness="medium"
+        aria-label={`${STAGE_LABELS[name]}: ${percent}%`}
+      />
+      <span className="job-stage-value" title={stageStatusText(stage)}>
+        {stage.status === 'skipped' ? '—' : `${percent}%`}
+      </span>
+    </div>
+  );
+}
+
+export function QueuePage({
+  onAuthError,
+  initialJobId = null,
+  onInitialJobOpened,
+}: QueuePageProps) {
   const [files, setFiles] = useState<SelectedFile[]>([]);
   const [jobs, setJobs] = useState<JobSummary[]>([]);
   const [detail, setDetail] = useState<JobDetail | null>(null);
@@ -158,8 +238,11 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
   const [exportFormat, setExportFormat] = useState<'txt' | 'srt' | 'vtt' | 'md' | 'json'>('txt');
   const [summary, setSummary] = useState<any>(null);
   const [summarizing, setSummarizing] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+  const [savingJobId, setSavingJobId] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const nextId = useRef(0);
+  const initialSelectionOpened = useRef(false);
 
   const openPicker = (): void => {
     inputRef.current?.click();
@@ -231,8 +314,29 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
     };
   }, [onAuthError]);
 
-  const hasActive = jobs.some((job) => isActive(job.status))
-    || (detail !== null && isActive(detail.status));
+  const hasActive = jobs.some(
+    (job) =>
+      isActive(job.status) ||
+      job.stages?.summary?.status === 'running' ||
+      job.stages?.recognition?.status === 'running' ||
+      job.stages?.diarization?.status === 'running',
+  )
+    || (detail !== null && isActive(detail.status))
+    || (detail !== null && detail.stages?.summary?.status === 'running')
+    || summarizing;
+
+  useEffect(() => {
+    if (!hasActive) {
+      return;
+    }
+    setNow(Date.now());
+    const timer = window.setInterval(() => {
+      setNow(Date.now());
+    }, 1000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [hasActive]);
 
   useEffect(() => {
     if (!hasActive) {
@@ -246,10 +350,14 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
           return;
         }
         setJobs(response.items);
-        if (detail !== null && isActive(detail.status)) {
+        if (
+          detail !== null &&
+          (isActive(detail.status) || detail.stages?.summary?.status === 'running')
+        ) {
           const fresh = await getJob(detail.id);
           if (!cancelled) {
             setDetail(fresh);
+            setSummary(fresh.summary ?? null);
           }
         }
       } catch (reason: unknown) {
@@ -270,7 +378,9 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
 
   const selectJob = async (jobId: string): Promise<void> => {
     try {
-      setDetail(await getJob(jobId));
+      const fresh = await getJob(jobId);
+      setDetail(fresh);
+      setSummary(fresh.summary ?? null);
       setError(null);
     } catch (reason: unknown) {
       if (reason instanceof AuthError) {
@@ -278,6 +388,90 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
         return;
       }
       setError(describeError(reason));
+    }
+  };
+
+  useEffect(() => {
+    if (initialJobId === null || initialSelectionOpened.current) {
+      return;
+    }
+    initialSelectionOpened.current = true;
+    void selectJob(initialJobId);
+    onInitialJobOpened?.();
+  }, [initialJobId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleOpenFolder = async (jobId: string): Promise<void> => {
+    try {
+      const bridgeResult = await openResultFolder(jobId);
+      if (bridgeResult !== null) {
+        if (!bridgeResult.ok) {
+          setError(bridgeResult.error ?? 'Не удалось открыть папку результата.');
+        }
+        return;
+      }
+      await revealJobFolder(jobId);
+    } catch (reason: unknown) {
+      if (reason instanceof AuthError) {
+        onAuthError();
+        return;
+      }
+      setError(describeError(reason));
+    }
+  };
+
+  const handleSaveResult = async (job: JobDetail | JobSummary): Promise<void> => {
+    if (job.status !== 'done') {
+      return;
+    }
+    const base = job.filename.replace(/\.[^.]+$/, '') || 'transcript';
+    setSavingJobId(job.id);
+    setError(null);
+    try {
+      const bridgeResult = await saveResultAs(job.id, `${base}.txt`);
+      if (bridgeResult !== null) {
+        if (bridgeResult.cancelled) {
+          return;
+        }
+        if (!bridgeResult.ok) {
+          setError(bridgeResult.error ?? 'Не удалось сохранить результат.');
+          return;
+        }
+        setNotice(`Результат сохранён: ${bridgeResult.path ?? ''}`);
+        return;
+      }
+      // Browser fallback: regular download to the browser's download folder.
+      const response = await fetch(
+        `/api/v1/jobs/${encodeURIComponent(job.id)}/export?format=txt`,
+        {
+          method: 'GET',
+          credentials: 'same-origin',
+          headers: {
+            Accept: '*/*',
+            ...(token !== null ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          cache: 'no-store',
+        },
+      );
+      if (!response.ok) {
+        setError(`Сохранение не удалось (HTTP ${response.status}).`);
+        return;
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${base}.txt`;
+      link.click();
+      URL.revokeObjectURL(url);
+      setNotice('Результат сохранён в папку загрузок браузера.');
+    } catch (reason: unknown) {
+      if (reason instanceof AuthError) {
+        onAuthError();
+        return;
+      }
+      setError(describeError(reason));
+    } finally {
+      setSavingJobId(null);
     }
   };
 
@@ -474,6 +668,14 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
       const response = await summarizeJob(detail.id);
       setSummary(response.summary);
       setNotice('Саммари готово.');
+      try {
+        const fresh = await getJob(detail.id);
+        setDetail(fresh);
+        const responseJobs = await getJobs();
+        setJobs(responseJobs.items);
+      } catch {
+        // The next poll will catch up.
+      }
     } catch (reason: unknown) {
       if (reason instanceof AuthError) {
         onAuthError();
@@ -632,77 +834,110 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
             </Badge>
           </div>
           <ul className="jobs-list">
-            {jobs.map((job) => (
-              <li key={job.id}>
-                <button
-                  type="button"
-                  className="job-row"
-                  data-selected={detail?.id === job.id}
-                  onClick={() => {
-                    void selectJob(job.id);
-                  }}
-                >
-                  <span className="job-main">
-                    <span className="file-name" title={job.filename}>
-                      {job.filename}
+            {jobs.map((job) => {
+              const elapsed = formatDuration(jobElapsedSeconds(job, now));
+              const percent = Math.round(Math.max(0, Math.min(job.progress, 1)) * 100);
+              return (
+                <li key={job.id}>
+                  <button
+                    type="button"
+                    className="job-row"
+                    data-selected={detail?.id === job.id}
+                    onClick={() => {
+                      void selectJob(job.id);
+                    }}
+                  >
+                    <span className="job-main">
+                      <span className="file-name" title={job.filename}>
+                        {job.filename}
+                      </span>
+                      <span className="job-meta">
+                        {formatDate(job.created_at)} · {job.audio_format.toUpperCase()} ·{' '}
+                        {formatBytes(job.size_bytes)}
+                        {job.status !== 'queued' ? ` · время: ${elapsed}` : ''}
+                        {job.status !== 'queued' ? ` · ${percent}%` : ''}
+                      </span>
                     </span>
-                    <span className="job-meta">
-                      {formatDate(job.created_at)} · {job.audio_format.toUpperCase()}
-                    </span>
-                  </span>
-                  <Badge appearance="tint" color={statusColor(job.status)} size="small">
-                    {statusLabel(job.status)}
-                  </Badge>
-                </button>
-                {isActive(job.status) ? (
-                  <>
-                    <ProgressBar
-                      className="job-progress"
-                      value={job.progress}
-                      thickness="medium"
-                      aria-label={`Прогресс ${job.filename}`}
-                    />
+                    <Badge appearance="tint" color={statusColor(job.status)} size="small">
+                      {statusLabel(job.status)}
+                    </Badge>
+                  </button>
+
+                  <div className="job-stages" aria-label={`Этапы задачи ${job.filename}`}>
+                    <StageProgress name="recognition" stage={job.stages.recognition} />
+                    <StageProgress name="diarization" stage={job.stages.diarization} />
+                    <StageProgress name="summary" stage={job.stages.summary} />
+                  </div>
+
+                  <div className="job-actions">
                     <Button
                       appearance="subtle"
                       size="small"
-                      icon={<DismissRegular />}
+                      icon={<FolderOpenRegular />}
                       onClick={() => {
-                        void handleCancel(job.id);
+                        void handleOpenFolder(job.id);
                       }}
                     >
-                      Отменить
+                      Папка
                     </Button>
-                  </>
-                ) : null}
-                {job.status === 'queued' && job.paused ? (
-                  <Button
-                    appearance="subtle"
-                    size="small"
-                    icon={<PlayRegular />}
-                    onClick={() => {
-                      void handleStart(job.id);
-                    }}
-                  >
-                    Запустить
-                  </Button>
-                ) : null}
-                {(job.status === 'error' || job.status === 'cancelled') && (
-                  <Button
-                    appearance="subtle"
-                    size="small"
-                    icon={<HistoryRegular />}
-                    onClick={() => {
-                      void handleRetry(job.id);
-                    }}
-                  >
-                    Повторить
-                  </Button>
-                )}
-                {job.status === 'error' && job.error !== null ? (
-                  <p className="job-error">{job.error}</p>
-                ) : null}
-              </li>
-            ))}
+                    {job.status === 'done' && job.segment_count > 0 ? (
+                      <Button
+                        appearance="subtle"
+                        size="small"
+                        icon={
+                          savingJobId === job.id ? <Spinner size="tiny" /> : <SaveRegular />
+                        }
+                        disabled={savingJobId === job.id}
+                        onClick={() => {
+                          void handleSaveResult(job);
+                        }}
+                      >
+                        Сохранить как…
+                      </Button>
+                    ) : null}
+                    {isActive(job.status) ? (
+                      <Button
+                        appearance="subtle"
+                        size="small"
+                        icon={<DismissRegular />}
+                        onClick={() => {
+                          void handleCancel(job.id);
+                        }}
+                      >
+                        Отменить
+                      </Button>
+                    ) : null}
+                    {job.status === 'queued' && job.paused ? (
+                      <Button
+                        appearance="subtle"
+                        size="small"
+                        icon={<PlayRegular />}
+                        onClick={() => {
+                          void handleStart(job.id);
+                        }}
+                      >
+                        Запустить
+                      </Button>
+                    ) : null}
+                    {(job.status === 'error' || job.status === 'cancelled') ? (
+                      <Button
+                        appearance="subtle"
+                        size="small"
+                        icon={<HistoryRegular />}
+                        onClick={() => {
+                          void handleRetry(job.id);
+                        }}
+                      >
+                        Повторить
+                      </Button>
+                    ) : null}
+                  </div>
+                  {job.status === 'error' && job.error !== null ? (
+                    <p className="job-error">{job.error}</p>
+                  ) : null}
+                </li>
+              );
+            })}
           </ul>
         </section>
       ) : null}
@@ -719,7 +954,12 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
                 {detail.duration_s !== null
                   ? ` · аудио ${formatSeconds(detail.duration_s)}`
                   : ''}
-                {detail.elapsed_s !== null ? ` · обработка ${formatSeconds(detail.elapsed_s)}` : ''}
+                {detail.status !== 'queued'
+                  ? ` · время ${formatDuration(jobElapsedSeconds(detail, now))}`
+                  : ''}
+                {detail.status !== 'queued'
+                  ? ` · ${Math.round(Math.max(0, Math.min(detail.progress, 1)) * 100)}%`
+                  : ''}
                 {detail.rtf !== null
                   ? ` · RTFx ${detail.rtf.toFixed(1).replace('.', ',')}`
                   : ''}
@@ -729,6 +969,25 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
               </p>
             </div>
             <div className="transcript-actions">
+              <Button
+                size="small"
+                icon={<FolderOpenRegular />}
+                onClick={() => {
+                  void handleOpenFolder(detail.id);
+                }}
+              >
+                Папка
+              </Button>
+              <Button
+                size="small"
+                icon={savingJobId === detail.id ? <Spinner size="tiny" /> : <SaveRegular />}
+                disabled={detail.text === '' || savingJobId === detail.id}
+                onClick={() => {
+                  void handleSaveResult(detail);
+                }}
+              >
+                Сохранить как…
+              </Button>
               <Button
                 size="small"
                 icon={<CopyRegular />}
@@ -806,6 +1065,12 @@ export function QueuePage({ onAuthError }: QueuePageProps) {
                 Закрыть
               </Button>
             </div>
+          </div>
+
+          <div className="detail-stages" aria-label="Этапы обработки">
+            <StageProgress name="recognition" stage={detail.stages.recognition} />
+            <StageProgress name="diarization" stage={detail.stages.diarization} />
+            <StageProgress name="summary" stage={detail.stages.summary} />
           </div>
 
           {isActive(detail.status) ? (

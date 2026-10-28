@@ -18,6 +18,7 @@ export interface Settings {
   notifications: boolean;
   close_to_tray: boolean;
   pause_on_battery: boolean;
+  context_menu_enabled: boolean;
   results_dir: string;
   keep_extracted_audio: boolean;
   asr_model: string;
@@ -46,6 +47,18 @@ export interface Settings {
 
 export type JobStatus = 'queued' | 'running' | 'done' | 'error' | 'cancelled';
 
+export type StageKey = 'recognition' | 'diarization' | 'summary';
+export type StageStatus = 'pending' | 'running' | 'done' | 'error' | 'skipped';
+
+export interface JobStage {
+  status: StageStatus;
+  phase: string;
+  progress: number;
+  elapsed_s: number | null;
+}
+
+export type JobStages = Record<StageKey, JobStage>;
+
 export interface JobSummary {
   id: string;
   filename: string;
@@ -64,6 +77,7 @@ export interface JobSummary {
   audio_format: string;
   error: string | null;
   paused?: boolean;
+  stages: JobStages;
 }
 
 export interface JobSegment {
@@ -78,6 +92,7 @@ export interface JobDetail extends JobSummary {
   result_file: string | null;
   result_url: string | null;
   segments: JobSegment[];
+  summary: Record<string, any> | null;
 }
 
 export interface JobsResponse {
@@ -445,6 +460,28 @@ export function startJob(jobId: string): Promise<JobDetail> {
   );
 }
 
+export function revealJobFolder(jobId: string): Promise<{ id: string; path: string }> {
+  return request<{ id: string; path: string }>(
+    `/api/v1/jobs/${encodeURIComponent(jobId)}/reveal`,
+    { method: 'POST', timeoutMs: 15_000 },
+  );
+}
+
+export function saveJobResult(
+  jobId: string,
+  targetPath: string,
+  format?: string,
+): Promise<{ id: string; path: string; name: string; size_bytes: number }> {
+  return request<{ id: string; path: string; name: string; size_bytes: number }>(
+    `/api/v1/jobs/${encodeURIComponent(jobId)}/save`,
+    {
+      method: 'POST',
+      body: format === undefined ? { path: targetPath } : { path: targetPath, format },
+      timeoutMs: 30_000,
+    },
+  );
+}
+
 export function summarizeJob(jobId: string): Promise<any> {
   return request<any>(
     `/api/v1/llm/summarize/${encodeURIComponent(jobId)}`,
@@ -513,19 +550,33 @@ export interface ModelItem {
   note?: string;
   purpose?: string;
   installed: boolean;
-  download_progress?: { value: number; phase: string } | null;
+  local?: boolean;
+  location?: 'data' | 'huggingface-cache' | null;
+  download_progress?: {
+    value: number;
+    phase: string;
+    status?: string;
+  } | null;
 }
 
 export interface ModelDownloadProgress {
   id: string;
   value: number;
   phase: string;
+  status?: string;
 }
 
 export interface ModelDownloadResponse {
   id: string;
   status: string;
   url: string;
+}
+
+export function revealModelsFolder(): Promise<{ path: string }> {
+  return request<{ path: string }>('/api/v1/models/reveal', {
+    method: 'POST',
+    timeoutMs: 15_000,
+  });
 }
 
 export function downloadModel(modelId: string): Promise<ModelDownloadResponse> {

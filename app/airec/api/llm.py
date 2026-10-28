@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -26,13 +26,41 @@ def _manager(request: Request) -> JobManager:
     return request.app.state.jobs
 
 
+def _resolve_llm_model(request: Request, settings: Settings) -> str:
+    """Resolve a GGUF name from Settings to the real file in ``models/``."""
+    models_dir = Path(request.app.state.paths.models)
+    value = (settings.llm_model or "").strip()
+    if value and value != "auto":
+        candidate = Path(value)
+        if candidate.is_file():
+            return str(candidate)
+        if not candidate.is_absolute():
+            direct = models_dir / value
+            if direct.is_file():
+                return str(direct)
+            matches = sorted(models_dir.rglob(value))
+            if matches:
+                return str(matches[0])
+        return value
+
+    matches = sorted(models_dir.rglob("*.gguf"))
+    if matches:
+        return str(matches[0])
+    return value or "auto"
+
+
 def _provider(request: Request, settings: Settings) -> Any:
     kind = settings.llm_provider
     if settings.external_llm_enabled and kind == "llamacpp-local":
         kind = "external"
+    local_model = (
+        _resolve_llm_model(request, settings)
+        if kind == "llamacpp-local"
+        else settings.llm_model
+    )
     signature = (
         kind,
-        settings.llm_model,
+        local_model,
         settings.external_llm_base_url,
         settings.external_llm_api_key,
         settings.llm_ctx_size,
@@ -51,11 +79,12 @@ def _provider(request: Request, settings: Settings) -> Any:
                 log.debug("cannot close previous LLM provider", exc_info=True)
     provider = create_provider(
         kind=kind,
-        model=settings.llm_model,
+        model=local_model,
         base_url=settings.external_llm_base_url,
         api_key=settings.external_llm_api_key or None,
         ctx_size=settings.llm_ctx_size,
         threads=settings.llm_threads,
+        binary=request.app.state.paths.bin if kind == "llamacpp-local" else None,
     )
     setattr(request.app.state, PROVIDER_STATE_KEY, (signature, provider))
     return provider
@@ -68,11 +97,15 @@ def list_providers(request: Request) -> dict[str, Any]:
     kind = s.llm_provider
     if kind == "llamacpp-local" and s.external_llm_enabled:
         kind = "external"
+    local_model = (
+        _resolve_llm_model(request, s) if kind == "llamacpp-local" else s.llm_model
+    )
     provider = create_provider(
         kind=kind,
-        model=s.llm_model,
+        model=local_model,
         base_url=s.external_llm_base_url,
         api_key=s.external_llm_api_key or None,
+        binary=request.app.state.paths.bin if kind == "llamacpp-local" else None,
     )
     try:
         health = provider.health()
@@ -100,19 +133,24 @@ def summarize_job(request: Request, job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="Транскрипт пуст.")
 
     settings = request.app.state.settings
+    manager.begin_summary(job_id)
     try:
         provider = _provider(request, settings)
         summarizer = Summarizer(provider)
         glossary = Glossary.from_dicts([])  # TODO: load persisted glossary
         text = glossary.apply(job.text)
-        summary = summarizer.summarize(text)
-        # Persist summary on the job.
-        job.summary = summary  # type: ignore[attr-defined]
-        manager._db.upsert_job(asdict(job))  # type: ignore[attr-defined]
-        manager._write_job_json(job)
+        summary = summarizer.summarize(
+            text,
+            progress=lambda value, phase: manager.update_summary(job_id, value, phase),
+        )
+        manager.finish_summary(job_id, summary)
         return {"job_id": job_id, "summary": summary}
     except LLMError as exc:
+        manager.fail_summary(job_id, str(exc))
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        manager.fail_summary(job_id, str(exc))
+        raise
 
 
 @router.post("/ask/{job_id}")

@@ -8,21 +8,18 @@ import {
   MessageBarActions,
   MessageBarBody,
   Option,
-  ProgressBar,
   Switch,
 } from '@fluentui/react-components';
 import {
   ArrowClockwiseRegular,
-  ArrowDownloadRegular,
   DismissRegular,
   FolderRegular,
+  SettingsRegular,
 } from '@fluentui/react-icons';
 import {
   ApiError,
   AuthError,
-  downloadModel,
   getHealth,
-  getModelDownloadProgress,
   getModels,
   getSettings,
   putSettings,
@@ -60,16 +57,18 @@ interface SaveResult {
 interface SettingsPageProps {
   onAuthError: () => void;
   onThemeModeChange: (mode: ThemeMode) => void;
+  onManageModels: () => void;
 }
 
-export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPageProps) {
+export function SettingsPage({
+  onAuthError,
+  onThemeModeChange,
+  onManageModels,
+}: SettingsPageProps) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [asrModels, setAsrModels] = useState<ModelItem[]>([]);
   const [allModels, setAllModels] = useState<ModelItem[]>([]);
-  const [modelProgress, setModelProgress] = useState<Record<string, { value: number; phase: string }>>(
-    {}
-  );
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveResult, setSaveResult] = useState<SaveResult | null>(null);
@@ -189,55 +188,6 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
   }, [settings, onAuthError]);
 
   // Model download progress polling
-  useEffect(() => {
-    let timer: ReturnType<typeof setInterval> | null = null;
-
-    const poll = async () => {
-      for (const model of allModels) {
-        if (model.download_progress) {
-          try {
-            const progress = await getModelDownloadProgress(model.id);
-            setModelProgress((prev) => ({ ...prev, [model.id]: progress }));
-          } catch {
-            // Ignore individual poll errors
-          }
-        }
-      }
-    };
-
-    timer = setInterval(poll, 2000);
-    void poll();
-
-    return () => {
-      if (timer) {
-        clearInterval(timer);
-      }
-    };
-  }, [allModels]);
-
-  const handleDownloadModel = async (modelId: string): Promise<void> => {
-    try {
-      await downloadModel(modelId);
-      setSaveResult({
-        intent: 'success',
-        text: 'Скачивание модели запущено.',
-      });
-      // Reload models after a short delay to pick up progress
-      setReloadKey((key) => key + 1);
-    } catch (reason: unknown) {
-      if (reason instanceof AuthError) {
-        onAuthError();
-        return;
-      }
-      setSaveResult({
-        intent: 'error',
-        text:
-          reason instanceof ApiError
-            ? reason.message
-            : 'Не удалось запустить скачивание модели.',
-      });
-    }
-  };
 
   const asrOptions: Array<{ value: string; label: string }> = asrModels.map((model) => ({
     value: model.id,
@@ -318,6 +268,10 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
 
   const themeLabel =
     THEME_OPTIONS.find((option) => option.value === settings?.theme)?.label ?? 'Системная';
+  const localModelCount = allModels.filter((model) => model.local).length;
+  const cachedModelCount = allModels.filter(
+    (model) => !model.local && model.location === 'huggingface-cache',
+  ).length;
 
   return (
     <>
@@ -439,7 +393,8 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
                 <div className="settings-row-text">
                   <span className="settings-label">Уведомления</span>
                   <span className="settings-hint">
-                    Показывать уведомление о завершении задачи.
+                    Нативные уведомления Windows с кнопками «Открыть результат» и
+                    «Открыть папку».
                   </span>
                 </div>
                 <div className="settings-control">
@@ -448,6 +403,48 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
                     checked={settings.notifications}
                     onChange={(_event, data) => {
                       update({ notifications: data.checked });
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">
+                    Распознавать файл немедленно при добавлении
+                  </span>
+                  <span className="settings-hint">
+                    При отключении файлы добавляются в очередь, но не начинаются
+                    до нажатия «Распознать».
+                  </span>
+                </div>
+                <div className="settings-control">
+                  <Switch
+                    aria-label="Распознавать файл немедленно при добавлении"
+                    checked={settings.recognize_immediately}
+                    onChange={(_event, data) => {
+                      update({ recognize_immediately: data.checked });
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">
+                    Пункт «Распознать в AI Recogniser» в контекстном меню
+                  </span>
+                  <span className="settings-hint">
+                    Добавляет команду для аудио и видео в контекстное меню
+                    Проводника. Изменение применяется сразу, без перезапуска.
+                  </span>
+                </div>
+                <div className="settings-control">
+                  <Switch
+                    aria-label="Пункт в контекстном меню Проводника"
+                    checked={settings.context_menu_enabled}
+                    onChange={(_event, data) => {
+                      update({ context_menu_enabled: data.checked });
                     }}
                   />
                 </div>
@@ -579,37 +576,6 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
                       if (Number.isFinite(parsed)) {
                         update({ vad_speech_pad_ms: Math.min(1000, Math.max(0, parsed)) });
                       }
-                    }}
-                  />
-                </div>
-              </div>
-            </div>
-          </section>
-
-          <section className="settings-card surface" aria-labelledby="settings-autostart-recognition">
-            <h2 id="settings-autostart-recognition" className="settings-card-title">
-              Автозапуск распознавания
-            </h2>
-            <p className="settings-card-sub">
-              Если включено, файлы начинают распознаваться сразу после добавления
-              в очередь (перетаскиванием или контекстным меню).
-            </p>
-
-            <div className="settings-rows">
-              <div className="settings-row">
-                <div className="settings-row-text">
-                  <span className="settings-label">Распознавать файл немедленно при добавлении</span>
-                  <span className="settings-hint">
-                    При отключении файлы добавляются в очередь, но не начинаются
-                    до нажатия «Распознать».
-                  </span>
-                </div>
-                <div className="settings-control">
-                  <Switch
-                    aria-label="Распознавать файл немедленно при добавлении"
-                    checked={settings.recognize_immediately}
-                    onChange={(_event, data) => {
-                      update({ recognize_immediately: data.checked });
                     }}
                   />
                 </div>
@@ -1004,95 +970,32 @@ export function SettingsPage({ onAuthError, onThemeModeChange }: SettingsPagePro
           <section className="settings-card surface" aria-labelledby="settings-models">
             <div className="settings-card-head">
               <h2 id="settings-models" className="settings-card-title">
-                Модели
+                Модели и ИИ
               </h2>
               <Badge appearance="tint" color="informative" size="small">
-                {allModels.length}
+                {localModelCount} / {allModels.length}
               </Badge>
             </div>
             <p className="settings-card-sub">
-              Каталог доступных моделей. Скачивание происходит при первом использовании
-              или вручную по кнопке ниже.
+              Установка и проверка моделей, прогресс скачивания и реальные файлы
+              на диске.
             </p>
 
-            <div className="settings-rows">
-              <table className="settings-models-table">
-                <thead>
-                  <tr>
-                    <th>Модель</th>
-                    <th>Назначение</th>
-                    <th>Тип</th>
-                    <th>Размер</th>
-                    <th>Лицензия</th>
-                    <th>Статус</th>
-                    <th>Действие</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {allModels.map((model) => {
-                    const progress = modelProgress[model.id];
-                    const isDownloading = progress
-                      ? progress.value < 1 && progress.phase !== 'Готово'
-                      : false;
-                    const isInstalled = model.installed;
-                    const sizeText = model.size_mb
-                      ? `${model.size_mb} МБ`
-                      : model.size_bytes
-                      ? `${(model.size_bytes / (1024 * 1024)).toFixed(1)} МБ`
-                      : '—';
-
-                    return (
-                      <tr key={model.id}>
-                        <td>
-                          <div className="model-title">{model.title}</div>
-                          <div className="model-note">{model.note}</div>
-                        </td>
-                        <td>{model.purpose ?? '—'}</td>
-                        <td>{model.kind}</td>
-                        <td>{sizeText}</td>
-                        <td>{model.license}</td>
-                        <td>
-                          {isDownloading ? (
-                            <div>
-                              <ProgressBar
-                                value={progress?.value ?? 0}
-                              />
-                              <span className="model-phase">
-                                {progress?.phase ?? 'Скачивание…'}
-                              </span>
-                            </div>
-                          ) : isInstalled ? (
-                            <span className="model-status-installed">
-                              Установлена
-                            </span>
-                          ) : (
-                            <span className="model-status-not-installed">
-                              Не установлена
-                            </span>
-                          )}
-                        </td>
-                        <td>
-                          {isInstalled ? (
-                            <Button appearance="subtle" size="small" disabled>
-                              Установлена
-                            </Button>
-                          ) : (
-                            <Button
-                              size="small"
-                              icon={<ArrowDownloadRegular />}
-                              onClick={() => {
-                                void handleDownloadModel(model.id);
-                              }}
-                            >
-                              Скачать
-                            </Button>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+            <div className="settings-manage-models">
+              <div className="settings-row-text">
+                <span className="settings-label">Менеджер ИИ-моделей</span>
+                <span className="settings-hint">
+                  Локально установлено: {localModelCount}. В кэше Hugging Face: {cachedModelCount}.
+                  Здесь же можно скачать модель в папку данных и открыть её расположение.
+                </span>
+              </div>
+              <Button
+                appearance="primary"
+                icon={<SettingsRegular />}
+                onClick={onManageModels}
+              >
+                Менеджер ИИ-моделей
+              </Button>
             </div>
           </section>
 

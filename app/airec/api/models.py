@@ -4,6 +4,7 @@ and Ollama models detection."""
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -96,19 +97,31 @@ def list_models(request: Request) -> dict[str, Any]:
     manifest = load_manifest(MANIFEST_DIR)
     manager = _manager(request)
     disk_installed = manager.installed_models()
-    installed = {m["id"]: m for m in disk_installed}
+    installed = {m["id"]: {**m, "location": "data"} for m in disk_installed}
     items: list[dict[str, Any]] = []
     for entry in manifest.get("models", []):
         model_id = entry.get("id", "")
         info = dict(entry)
         inst = installed.get(model_id)
-        if inst is None and entry.get("kind") == "diarization":
-            inst = _hf_cached(entry)
-            if inst is not None:
+        if inst is not None and inst.get("location") == "data":
+            for extra in entry.get("extra_files") or []:
+                extra_name = Path(str(extra.get("filename", ""))).name
+                if extra_name and not (manager.model_path(model_id) / extra_name).is_file():
+                    inst = None
+                    installed.pop(model_id, None)
+                    break
+        if inst is None:
+            cached = _hf_cached(entry)
+            if cached is not None:
+                inst = {**cached, "location": "huggingface-cache"}
                 installed[model_id] = inst
         info["installed"] = inst is not None
+        info["local"] = inst is not None and inst.get("location") == "data"
+        info["location"] = inst.get("location") if inst else None
         info["size_mb"] = round((inst["size_bytes"] if inst else entry.get("size_bytes", 0)) / (1024 * 1024), 1)
-        info["download_progress"] = _DOWNLOAD_PROGRESS.get(model_id)
+        info["download_progress"] = manager.download_status(model_id) or _DOWNLOAD_PROGRESS.get(
+            model_id
+        )
         items.append(info)
 
     # Add Ollama models (already installed on the computer)
@@ -131,6 +144,8 @@ async def download_model_by_id(
     manifest = load_manifest(MANIFEST_DIR)
 
     entry = find_model(manifest, model_id)
+    filename: str | None = None
+    extra_files: list[dict[str, str]] = []
     if entry is None:
         try:
             body = await request.json()
@@ -141,15 +156,22 @@ async def download_model_by_id(
         model_id = body.get("id", model_id)
         url = body.get("url")
         sha256 = body.get("sha256")
+        filename = body.get("filename")
         if not url:
             raise HTTPException(status_code=400, detail="требуется поле url")
     else:
         url = entry.get("url", "")
         sha256 = entry.get("sha256") or None
+        filename = entry.get("filename")
+        extra_files = entry.get("extra_files") or []
         if not url:
             raise HTTPException(status_code=400, detail="модель без URL скачивания")
 
-    if manager.is_installed(model_id):
+    if manager.is_installed(model_id, filename=filename) and not any(
+        not (manager.model_path(model_id) / Path(str(extra.get("filename", ""))).name).is_file()
+        for extra in extra_files
+        if extra.get("filename")
+    ):
         raise HTTPException(status_code=409, detail="модель уже установлена")
 
     def progress(value: float, phase: str) -> None:
@@ -161,7 +183,8 @@ async def download_model_by_id(
                 model_id,
                 url,
                 sha256=sha256,
-                filename=entry.get("filename"),
+                filename=filename,
+                extra_files=extra_files,
                 progress=progress,
             )
         except Exception as exc:  # background task: report instead of crashing
@@ -179,15 +202,36 @@ async def download_model_by_id(
 @router.get("/download/{model_id}/progress")
 def download_progress(request: Request, model_id: str) -> dict[str, Any]:
     """Return download progress for *model_id*."""
-    progress = _DOWNLOAD_PROGRESS.get(model_id)
+    manager = _manager(request)
+    progress = manager.download_status(model_id)
     if progress is None:
-        installed = [m["id"] for m in _manager(request).installed_models()]
+        progress = _DOWNLOAD_PROGRESS.get(model_id)
+    if progress is None:
+        installed = [m["id"] for m in manager.installed_models()]
         return {
             "id": model_id,
             "installed": model_id in installed,
             "phase": "готово" if model_id in installed else "неизвестно",
         }
     return {"id": model_id, **progress}
+
+
+@router.post("/reveal")
+def reveal_models_folder(request: Request) -> dict[str, Any]:
+    """Open the local models folder in Explorer."""
+    manager = _manager(request)
+    directory = manager.models_dir
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        if os.name == "nt":
+            os.startfile(str(directory))  # type: ignore[attr-defined]
+        else:
+            raise OSError("открытие папки поддерживается только в Windows")
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Не удалось открыть папку: {exc}"
+        ) from exc
+    return {"path": str(directory)}
 
 
 @router.post("/import")

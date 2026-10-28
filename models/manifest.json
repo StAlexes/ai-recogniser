@@ -4,25 +4,47 @@
       "id": "gigaam-v3-e2e-ctc",
       "kind": "asr",
       "title": "GigaAM v3 e2e CTC int8",
+      "repo": "istupakov/gigaam-v3-onnx",
       "filename": "v3_e2e_ctc.int8.onnx",
       "url": "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/main/v3_e2e_ctc.int8.onnx",
       "size_bytes": 224893347,
       "sha256": "",
       "license": "MIT",
       "note": "Основная ASR-модель (скачивается автоматически при первом запуске)",
-      "purpose": "расшифровка"
+      "purpose": "расшифровка",
+      "extra_files": [
+        {
+          "url": "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/main/config.json",
+          "filename": "config.json"
+        },
+        {
+          "url": "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/main/v3_e2e_ctc_vocab.txt",
+          "filename": "v3_e2e_ctc_vocab.txt"
+        }
+      ]
     },
     {
       "id": "gigaam-multilingual-ctc",
       "kind": "asr",
       "title": "GigaAM Multilingual CTC",
-      "filename": "gigaam-multilingual-ctc.int8.onnx",
-      "url": "https://huggingface.co/istupakov/gigaam-multilingual-ctc-onnx/resolve/main/model.int8.onnx",
-      "size_bytes": 224893347,
+      "repo": "istupakov/gigaam-multilingual-ctc-onnx",
+      "filename": "multilingual_ctc.int8.onnx",
+      "url": "https://huggingface.co/istupakov/gigaam-multilingual-ctc-onnx/resolve/main/multilingual_ctc.int8.onnx",
+      "size_bytes": 224762204,
       "sha256": "",
       "license": "MIT",
       "note": "5 языков (RU, EN, KK, KY, UZ), без пунктуации",
-      "purpose": "расшифровка"
+      "purpose": "расшифровка",
+      "extra_files": [
+        {
+          "url": "https://huggingface.co/istupakov/gigaam-multilingual-ctc-onnx/resolve/main/config.json",
+          "filename": "config.json"
+        },
+        {
+          "url": "https://huggingface.co/istupakov/gigaam-multilingual-ctc-onnx/resolve/main/multilingual_vocab.txt",
+          "filename": "multilingual_vocab.txt"
+        }
+      ]
     },
     {
       "id": "wespeaker-voxceleb-resnet34",

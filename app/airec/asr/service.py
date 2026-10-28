@@ -35,6 +35,7 @@ QUANTIZATION = "int8"
 FALLBACK_WINDOW_SECONDS = 60.0
 
 ProgressCallback = Callable[[float, str], None]
+StageProgressCallback = Callable[[str, float, str], None]
 
 
 class AsrError(RuntimeError):
@@ -52,14 +53,28 @@ class TranscriptionResult:
 
 
 _model: Any | None = None
-_model_key: tuple[str, int] | None = None
+_model_key: tuple[str, int, str | None] | None = None
 _model_lock = threading.Lock()
 
 
-def _load_model(model_id: str, cpu_threads: int) -> Any:
+def _load_model(
+    model_id: str,
+    cpu_threads: int,
+    models_dir: Path | None = None,
+) -> Any:
     global _model, _model_key
 
-    key = (model_id, cpu_threads)
+    local_dir: Path | None = None
+    if models_dir is not None:
+        candidate = Path(models_dir) / model_id
+        if (
+            candidate.is_dir()
+            and (candidate / "config.json").is_file()
+            and any(candidate.glob("*.onnx"))
+        ):
+            local_dir = candidate
+
+    key = (model_id, cpu_threads, str(local_dir) if local_dir else None)
     with _model_lock:
         if _model is not None and _model_key == key:
             return _model
@@ -86,14 +101,21 @@ def _load_model(model_id: str, cpu_threads: int) -> Any:
             session_options.intra_op_num_threads = cpu_threads
             session_options.inter_op_num_threads = 1
 
-        log.info("loading ASR model %s (int8, CPU, threads=%s)", model_id, cpu_threads or "auto")
+        log.info(
+            "loading ASR model %s (int8, CPU, threads=%s, local=%s)",
+            model_id,
+            cpu_threads or "auto",
+            local_dir or "no",
+        )
         try:
-            model = onnx_asr.load_model(
-                model_id,
-                quantization=QUANTIZATION,
-                providers=["CPUExecutionProvider"],
-                sess_options=session_options,
-            )
+            load_kwargs: dict[str, Any] = {
+                "quantization": QUANTIZATION,
+                "providers": ["CPUExecutionProvider"],
+                "sess_options": session_options,
+            }
+            if local_dir is not None:
+                load_kwargs["path"] = local_dir
+            model = onnx_asr.load_model(model_id, **load_kwargs)
         except Exception as exc:  # onnx-asr raises several unrelated types
             raise AsrError(f"Не удалось загрузить модель {model_id}: {exc}") from exc
 
@@ -181,6 +203,7 @@ def transcribe(
     ffmpeg: str | None = None,
     work_dir: Path,
     progress: ProgressCallback | None = None,
+    stage_progress: StageProgressCallback | None = None,
     vad_enabled: bool = True,
     vad_max_segment_s: float = DEFAULT_MAX_SEGMENT_S,
     vad_min_silence_ms: float = DEFAULT_MIN_SILENCE_MS,
@@ -205,10 +228,16 @@ def transcribe(
     session are shared, and one worker avoids memory spikes and races.
     """
     notify = progress or (lambda _value, _phase: None)
+    stage_notify = stage_progress or (lambda _stage, _value, _phase: None)
     started = time.perf_counter()
 
+    def recognition_progress(value: float, phase: str) -> None:
+        notify(value, phase)
+        # The overall bar reserves the last ~8% for diarization/saving.
+        stage_notify("recognition", min(max(value / 0.92, 0.0), 0.99), phase)
+
     try:
-        notify(0.08, "Подготовка аудио")
+        recognition_progress(0.08, "Подготовка аудио")
         work_dir.mkdir(parents=True, exist_ok=True)
         wav_path, duration = prepare_wav(
             source,
@@ -216,14 +245,14 @@ def transcribe(
             ffmpeg=ffmpeg,
         )
 
-        notify(0.2, "Загрузка модели")
-        model = _load_model(model_id, cpu_threads)
+        recognition_progress(0.2, "Загрузка модели")
+        model = _load_model(model_id, cpu_threads, models_dir)
 
         segments: tuple[SpeechSegment, ...] = ()
         used_vad = False
 
         if vad_enabled and (duration is None or duration > SHORT_AUDIO_SECONDS):
-            notify(0.28, "Нарезка по сегментам")
+            recognition_progress(0.28, "Нарезка по сегментам")
             try:
                 collected: list[SpeechSegment] = []
                 for segment in segment_and_recognize(
@@ -239,7 +268,7 @@ def transcribe(
                         value = 0.32 + 0.55 * min(segment.end_s / duration, 1.0)
                     else:
                         value = 0.5
-                    notify(value, f"Распознавание сегментов: {len(collected)}")
+                    recognition_progress(value, f"Распознавание сегментов: {len(collected)}")
                 segments = tuple(collected)
                 used_vad = True
                 log.info("VAD segmentation: %d segments for %s", len(segments), source.name)
@@ -251,10 +280,12 @@ def transcribe(
         if used_vad:
             text = join_segments(segments)
         elif duration is not None and duration > FALLBACK_WINDOW_SECONDS:
-            notify(0.3, "Распознавание по окнам")
-            text, segments = _recognize_fixed_windows(model, wav_path, notify)
+            recognition_progress(0.3, "Распознавание по окнам")
+            text, segments = _recognize_fixed_windows(
+                model, wav_path, recognition_progress
+            )
         else:
-            notify(0.4, "Распознавание")
+            recognition_progress(0.4, "Распознавание")
             try:
                 text = model.recognize(str(wav_path), channel="mean")
             except AudioError:
@@ -271,12 +302,14 @@ def transcribe(
         # Диаризация: кластеризация сегментов по спикерам (Wespeaker embeddings).
         if diarize_enabled and segments:
             notify(0.88, "Разбор по участникам")
+            stage_notify("diarization", 0.08, "Загрузка модели спикеров")
             try:
                 audio = read_pcm16_mono(wav_path, sample_rate=SAMPLE_RATE)
                 segment_dicts = [s.as_dict() for s in segments]
                 repo_id, model_path = _resolve_diarization(
                     diarize_model, diarize_model_path, models_dir
                 )
+                stage_notify("diarization", 0.3, "Эмбеддинги спикеров")
                 diarized = diarize_segments(
                     segment_dicts,
                     audio,
@@ -297,12 +330,15 @@ def transcribe(
                     len(segments),
                     len({s.speaker for s in segments if s.speaker}),
                 )
+                stage_notify("diarization", 1.0, "Готово")
             except DiarizationError as exc:
                 log.warning("Diarization unavailable: %s", exc)
+                stage_notify("diarization", 1.0, f"Ошибка: {exc}")
 
         elapsed = max(time.perf_counter() - started, 0.001)
         rtf = duration / elapsed if duration and duration > 0 else None
-        notify(0.92, "Сохранение результата")
+        recognition_progress(0.92, "Сохранение результата")
+        stage_notify("recognition", 1.0, "Готово")
         return TranscriptionResult(
             text=text.strip(),
             model_id=model_id,

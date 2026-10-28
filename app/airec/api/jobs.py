@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
+from pydantic import BaseModel
 
 from airec.asr.audio import SUPPORTED_EXTENSIONS
 from airec.asr.manager import ACTIVE_STATUSES, JobManager, JobValidationError
@@ -19,6 +21,13 @@ router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
 EXPORT_FORMATS = {"txt", "srt", "vtt", "md", "json"}
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+class SaveResultRequest(BaseModel):
+    """Destination selected by the user in the native save dialog."""
+
+    path: str
+    format: str | None = None
 
 
 def _manager(request: Request) -> JobManager:
@@ -167,6 +176,47 @@ def start_job(request: Request, job_id: str) -> dict[str, object]:
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return job.detail()
+
+
+@router.post("/{job_id}/reveal")
+def reveal_job_folder(request: Request, job_id: str) -> dict[str, object]:
+    """Open the job result folder in Explorer (local desktop app only)."""
+    manager = _manager(request)
+    if manager.get(job_id) is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена.")
+    directory = manager.result_dir(job_id)
+    try:
+        if os.name == "nt":
+            os.startfile(str(directory))  # type: ignore[attr-defined]
+        else:
+            raise OSError("открытие папки поддерживается только в Windows")
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Не удалось открыть папку: {exc}"
+        ) from exc
+    return {"id": job_id, "path": str(directory)}
+
+
+@router.post("/{job_id}/save")
+def save_job_result(
+    request: Request, job_id: str, payload: SaveResultRequest
+) -> dict[str, object]:
+    """Save a finished transcript to a user-selected path."""
+    manager = _manager(request)
+    try:
+        target = manager.save_result(
+            job_id, Path(payload.path), format=payload.format
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "id": job_id,
+        "path": str(target),
+        "name": target.name,
+        "size_bytes": target.stat().st_size,
+    }
 
 
 @router.get("/{job_id}/export")

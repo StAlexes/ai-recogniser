@@ -17,6 +17,7 @@ import logging
 import os
 import shutil
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from airec.asr.audio import SUPPORTED_EXTENSIONS, find_ffmpeg
+from airec.asr.export import EXPORT_CONTENT_TYPES, EXPORT_DOWNLOAD_NAMES, EXPORT_EXTENSIONS
 from airec.asr.service import AsrError, TranscriptionResult, transcribe
 from airec.core.config import Settings
 from airec.core.db import Database
@@ -56,6 +58,43 @@ def _safe_name(name: str) -> str:
     return candidate
 
 
+STAGE_KEYS = ("recognition", "diarization", "summary")
+STAGE_LABELS = {
+    "recognition": "Распознавание",
+    "diarization": "Диаризация",
+    "summary": "Саммаризация",
+}
+
+# Status values used by per-stage progress bars in the UI.
+STAGE_PENDING = "pending"
+STAGE_RUNNING = "running"
+STAGE_DONE = "done"
+STAGE_ERROR = "error"
+STAGE_SKIPPED = "skipped"
+
+
+def _stage(
+    status: str = STAGE_PENDING,
+    phase: str = "Ожидает",
+    progress: float = 0.0,
+    elapsed_s: float | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "phase": phase,
+        "progress": progress,
+        "elapsed_s": elapsed_s,
+    }
+
+
+def default_stages() -> dict[str, dict[str, Any]]:
+    return {
+        "recognition": _stage(),
+        "diarization": _stage(),
+        "summary": _stage(phase="Не запрошено"),
+    }
+
+
 @dataclass
 class Job:
     id: str
@@ -79,6 +118,34 @@ class Job:
     source_path: str | None = None
     summary: dict[str, Any] | None = None
     paused: bool = False
+    stages: dict[str, dict[str, Any]] = field(default_factory=default_stages)
+
+    def __post_init__(self) -> None:
+        """Keep stage data complete for jobs restored from older releases."""
+        if not isinstance(self.stages, dict):
+            self.stages = default_stages()
+            if self.status == "done":
+                self.stages["recognition"].update(
+                    status="done", phase="Готово", progress=1.0
+                )
+                self.stages["diarization"].update(
+                    status="skipped",
+                    phase="Нет данных о спикерах",
+                    progress=0.0,
+                )
+            elif self.status == "error":
+                self.stages["recognition"].update(
+                    status="error",
+                    phase="Задача завершилась с ошибкой",
+                    progress=0.0,
+                )
+            return
+        for key, value in default_stages().items():
+            current = self.stages.get(key)
+            if not isinstance(current, dict):
+                self.stages[key] = value
+            else:
+                self.stages[key] = {**value, **current}
 
     def as_dict_summary(self) -> dict[str, Any]:
         data = asdict(self)
@@ -114,6 +181,7 @@ class JobManager:
         self._transcriber = transcriber
         self._jobs: dict[str, Job] = {}
         self._futures: dict[str, Future[None]] = {}
+        self._stage_started: dict[tuple[str, str], float] = {}
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="airec-asr")
         self._ffmpeg = find_ffmpeg(paths.bin)
@@ -133,6 +201,76 @@ class JobManager:
 
     def _job_meta_path(self, job_id: str) -> Path:
         return self._job_dir(job_id) / "job.json"
+
+    def result_dir(self, job_id: str) -> Path:
+        """Return the per-job result folder, creating it when needed."""
+        directory = self._job_dir(job_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    # ------------------------------------------------------------------ #
+    # Per-stage progress
+    # ------------------------------------------------------------------ #
+    def _set_stage(
+        self,
+        job: Job,
+        stage: str,
+        *,
+        status: str | None = None,
+        phase: str | None = None,
+        progress: float | None = None,
+        finished: bool = False,
+    ) -> None:
+        """Update one stage in-place; caller holds the lock."""
+        if stage not in STAGE_KEYS:
+            return
+        current = job.stages.setdefault(stage, _stage())
+        if status is not None:
+            current["status"] = status
+            if status == STAGE_RUNNING:
+                self._stage_started.setdefault((job.id, stage), time.perf_counter())
+            elif status in {STAGE_DONE, STAGE_ERROR, STAGE_SKIPPED}:
+                started = self._stage_started.pop((job.id, stage), None)
+                if started is not None and current.get("elapsed_s") is None:
+                    current["elapsed_s"] = round(max(time.perf_counter() - started, 0.0), 3)
+        if phase is not None:
+            current["phase"] = phase
+        if progress is not None:
+            current["progress"] = max(0.0, min(float(progress), 1.0))
+        if finished:
+            current["progress"] = 1.0
+            started = self._stage_started.pop((job.id, stage), None)
+            if started is not None and current.get("elapsed_s") is None:
+                current["elapsed_s"] = round(max(time.perf_counter() - started, 0.0), 3)
+
+    def _update_stage(
+        self,
+        job_id: str,
+        stage: str,
+        *,
+        status: str | None = None,
+        phase: str | None = None,
+        progress: float | None = None,
+        finished: bool = False,
+        persist: bool = True,
+    ) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return
+            self._set_stage(
+                job,
+                stage,
+                status=status,
+                phase=phase,
+                progress=progress,
+                finished=finished,
+            )
+            if persist:
+                try:
+                    self._db.upsert_job(asdict(job))
+                except OSError:
+                    log.exception("cannot persist stage %s for job %s", stage, job_id)
 
     # ------------------------------------------------------------------ #
     # Persistence
@@ -252,9 +390,16 @@ class JobManager:
             source_path=str(source_copy),
         )
         settings = self._settings()
+        self._set_stage(
+            job,
+            "diarization",
+            status=STAGE_PENDING if settings.diarize_enabled else STAGE_SKIPPED,
+            phase="Ожидает" if settings.diarize_enabled else "Отключена в настройках",
+        )
         if not settings.recognize_immediately:
             job.paused = True
             job.phase = "Ожидает запуска"
+            self._set_stage(job, "recognition", phase="Ожидает запуска")
         with self._lock:
             self._jobs[job.id] = job
             try:
@@ -328,6 +473,30 @@ class JobManager:
             job.phase = "Отменено"
             job.finished_at = utc_now()
             job.error = "Задача отменена пользователем."
+            if job.stages["recognition"]["status"] in {STAGE_RUNNING, STAGE_PENDING}:
+                self._set_stage(
+                    job,
+                    "recognition",
+                    status=STAGE_SKIPPED,
+                    phase="Отменено",
+                    progress=0.0,
+                )
+            if job.stages["diarization"]["status"] in {STAGE_RUNNING, STAGE_PENDING}:
+                self._set_stage(
+                    job,
+                    "diarization",
+                    status=STAGE_SKIPPED,
+                    phase="Отменено",
+                    progress=0.0,
+                )
+            if job.stages["summary"]["status"] in {STAGE_RUNNING, STAGE_PENDING}:
+                self._set_stage(
+                    job,
+                    "summary",
+                    status=STAGE_SKIPPED,
+                    phase="Нет результата",
+                    progress=0.0,
+                )
             try:
                 self._persist(job)
             except OSError:
@@ -376,6 +545,13 @@ class JobManager:
                 audio_format=job.audio_format,
                 source_path=str(source),
             )
+            settings = self._settings()
+            self._set_stage(
+                new_job,
+                "diarization",
+                status=STAGE_PENDING if settings.diarize_enabled else STAGE_SKIPPED,
+                phase="Ожидает" if settings.diarize_enabled else "Отключена в настройках",
+            )
             self._jobs[new_job.id] = new_job
             try:
                 self._persist(new_job)
@@ -392,6 +568,7 @@ class JobManager:
     # Worker
     # ------------------------------------------------------------------ #
     def _run(self, job_id: str, source: Path, work_dir: Path) -> None:
+        settings = self._settings()
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -400,11 +577,29 @@ class JobManager:
             job.phase = "Запуск"
             job.started_at = utc_now()
             job.progress = 0.02
+            self._set_stage(
+                job, "recognition", status=STAGE_RUNNING, phase="Запуск", progress=0.02
+            )
+            if settings.diarize_enabled:
+                self._set_stage(
+                    job,
+                    "diarization",
+                    status=STAGE_PENDING,
+                    phase="Ожидает распознавания",
+                    progress=0.0,
+                )
+            else:
+                self._set_stage(
+                    job,
+                    "diarization",
+                    status=STAGE_SKIPPED,
+                    phase="Отключена в настройках",
+                    progress=0.0,
+                )
             try:
                 self._persist(job)
             except OSError:
                 log.exception("cannot persist started job %s", job.id)
-            settings = self._settings()
 
         def progress(value: float, phase: str) -> None:
             with self._lock:
@@ -418,6 +613,15 @@ class JobManager:
                 except OSError:
                     log.exception("cannot persist progress for job %s", job_id)
 
+        def stage_progress(stage: str, value: float, phase: str) -> None:
+            self._update_stage(
+                job_id,
+                stage,
+                status=STAGE_RUNNING,
+                progress=value,
+                phase=phase,
+            )
+
         try:
             result = self._transcriber(
                 source,
@@ -426,6 +630,7 @@ class JobManager:
                 ffmpeg=self._ffmpeg,
                 work_dir=work_dir,
                 progress=progress,
+                stage_progress=stage_progress,
                 vad_enabled=settings.vad_enabled,
                 vad_max_segment_s=settings.vad_max_segment_s,
                 vad_min_silence_ms=settings.vad_min_silence_ms,
@@ -453,6 +658,55 @@ class JobManager:
                 job.rtf = result.rtf
                 job.segments = [asdict(segment) for segment in result.segments]
                 job.result_file = str(transcript_path)
+                self._set_stage(
+                    job,
+                    "recognition",
+                    status=STAGE_DONE,
+                    phase="Готово",
+                    progress=1.0,
+                    finished=True,
+                )
+                speakers = {s.speaker for s in result.segments if s.speaker}
+                diarization_phase = str(job.stages["diarization"].get("phase", ""))
+                if not settings.diarize_enabled:
+                    self._set_stage(
+                        job,
+                        "diarization",
+                        status=STAGE_SKIPPED,
+                        phase="Отключена в настройках",
+                        progress=0.0,
+                    )
+                elif diarization_phase.startswith("Ошибка"):
+                    self._set_stage(
+                        job,
+                        "diarization",
+                        status=STAGE_ERROR,
+                        progress=1.0,
+                    )
+                elif speakers:
+                    self._set_stage(
+                        job,
+                        "diarization",
+                        status=STAGE_DONE,
+                        phase=f"Спикеров: {len(speakers)}",
+                        progress=1.0,
+                        finished=True,
+                    )
+                else:
+                    self._set_stage(
+                        job,
+                        "diarization",
+                        status=STAGE_SKIPPED,
+                        phase="Спикеры не найдены",
+                        progress=1.0,
+                    )
+                self._set_stage(
+                    job,
+                    "summary",
+                    status=STAGE_PENDING,
+                    phase="Можно запросить" if result.text else "Нет текста",
+                    progress=0.0,
+                )
                 try:
                     self._persist(job)
                 except OSError:
@@ -475,6 +729,37 @@ class JobManager:
                 job.progress = 1.0
                 job.error = message
                 job.finished_at = utc_now()
+                self._set_stage(
+                    job,
+                    "recognition",
+                    status=STAGE_ERROR,
+                    phase="Ошибка",
+                    progress=1.0,
+                )
+                if job.stages["diarization"]["status"] == STAGE_RUNNING:
+                    self._set_stage(
+                        job,
+                        "diarization",
+                        status=STAGE_ERROR,
+                        phase="Прервано",
+                        progress=1.0,
+                    )
+                elif job.stages["diarization"]["status"] == STAGE_PENDING:
+                    self._set_stage(
+                        job,
+                        "diarization",
+                        status=STAGE_SKIPPED,
+                        phase="Не выполнялась",
+                        progress=0.0,
+                    )
+                if job.stages["summary"]["status"] == STAGE_PENDING:
+                    self._set_stage(
+                        job,
+                        "summary",
+                        status=STAGE_SKIPPED,
+                        phase="Нет результата",
+                        progress=0.0,
+                    )
                 try:
                     self._persist(job)
                 except OSError:
@@ -531,25 +816,8 @@ class JobManager:
         Returns ``(file_path, download_name, content_type)``.  The exported
         file is written to the job's results folder next to ``transcript.txt``.
         """
-        from airec.asr.export import EXPORT_CONTENT_TYPES, EXPORT_DOWNLOAD_NAMES, export
-
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                job = self.get(job_id)
-            if job is None:
-                raise FileNotFoundError(f"Job {job_id} not found.")
-            if job.status != "done":
-                raise ValueError(f"Job {job_id} is not finished (status={job.status}).")
-
-        segments = job.segments or []
-        content = export(segments, format, metadata={
-            "job_id": job.id,
-            "filename": job.filename,
-            "model": job.model,
-            "duration_s": job.duration_s,
-            "speaker_count": len({s.get("speaker") for s in segments if s.get("speaker")}),
-        })
+        job = self._finished_job(job_id)
+        content = self._export_content(job, format)
 
         job_dir = self._job_dir(job_id)
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -558,6 +826,107 @@ class JobManager:
         out_path = job_dir / f"{stem}{ext}"
         out_path.write_text(content, encoding="utf-8", newline="\n")
         return out_path, EXPORT_DOWNLOAD_NAMES[format], EXPORT_CONTENT_TYPES[format]
+
+    def _finished_job(self, job_id: str) -> Job:
+        with self._lock:
+            job = self._jobs.get(job_id) or self.get(job_id)
+            if job is None:
+                raise FileNotFoundError(f"Job {job_id} not found.")
+            if job.status != "done":
+                raise ValueError(f"Job {job_id} is not finished (status={job.status}).")
+            return job
+
+    def _export_content(self, job: Job, format: str) -> str:
+        from airec.asr.export import export
+
+        segments = job.segments or []
+        return export(
+            segments,
+            format,
+            metadata={
+                "job_id": job.id,
+                "filename": job.filename,
+                "model": job.model,
+                "duration_s": job.duration_s,
+                "speaker_count": len(
+                    {s.get("speaker") for s in segments if s.get("speaker")}
+                ),
+                "summary": job.summary,
+            },
+        )
+
+    def save_result(self, job_id: str, target: Path, format: str | None = None) -> Path:
+        """Write the finished transcript to an arbitrary user-chosen path.
+
+        When *format* is omitted it is inferred from the target extension; a
+        directory target gets a sensible default file name.
+        """
+        job = self._finished_job(job_id)
+        target = Path(target).expanduser()
+        if target.is_dir():
+            stem = Path(job.filename).stem or "transcript"
+            target = target / f"{stem}{EXPORT_EXTENSIONS.get(format or 'txt', '.txt')}"
+        suffix = target.suffix.lower().lstrip(".")
+        if format is None:
+            format = suffix if suffix in EXPORT_EXTENSIONS else "txt"
+        if format not in EXPORT_EXTENSIONS:
+            raise ValueError(f"Неизвестный формат экспорта: {format}")
+        if target.suffix == "":
+            target = target.with_suffix(EXPORT_EXTENSIONS[format])
+        content = self._export_content(job, format)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8", newline="\n")
+        log.info("job %s saved as %s (%s)", job_id, target, EXPORT_DOWNLOAD_NAMES[format])
+        return target
+
+    # ------------------------------------------------------------------ #
+    # Summary stage
+    # ------------------------------------------------------------------ #
+    def begin_summary(self, job_id: str) -> None:
+        self._update_stage(
+            job_id,
+            "summary",
+            status=STAGE_RUNNING,
+            phase="Подготовка текста",
+            progress=0.02,
+        )
+
+    def update_summary(self, job_id: str, progress: float, phase: str) -> None:
+        self._update_stage(
+            job_id,
+            "summary",
+            status=STAGE_RUNNING,
+            progress=progress,
+            phase=phase,
+        )
+
+    def finish_summary(self, job_id: str, summary: dict[str, Any]) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id) or self.get(job_id)
+            if job is None:
+                return
+            job.summary = summary
+            self._set_stage(
+                job,
+                "summary",
+                status=STAGE_DONE,
+                phase="Готово",
+                progress=1.0,
+                finished=True,
+            )
+            try:
+                self._persist(job)
+            except OSError:
+                log.exception("cannot persist summary for job %s", job.id)
+
+    def fail_summary(self, job_id: str, error: str) -> None:
+        self._update_stage(
+            job_id,
+            "summary",
+            status=STAGE_ERROR,
+            phase=error[:160] or "Ошибка",
+            progress=1.0,
+        )
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)

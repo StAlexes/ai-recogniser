@@ -9,6 +9,7 @@ context window even for hour-long recordings.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from airec.llm.providers import LLMProvider
@@ -81,24 +82,40 @@ class Summarizer:
     def __init__(self, provider: LLMProvider) -> None:
         self.provider = provider
 
-    def summarize(self, text: str, *, language: str = "ru") -> dict[str, Any]:
+    def summarize(
+        self,
+        text: str,
+        *,
+        language: str = "ru",
+        progress: Callable[[float, str], None] | None = None,
+    ) -> dict[str, Any]:
         """Return structured summary dict for *text*."""
+        notify = progress or (lambda _value, _phase: None)
         blocks = _split_into_blocks(text)
         log.info("summarising %d chars in %d block(s)", len(text), len(blocks))
+        notify(0.05, "Подготовка текста")
 
         if len(blocks) == 1:
-            return self.provider.summarize(text, language=language)
+            notify(0.25, "Генерация саммари")
+            result = self.provider.summarize(text, language=language)
+            notify(1.0, "Готово")
+            return result
 
         # Map: summarise each block.
         block_summaries: list[str] = []
-        for _index, block in enumerate(blocks):
+        total = len(blocks)
+        for index, block in enumerate(blocks):
+            notify(0.1 + 0.7 * (index / max(total, 1)), f"Фрагмент {index + 1} из {total}")
             summary = self.provider.summarize(block, language=language)
             # LlamaCppProvider.summarize returns a dict; flatten to text.
             block_text = summary.get("tl_dr", "") if isinstance(summary, dict) else str(summary)
             block_summaries.append(block_text)
 
         # Reduce: merge into one structured summary.
-        return self.provider.summarize(_reduce_prompt(block_summaries), language=language)
+        notify(0.85, "Объединение фрагментов")
+        result = self.provider.summarize(_reduce_prompt(block_summaries), language=language)
+        notify(1.0, "Готово")
+        return result
 
     def ask(self, question: str, *, context: str, language: str = "ru") -> str:
         """Answer *question* using *context* (the full transcript)."""

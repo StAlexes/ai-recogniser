@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -79,6 +79,195 @@ class CoreHandle:
     process: subprocess.Popen[bytes] | None = None
     log_stream: IO[str] | None = None
     spawned: bool = False
+
+
+# --------------------------------------------------------------------------- #
+# Result navigation (used by toast actions and the airec:// protocol)
+# --------------------------------------------------------------------------- #
+
+
+def pending_nav_file(paths: AppPaths) -> Path:
+    return paths.data / "pending-navigation.json"
+
+
+def request_navigation(paths: AppPaths, job_id: str) -> None:
+    """Ask the running shell to open *job_id*; safe for a second instance."""
+    target = pending_nav_file(paths)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".json.tmp")
+    payload = json.dumps({"job_id": job_id, "requested_at": time.time()}, ensure_ascii=False)
+    tmp.write_text(payload, encoding="utf-8")
+    os.replace(tmp, target)
+
+
+def take_navigation(paths: AppPaths) -> str | None:
+    target = pending_nav_file(paths)
+    if not target.is_file():
+        return None
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        target.unlink(missing_ok=True)
+        return None
+    target.unlink(missing_ok=True)
+    job_id = payload.get("job_id") if isinstance(payload, dict) else None
+    return str(job_id) if job_id else None
+
+
+def open_result_folder(paths: AppPaths, job_id: str) -> bool:
+    folder = paths.results / job_id
+    if not folder.is_dir():
+        LOG.warning("result folder does not exist: %s", folder)
+        return False
+    try:
+        os.startfile(str(folder))  # type: ignore[attr-defined]
+        return True
+    except OSError:
+        LOG.exception("cannot open result folder %s", folder)
+        return False
+
+
+def handle_protocol_uri(paths: AppPaths, uri: str) -> tuple[str | None, bool]:
+    """Parse ``airec://result/<id>`` / ``airec://folder/<id>``.
+
+    Returns ``(job_id, handled)``.  Folder requests are handled immediately
+    (Explorer opens even when the app is not running).
+    """
+    parsed = urlsplit(uri)
+    if parsed.scheme != "airec":
+        LOG.warning("unsupported protocol URI: %s", uri)
+        return None, False
+    action = parsed.netloc.lower()
+    job_id = parsed.path.strip("/").split("/")[0]
+    if not job_id:
+        LOG.warning("protocol URI has no job id: %s", uri)
+        return None, False
+    if action == "folder":
+        return job_id, open_result_folder(paths, job_id)
+    if action in {"result", "open", "job"}:
+        request_navigation(paths, job_id)
+        return job_id, False
+    LOG.warning("unknown protocol action %r in %s", action, uri)
+    return None, False
+
+
+class NavigationWatcher:
+    """Poll the pending-navigation file and route the WebView to a job."""
+
+    def __init__(self, window: Any, paths: AppPaths) -> None:
+        self._window = window
+        self._paths = paths
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="navigation", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.wait(1.0):
+            job_id = take_navigation(self._paths)
+            if job_id is None:
+                continue
+            try:
+                self._window.show()
+                self._window.evaluate_js(
+                    f"window.location.href='/?job={quote(job_id, safe='')}'"
+                )
+                LOG.info("navigated to job %s", job_id)
+            except Exception:
+                LOG.debug("cannot navigate the window to job %s", job_id, exc_info=True)
+
+
+class NotificationWatcher:
+    """Watch core jobs and show native Windows toasts on completion."""
+
+    def __init__(self, core: CoreHandle, tray: Any) -> None:
+        self._core = core
+        self._tray = tray
+        self._stop = threading.Event()
+        self._known: dict[str, str] = {}
+        self._initialised = False
+        self._notifications = True
+        self._settings_at = 0.0
+        self._thread = threading.Thread(target=self._run, name="notifications", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _refresh_setting(self) -> None:
+        if time.monotonic() - self._settings_at < 10.0:
+            return
+        try:
+            headers = {"Authorization": f"Bearer {self._core.token}"} if self._core.token else {}
+            with httpx.Client(timeout=3.0, trust_env=False) as client:
+                response = client.get(f"{self._core.base_url}/api/v1/settings", headers=headers)
+            if response.status_code == 200:
+                self._notifications = bool(response.json().get("notifications", True))
+            self._settings_at = time.monotonic()
+        except Exception:
+            LOG.debug("cannot read notification settings", exc_info=True)
+
+    def _run(self) -> None:
+        headers = {"Authorization": f"Bearer {self._core.token}"} if self._core.token else {}
+        with httpx.Client(
+            timeout=httpx.Timeout(5.0, connect=2.0), trust_env=False
+        ) as client:
+            while not self._stop.wait(2.0):
+                try:
+                    response = client.get(
+                        f"{self._core.base_url}/api/v1/jobs", headers=headers
+                    )
+                    if response.status_code != 200:
+                        continue
+                    items = response.json().get("items", [])
+                except Exception:
+                    LOG.debug("notification watcher: core is unavailable", exc_info=True)
+                    continue
+
+                self._refresh_setting()
+                # The first successful poll is a baseline: jobs that already
+                # finished before the app started must not produce toasts.
+                # After that, an unseen job may complete between two polls, so
+                # a missing previous status is treated as "new and finished".
+                baseline = not self._initialised
+                for job in items:
+                    job_id = str(job.get("id") or "")
+                    status = str(job.get("status") or "")
+                    if not job_id or not status:
+                        continue
+                    previous = self._known.get(job_id)
+                    self._known[job_id] = status
+                    if baseline:
+                        continue
+                    if status not in {"done", "error"}:
+                        continue
+                    if previous not in {None, "queued", "running"}:
+                        continue
+                    if not self._notifications:
+                        continue
+                    self._toast(job_id, str(job.get("filename") or ""), status == "error")
+                self._initialised = True
+
+    def _toast(self, job_id: str, filename: str, error: bool) -> None:
+        try:
+            from airec.notify.windows_toast import show_job_toast
+
+            if show_job_toast(job_id, filename, error=error):
+                return
+        except Exception:
+            LOG.debug("native toast failed", exc_info=True)
+        try:
+            if self._tray is not None:
+                title = "Ошибка" if error else "Готово"
+                self._tray.notify(f"{'Ошибка: ' if error else ''}{filename}", title)
+        except Exception:
+            LOG.debug("tray fallback notification failed", exc_info=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -609,6 +798,68 @@ class ShellBridge:
         with contextlib.suppress(Exception):
             self._app.window.hide()
 
+    def open_result_folder(self, job_id: str) -> dict[str, Any]:
+        """Open ``<data>/results/<job_id>`` in Explorer."""
+        if not job_id:
+            return {"ok": False, "error": "Не указан идентификатор задачи."}
+        if open_result_folder(self._app.paths, job_id):
+            return {"ok": True, "path": str(self._app.paths.results / job_id)}
+        return {"ok": False, "error": "Папка результата ещё не создана."}
+
+    def save_result(self, job_id: str, default_name: str = "") -> dict[str, Any]:
+        """Ask for a target path with the native dialog and save the result."""
+        if not job_id:
+            return {"ok": False, "error": "Не указан идентификатор задачи."}
+        import webview
+
+        safe_name = Path(default_name or "transcript.txt").name
+        if not Path(safe_name).suffix:
+            safe_name += ".txt"
+        window = self._app.window
+        try:
+            selection = window.create_file_dialog(
+                webview.SAVE_DIALOG,
+                save_filename=safe_name,
+                file_types=(
+                    "Текст (*.txt)",
+                    "Субтитры SRT (*.srt)",
+                    "Субтитры VTT (*.vtt)",
+                    "Markdown (*.md)",
+                    "JSON (*.json)",
+                    "Все файлы (*.*)",
+                ),
+            )
+        except Exception as exc:
+            LOG.exception("cannot show the save dialog")
+            return {"ok": False, "error": f"Не удалось открыть диалог сохранения: {exc}"}
+        if not selection:
+            return {"ok": False, "cancelled": True}
+        target = selection[0] if isinstance(selection, (list, tuple)) else str(selection)
+        headers = (
+            {"Authorization": f"Bearer {self._app.core.token}"}
+            if self._app.core.token
+            else {}
+        )
+        try:
+            response = httpx.post(
+                f"{self._app.core.base_url}/api/v1/jobs/{job_id}/save",
+                json={"path": target},
+                headers=headers,
+                timeout=30.0,
+                trust_env=False,
+            )
+        except Exception as exc:
+            LOG.exception("cannot save job %s", job_id)
+            return {"ok": False, "error": f"Не удалось сохранить результат: {exc}"}
+        if response.status_code != 200:
+            try:
+                detail = response.json().get("detail") or response.text
+            except ValueError:
+                detail = response.text
+            return {"ok": False, "error": str(detail)}
+        payload = response.json()
+        return {"ok": True, "path": payload.get("path", target)}
+
 
 class ShellApp:
     """Window/tray glue shared by the close handler and the tray menu."""
@@ -626,6 +877,8 @@ class ShellApp:
         self.paths = paths
         self.close_to_tray = close_to_tray
         self.tray = TrayIcon(window, self)
+        self.nav_watcher: NavigationWatcher | None = None
+        self.notifier: NotificationWatcher | None = None
         self._lock = threading.Lock()
         self._quitting = False
         self._cleaned_up = False
@@ -666,6 +919,10 @@ class ShellApp:
             if self._cleaned_up:
                 return
             self._cleaned_up = True
+        if self.nav_watcher is not None:
+            self.nav_watcher.stop()
+        if self.notifier is not None:
+            self.notifier.stop()
         self.tray.stop()
         stop_core(self.core, self.paths)
 
@@ -706,10 +963,12 @@ def run_gui(paths: AppPaths, args: argparse.Namespace) -> int:
 
     app: ShellApp | None = None
     try:
+        pending_job = take_navigation(paths)
+        query = f"?job={quote(pending_job, safe='')}" if pending_job else ""
         fragment = f"#token={core.token}" if core.token else ""
         window = webview.create_window(
             APP_TITLE,
-            f"{core.base_url}/{fragment}",
+            f"{core.base_url}/{query}{fragment}",
             width=1200,
             height=800,
             min_size=(960, 640),
@@ -719,8 +978,17 @@ def run_gui(paths: AppPaths, args: argparse.Namespace) -> int:
         window.events.closing += app.on_closing
         bridge = ShellBridge(app)
         with contextlib.suppress(Exception):
-            window.expose(bridge.quit, bridge.minimize)
+            window.expose(
+                bridge.quit,
+                bridge.minimize,
+                bridge.open_result_folder,
+                bridge.save_result,
+            )
         app.tray.start()
+        app.nav_watcher = NavigationWatcher(window, paths)
+        app.nav_watcher.start()
+        app.notifier = NotificationWatcher(core, app.tray)
+        app.notifier.start()
 
         icon = _asset("icon.ico")
         webview.start(debug=False, icon=str(icon) if icon else None)
@@ -745,11 +1013,13 @@ def run_smoke_test(paths: AppPaths) -> int:
             "ui_built": bool(info.get("ui_built", (paths.ui / "index.html").exists())),
         }
         LOG.info("smoke test passed: %s", payload)
-        print(json.dumps(payload, ensure_ascii=False), flush=True)
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            print(json.dumps(payload, ensure_ascii=False), flush=True)
         return 0
     except Exception as exc:
         LOG.exception("smoke test failed")
-        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), flush=True)
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), flush=True)
         return 1
     finally:
         stop_core(core, paths)
@@ -817,6 +1087,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="manage autostart in HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
     )
     parser.add_argument(
+        "--protocol",
+        metavar="URI",
+        help="обработать ссылку airec:// из кнопки уведомления",
+    )
+    parser.add_argument(
         "--version", action="version", version=f"{APP_TITLE} {__version__}"
     )
     parser.add_argument(
@@ -864,6 +1139,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.smoke_test:
             return run_smoke_test(paths)
+
+        if args.protocol:
+            job_id, handled = handle_protocol_uri(paths, args.protocol)
+            if handled:
+                return 0
+            if job_id is None:
+                return 1
 
         if not acquire_single_instance():
             LOG.info("another shell instance is already running")

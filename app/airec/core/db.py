@@ -17,7 +17,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # All Job dataclass fields that are persisted, in column order.
 JOB_COLUMNS = (
@@ -42,6 +42,7 @@ JOB_COLUMNS = (
     "source_path",
     "summary",
     "paused",
+    "stages",
 )
 
 # Columns that may be missing in databases created by older releases.
@@ -52,6 +53,7 @@ JOB_COLUMN_MIGRATIONS: dict[str, str] = {
     "summary": "TEXT",
     "segment_count": "INTEGER NOT NULL DEFAULT 0",
     "paused": "INTEGER NOT NULL DEFAULT 0",
+    "stages": "TEXT",
 }
 
 CREATE_JOBS_TABLE = """
@@ -77,7 +79,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     source_path TEXT,
     summary TEXT,
     paused INTEGER NOT NULL DEFAULT 0,
-    segment_count INTEGER NOT NULL DEFAULT 0
+    segment_count INTEGER NOT NULL DEFAULT 0,
+    stages TEXT
 );
 """
 
@@ -175,19 +178,20 @@ class Database:
                     source_path=excluded.source_path,
                     summary=excluded.summary,
                     paused=excluded.paused,
-                    segment_count=excluded.segment_count
+                    segment_count=excluded.segment_count,
+                    stages=excluded.stages
                 """,
                 values,
             )
 
     def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         data = dict(row)
-        for json_column in ("segments", "summary"):
+        for json_column in ("segments", "summary", "stages"):
             if data.get(json_column):
                 try:
                     data[json_column] = json.loads(data[json_column])
                 except (TypeError, ValueError):
-                    data[json_column] = []
+                    data[json_column] = [] if json_column == "segments" else None
             else:
                 data[json_column] = [] if json_column == "segments" else None
         data["paused"] = bool(data.get("paused"))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+import logging
 import os
 import socket
 import sys
@@ -45,6 +46,12 @@ def main(argv: list[str] | None = None) -> int:
     faulthandler.enable(file=open(paths.logs / "crash.log", "a", encoding="utf-8"))  # noqa: SIM115
 
     settings = load_settings(paths.config_file)
+    try:
+        from airec.integrations.windows import apply as apply_windows_integration
+
+        apply_windows_integration(settings)
+    except Exception:  # registry integration must never prevent the core from starting
+        logging.getLogger(__name__).exception("cannot apply Windows shell integration")
 
     auth_enabled = not args.no_auth and os.environ.get("AIREC_AUTH", "").lower() != "off"
     token = new_token() if auth_enabled else "dev-token"

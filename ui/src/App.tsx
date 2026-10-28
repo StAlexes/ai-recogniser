@@ -10,6 +10,7 @@ import type { PageKey } from './components/Sidebar';
 import { useAppTheme } from './hooks/useAppTheme';
 import { useCoreStatus } from './hooks/useCoreStatus';
 import { KnowledgePage } from './pages/KnowledgePage';
+import { ModelsPage } from './pages/ModelsPage';
 import { QueuePage } from './pages/QueuePage';
 import { SettingsPage } from './pages/SettingsPage';
 import { darkTheme, lightTheme } from './theme';
@@ -20,15 +21,29 @@ const PAGE_TITLES: Record<PageKey, string> = {
   queue: 'Очередь',
   knowledge: 'База знаний',
   settings: 'Настройки',
+  models: 'Менеджер ИИ-моделей',
 };
+
+function initialJobFromUrl(): string | null {
+  const value = new URLSearchParams(window.location.search).get('job');
+  return value !== null && value.trim() !== '' ? value : null;
+}
 
 export function App() {
   const { resolved, setMode } = useAppTheme();
   const core = useCoreStatus();
   const [page, setPage] = useState<PageKey>('queue');
+  const [initialJobId, setInitialJobId] = useState<string | null>(initialJobFromUrl);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [authLost, setAuthLost] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
+
+  const navigate = useCallback((next: PageKey): void => {
+    setPage(next);
+    if (next !== 'queue') {
+      setInitialJobId(null);
+    }
+  }, []);
 
   const handleAuthError = useCallback((): void => {
     setAuthLost(true);
@@ -68,7 +83,15 @@ export function App() {
   const renderPage = (): ReactNode => {
     switch (page) {
       case 'queue':
-        return <QueuePage onAuthError={handleAuthError} />;
+        return (
+          <QueuePage
+            onAuthError={handleAuthError}
+            initialJobId={initialJobId}
+            onInitialJobOpened={() => {
+              setInitialJobId(null);
+            }}
+          />
+        );
       case 'knowledge':
         return <KnowledgePage onAuthError={handleAuthError} />;
       case 'settings':
@@ -76,6 +99,18 @@ export function App() {
           <SettingsPage
             onAuthError={handleAuthError}
             onThemeModeChange={setMode}
+            onManageModels={() => {
+              navigate('models');
+            }}
+          />
+        );
+      case 'models':
+        return (
+          <ModelsPage
+            onAuthError={handleAuthError}
+            onBack={() => {
+              navigate('settings');
+            }}
           />
         );
       default:
@@ -99,8 +134,8 @@ export function App() {
         </a>
 
         <Sidebar
-          active={page}
-          onNavigate={setPage}
+          active={page === 'models' ? 'settings' : page}
+          onNavigate={navigate}
           coreOnline={core.online}
           coreChecked={core.checked}
           version={health?.version ?? FALLBACK_VERSION}

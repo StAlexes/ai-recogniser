@@ -77,6 +77,10 @@ def test_manager_transcribes_and_persists(tmp_path: Path) -> None:
     assert finished.text == "Привет, это тестовая расшифровка."
     assert finished.rtf == 10.9
     assert len(finished.segments) == 2
+    assert finished.stages["recognition"]["status"] == "done"
+    assert finished.stages["recognition"]["progress"] == 1.0
+    assert finished.stages["diarization"]["status"] == "skipped"
+    assert finished.stages["summary"]["status"] == "pending"
     assert finished.detail()["segments"][0]["text"] == "Привет, это"
     assert finished.detail()["result_url"] == f"/api/v1/jobs/{job.id}/result"
     result = manager.result_path(job.id)
@@ -96,6 +100,7 @@ def test_manager_transcribes_and_persists(tmp_path: Path) -> None:
     assert restored_job.text == finished.text
     assert len(restored_job.segments) == 2
     assert restored_job.segments[0]["text"] == "Привет, это"
+    assert restored_job.stages["recognition"]["status"] == "done"
     assert restored.result_path(job.id) is not None
     restored.shutdown()
 
@@ -230,3 +235,14 @@ def test_upload_endpoint_with_fake_worker(tmp_path: Path) -> None:
 
         text = client.get(f"/api/v1/jobs/{job_id}/text", headers=headers)
         assert text.text == detail["text"]
+
+        target = tmp_path / "saved" / "meeting.srt"
+        saved = client.post(
+            f"/api/v1/jobs/{job_id}/save",
+            headers=headers,
+            json={"path": str(target)},
+        )
+        assert saved.status_code == 200, saved.text
+        assert target.is_file()
+        assert "-->" in target.read_text(encoding="utf-8")
+        assert saved.json()["name"] == "meeting.srt"

@@ -31,6 +31,7 @@ class Settings(BaseModel):
     notifications: bool = True
     close_to_tray: bool = True
     pause_on_battery: bool = False
+    context_menu_enabled: bool = True
 
     results_dir: str = ""
     keep_extracted_audio: bool = False
