@@ -36,10 +36,37 @@ def _speaker_label(segment: dict[str, Any]) -> str:
     return f" [{speaker}]"
 
 
+def _format_clock(seconds: float) -> str:
+    total = max(round(seconds), 0)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
 def export_txt(segments: list[dict[str, Any]]) -> str:
-    """Plain text — сегменты склеиваются через пробел."""
-    parts = [segment.get("text", "").strip() for segment in segments if segment.get("text", "").strip()]
-    return " ".join(parts).strip()
+    """Plain text.
+
+    Without diarization the segments are joined into one paragraph.  When
+    speakers are present each segment gets its own line with a timestamp and
+    speaker label, otherwise the diarization result would be invisible in the
+    saved transcript.
+    """
+    parts = [
+        (segment, segment.get("text", "").strip())
+        for segment in segments
+        if segment.get("text", "").strip()
+    ]
+    if not any(segment.get("speaker") for segment, _ in parts):
+        return " ".join(text for _, text in parts).strip()
+    lines: list[str] = []
+    for segment, text in parts:
+        start = _format_clock(segment.get("start_s", 0.0))
+        speaker = segment.get("speaker")
+        prefix = f"[{start}] {speaker}: " if speaker else f"[{start}] "
+        lines.append(prefix + text)
+    return "\n".join(lines).strip()
 
 
 def export_srt(segments: list[dict[str, Any]]) -> str:

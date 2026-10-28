@@ -9,6 +9,7 @@ import { Sidebar } from './components/Sidebar';
 import type { PageKey } from './components/Sidebar';
 import { useAppTheme } from './hooks/useAppTheme';
 import { useCoreStatus } from './hooks/useCoreStatus';
+import { JobPage } from './pages/JobPage';
 import { KnowledgePage } from './pages/KnowledgePage';
 import { ModelsPage } from './pages/ModelsPage';
 import { QueuePage } from './pages/QueuePage';
@@ -33,16 +34,55 @@ export function App() {
   const { resolved, setMode } = useAppTheme();
   const core = useCoreStatus();
   const [page, setPage] = useState<PageKey>('queue');
-  const [initialJobId, setInitialJobId] = useState<string | null>(initialJobFromUrl);
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(initialJobFromUrl);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [authLost, setAuthLost] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
 
-  const navigate = useCallback((next: PageKey): void => {
-    setPage(next);
-    if (next !== 'queue') {
-      setInitialJobId(null);
+  const clearJobParam = useCallback((): void => {
+    const url = new URL(window.location.href);
+    if (url.searchParams.has('job')) {
+      url.searchParams.delete('job');
+      window.history.replaceState({}, '', url);
     }
+  }, []);
+
+  const navigate = useCallback(
+    (next: PageKey): void => {
+      setPage(next);
+      setSelectedJobId(null);
+      clearJobParam();
+    },
+    [clearJobParam],
+  );
+
+  const openJob = useCallback((jobId: string): void => {
+    setPage('queue');
+    setSelectedJobId(jobId);
+    const url = new URL(window.location.href);
+    url.searchParams.set('job', jobId);
+    window.history.pushState({ job: jobId }, '', url);
+  }, []);
+
+  const closeJob = useCallback((): void => {
+    setSelectedJobId(null);
+    const url = new URL(window.location.href);
+    url.searchParams.delete('job');
+    window.history.pushState({}, '', url);
+  }, []);
+
+  useEffect(() => {
+    const onPopState = (): void => {
+      const jobId = initialJobFromUrl();
+      setSelectedJobId(jobId);
+      if (jobId !== null) {
+        setPage('queue');
+      }
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => {
+      window.removeEventListener('popstate', onPopState);
+    };
   }, []);
 
   const handleAuthError = useCallback((): void => {
@@ -75,22 +115,26 @@ export function App() {
   }, [core.online, authLost]);
 
   useEffect(() => {
-    const label = authLost ? 'Нет доступа' : PAGE_TITLES[page];
+    const label = authLost
+      ? 'Нет доступа'
+      : selectedJobId !== null
+        ? 'Задача'
+        : PAGE_TITLES[page];
     document.title = `${label} — AI Recogniser`;
     mainRef.current?.scrollTo({ top: 0 });
-  }, [page, authLost]);
+  }, [page, selectedJobId, authLost]);
 
   const renderPage = (): ReactNode => {
     switch (page) {
       case 'queue':
-        return (
-          <QueuePage
+        return selectedJobId !== null ? (
+          <JobPage
+            jobId={selectedJobId}
+            onBack={closeJob}
             onAuthError={handleAuthError}
-            initialJobId={initialJobId}
-            onInitialJobOpened={() => {
-              setInitialJobId(null);
-            }}
           />
+        ) : (
+          <QueuePage onAuthError={handleAuthError} onOpenJob={openJob} />
         );
       case 'knowledge':
         return <KnowledgePage onAuthError={handleAuthError} />;
@@ -143,7 +187,7 @@ export function App() {
 
         <main id="main-content" ref={mainRef} className="main-area" tabIndex={-1}>
           <div className="main-inner">
-            <AppErrorBoundary key={authLost ? 'auth' : page}>
+            <AppErrorBoundary key={authLost ? 'auth' : `${page}:${selectedJobId ?? ''}`}>
               {authLost ? <AuthErrorPanel onRetry={handleRetry} /> : renderPage()}
             </AppErrorBoundary>
           </div>

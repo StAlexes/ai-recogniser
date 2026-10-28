@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 
@@ -105,6 +106,24 @@ def test_manager_transcribes_and_persists(tmp_path: Path) -> None:
     restored.shutdown()
 
 
+def test_manager_starts_paused_job_manually(tmp_path: Path) -> None:
+    paths = paths_for(tmp_path)
+    settings = Settings(recognize_immediately=False)
+    manager = JobManager(paths, lambda: settings, transcriber=fake_transcriber)
+    upload = tmp_path / "meeting.wav"
+    upload.write_bytes(b"RIFF....WAVEfmt ")
+
+    job = manager.submit(upload, "meeting.wav", "gigaam-v3-e2e-ctc")
+    assert job.status == "queued"
+    assert job.paused is True
+
+    started = manager.start(job.id)
+    assert started.paused is False
+    finished = wait_done(manager, job.id)
+    assert finished.status == "done"
+    manager.shutdown()
+
+
 def test_manager_cancel_queued_job(tmp_path: Path) -> None:
     paths = paths_for(tmp_path)
     manager = JobManager(paths, lambda: Settings(), transcriber=fake_transcriber)
@@ -163,14 +182,92 @@ def test_manager_retry_error_job(tmp_path: Path) -> None:
     manager.cancel(job2.id)
 
     retried = manager.retry(job2.id)
-    assert retried.status == "queued"
+    assert retried.id == job2.id
     assert retried.filename == "meeting2.wav"
-    assert retried.id != job2.id
+    assert retried.status in {"queued", "running"}
 
     retried_done = wait_done(manager, retried.id)
     assert retried_done.status == "done"
     assert retried_done.text == "Привет, это тестовая расшифровка."
     manager.shutdown()
+
+
+def test_manager_auto_summary(tmp_path: Path) -> None:
+    paths = paths_for(tmp_path)
+
+    def summary_runner(
+        job_id: str, progress: Callable[[float, str], None]
+    ) -> dict[str, object]:
+        assert job_id
+        progress(0.5, "Саммаризация")
+        return {"tl_dr": "Короткое содержание.", "topics": ["тест"]}
+
+    settings = Settings(summarize_enabled=True)
+    manager = JobManager(
+        paths,
+        lambda: settings,
+        transcriber=fake_transcriber,
+        summary_runner=summary_runner,
+    )
+    upload = tmp_path / "meeting.wav"
+    upload.write_bytes(b"RIFF....WAVEfmt ")
+
+    job = manager.submit(upload, "meeting.wav", "gigaam-v3-e2e-ctc")
+    deadline = time.monotonic() + 5.0
+    finished = manager.get(job.id)
+    while time.monotonic() < deadline:
+        finished = manager.get(job.id)
+        assert finished is not None
+        if finished.stages["summary"]["status"] in {"done", "error"}:
+            break
+        time.sleep(0.02)
+    assert finished is not None
+    assert finished.status == "done"
+    assert finished.stages["summary"]["status"] == "done", finished.stages["summary"]
+    assert finished.summary == {"tl_dr": "Короткое содержание.", "topics": ["тест"]}
+    assert finished.text == "Привет, это тестовая расшифровка."
+    manager.shutdown()
+
+
+def test_manager_auto_summary_without_llm_keeps_transcript(tmp_path: Path) -> None:
+    paths = paths_for(tmp_path)
+    settings = Settings(summarize_enabled=True)
+    manager = JobManager(paths, lambda: settings, transcriber=fake_transcriber)
+    upload = tmp_path / "meeting.wav"
+    upload.write_bytes(b"RIFF....WAVEfmt ")
+
+    job = manager.submit(upload, "meeting.wav", "gigaam-v3-e2e-ctc")
+    finished = wait_done(manager, job.id)
+    assert finished.status == "done"
+    assert finished.stages["summary"]["status"] == "error"
+    assert "LLM" in finished.stages["summary"]["phase"]
+    assert finished.text == "Привет, это тестовая расшифровка."
+    manager.shutdown()
+
+
+def test_interrupted_summary_is_recovered(tmp_path: Path) -> None:
+    paths = paths_for(tmp_path)
+    manager = JobManager(paths, lambda: Settings(), transcriber=fake_transcriber)
+    upload = tmp_path / "meeting.wav"
+    upload.write_bytes(b"RIFF....WAVEfmt ")
+
+    job = manager.submit(upload, "meeting.wav", "gigaam-v3-e2e-ctc")
+    finished = wait_done(manager, job.id)
+    finished.stages["summary"].update(
+        status="running", phase="Саммаризация", progress=0.5
+    )
+    manager._persist(finished)
+    manager.shutdown()
+
+    restored_manager = JobManager(
+        paths, lambda: Settings(), transcriber=fake_transcriber
+    )
+    restored = restored_manager.get(job.id)
+    assert restored is not None
+    assert restored.status == "done"
+    assert restored.stages["summary"]["status"] == "error"
+    assert "прервана" in restored.stages["summary"]["phase"]
+    restored_manager.shutdown()
 
 
 def test_manager_rejects_unsupported_extension(tmp_path: Path) -> None:

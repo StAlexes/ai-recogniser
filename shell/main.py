@@ -806,28 +806,48 @@ class ShellBridge:
             return {"ok": True, "path": str(self._app.paths.results / job_id)}
         return {"ok": False, "error": "Папка результата ещё не создана."}
 
-    def save_result(self, job_id: str, default_name: str = "") -> dict[str, Any]:
+    def save_result(
+        self, job_id: str, default_name: str = "", format: str = "txt"
+    ) -> dict[str, Any]:
         """Ask for a target path with the native dialog and save the result."""
         if not job_id:
             return {"ok": False, "error": "Не указан идентификатор задачи."}
         import webview
 
-        safe_name = Path(default_name or "transcript.txt").name
+        extension = {
+            "txt": ".txt",
+            "srt": ".srt",
+            "vtt": ".vtt",
+            "md": ".md",
+            "json": ".json",
+        }.get(format, ".txt")
+        safe_name = Path(default_name or f"transcript{extension}").name
         if not Path(safe_name).suffix:
-            safe_name += ".txt"
+            safe_name += extension
+        file_types = (
+            "Текст (*.txt)",
+            "Субтитры SRT (*.srt)",
+            "Субтитры VTT (*.vtt)",
+            "Markdown (*.md)",
+            "JSON (*.json)",
+            "Все файлы (*.*)",
+        )
+        # Put the selected format first so the native dialog preselects it.
+        preferred = {
+            "txt": "Текст (*.txt)",
+            "srt": "Субтитры SRT (*.srt)",
+            "vtt": "Субтитры VTT (*.vtt)",
+            "md": "Markdown (*.md)",
+            "json": "JSON (*.json)",
+        }.get(format)
+        if preferred is not None:
+            file_types = (preferred, *[item for item in file_types if item != preferred])
         window = self._app.window
         try:
             selection = window.create_file_dialog(
                 webview.SAVE_DIALOG,
                 save_filename=safe_name,
-                file_types=(
-                    "Текст (*.txt)",
-                    "Субтитры SRT (*.srt)",
-                    "Субтитры VTT (*.vtt)",
-                    "Markdown (*.md)",
-                    "JSON (*.json)",
-                    "Все файлы (*.*)",
-                ),
+                file_types=file_types,
             )
         except Exception as exc:
             LOG.exception("cannot show the save dialog")
@@ -843,7 +863,7 @@ class ShellBridge:
         try:
             response = httpx.post(
                 f"{self._app.core.base_url}/api/v1/jobs/{job_id}/save",
-                json={"path": target},
+                json={"path": target, "format": format},
                 headers=headers,
                 timeout=30.0,
                 trust_env=False,
@@ -1049,7 +1069,8 @@ def enqueue_files(
                     f"{core.base_url}/api/v1/jobs",
                     files=files_payload,
                     headers=headers,
-                    timeout=30.0,
+                    timeout=300.0,
+                    trust_env=False,
                 )
             if resp.status_code == 202:
                 job_id = resp.json().get("id")
@@ -1067,6 +1088,33 @@ def enqueue_files(
                 )
         except Exception as exc:  # never crash the shell on context-menu launch
             LOG.exception("cannot enqueue %s: %s", path.name, exc)
+    return queued
+
+
+def enqueue_files_via_running_instance(paths: AppPaths, files: list[str]) -> list[str]:
+    """Forward context-menu files to the already running app.
+
+    The second process never owns a core handle, so it uses ``session.json``
+    written by the first instance.  On success it asks the window to navigate
+    to the first queued job.
+    """
+    if not files:
+        return []
+    from airec.core.security import read_session
+
+    session = read_session(paths.session_file)
+    if session is None:
+        return []
+    base_url = f"http://127.0.0.1:{session.port}"
+    core = CoreHandle(
+        base_url=base_url,
+        token=session.token,
+        port=session.port,
+        version=session.version,
+    )
+    queued = enqueue_files(core, files, session.token)
+    if queued:
+        request_navigation(paths, queued[0])
     return queued
 
 
@@ -1149,6 +1197,10 @@ def main(argv: list[str] | None = None) -> int:
 
         if not acquire_single_instance():
             LOG.info("another shell instance is already running")
+            if args.files:
+                queued = enqueue_files_via_running_instance(paths, args.files)
+                if queued:
+                    LOG.info("forwarded %d file(s) to the running instance", len(queued))
             if not activate_existing_window():
                 message_box(f"{APP_TITLE} уже запущен.", error=False)
             return 0

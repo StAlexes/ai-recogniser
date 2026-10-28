@@ -46,6 +46,9 @@ class Settings(BaseModel):
     llm_provider: str = "llamacpp-local"
     llm_ctx_size: int = Field(default=4096, ge=512, le=131072)
     llm_threads: int = Field(default=0, ge=0, le=256)
+    # Run the summary stage automatically after each successful transcription.
+    # Disabled by default because it requires a local LLM runtime + GGUF model.
+    summarize_enabled: bool = False
 
     # Long recordings are split into speech segments with Silero VAD.  The
     # segment cap is deliberately far below GigaAM's positional limit (~200 s).

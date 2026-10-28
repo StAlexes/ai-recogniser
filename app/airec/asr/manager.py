@@ -27,7 +27,12 @@ from pathlib import Path
 from typing import Any
 
 from airec.asr.audio import SUPPORTED_EXTENSIONS, find_ffmpeg
-from airec.asr.export import EXPORT_CONTENT_TYPES, EXPORT_DOWNLOAD_NAMES, EXPORT_EXTENSIONS
+from airec.asr.export import (
+    EXPORT_CONTENT_TYPES,
+    EXPORT_DOWNLOAD_NAMES,
+    EXPORT_EXTENSIONS,
+    export_txt,
+)
 from airec.asr.service import AsrError, TranscriptionResult, transcribe
 from airec.core.config import Settings
 from airec.core.db import Database
@@ -41,10 +46,15 @@ MAX_INPUT_BYTES = 4 * 1024 * 1024 * 1024
 ACTIVE_STATUSES = {"queued", "running"}
 
 Transcriber = Callable[..., TranscriptionResult]
+SummaryRunner = Callable[[str, Callable[[float, str], None]], dict[str, Any]]
 
 
 class JobValidationError(ValueError):
     """The uploaded input is not a supported audio/video file."""
+
+
+class JobCancelled(RuntimeError):
+    """Raised inside a worker when the user cancels its job."""
 
 
 def utc_now() -> str:
@@ -175,18 +185,31 @@ class JobManager:
         settings_provider: Callable[[], Settings],
         *,
         transcriber: Transcriber = transcribe,
+        summary_runner: SummaryRunner | None = None,
     ) -> None:
         self._paths = paths
         self._settings = settings_provider
         self._transcriber = transcriber
+        self._summary_runner = summary_runner
         self._jobs: dict[str, Job] = {}
         self._futures: dict[str, Future[None]] = {}
+        self._summary_futures: dict[str, Future[None]] = {}
         self._stage_started: dict[tuple[str, str], float] = {}
+        self._run_tokens: dict[str, int] = {}
+        self._cancel_events: dict[str, threading.Event] = {}
+        self._run_seq = 0
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="airec-asr")
+        self._summary_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="airec-summary"
+        )
         self._ffmpeg = find_ffmpeg(paths.bin)
         self._db = Database(paths.data / "airec_jobs.sqlite")
         self._load_existing()
+
+    def set_summary_runner(self, runner: SummaryRunner | None) -> None:
+        """Attach the LLM-backed summary implementation after app startup."""
+        self._summary_runner = runner
 
     @property
     def results_dir(self) -> Path:
@@ -195,6 +218,23 @@ class JobManager:
     @property
     def max_input_bytes(self) -> int:
         return MAX_INPUT_BYTES
+
+    def _begin_run(self, job_id: str, source: Path, work_dir: Path) -> Future[None]:
+        """Start a worker with a fresh generation token (caller holds the lock)."""
+        self._run_seq += 1
+        token = self._run_seq
+        self._run_tokens[job_id] = token
+        self._cancel_events[job_id] = threading.Event()
+        future = self._executor.submit(self._run, job_id, source, work_dir, token)
+        self._futures[job_id] = future
+        return future
+
+    def _token_current(self, job_id: str, token: int) -> bool:
+        return self._run_tokens.get(job_id) == token
+
+    def _cancel_requested(self, job_id: str) -> bool:
+        event = self._cancel_events.get(job_id)
+        return event is not None and event.is_set()
 
     def _job_dir(self, job_id: str) -> Path:
         return self._paths.results / job_id
@@ -253,10 +293,13 @@ class JobManager:
         progress: float | None = None,
         finished: bool = False,
         persist: bool = True,
+        token: int | None = None,
     ) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
+                return
+            if token is not None and not self._token_current(job_id, token):
                 return
             self._set_stage(
                 job,
@@ -346,8 +389,59 @@ class JobManager:
             segments = []
         row["segments"] = segments
         job = Job.from_dict(row)
+        if self._recover_interrupted(job):
+            try:
+                self._db.upsert_job(asdict(job))
+                self._write_job_json(job)
+            except OSError:
+                log.exception("cannot persist recovered job %s", job.id)
         with self._lock:
             self._jobs[job.id] = job
+
+    @staticmethod
+    def _recover_interrupted(job: Job) -> bool:
+        """Reset stages that were left running when the previous process died."""
+        changed = False
+        if job.status in ACTIVE_STATUSES:
+            job.status = "error"
+            job.phase = "Ошибка"
+            job.finished_at = utc_now()
+            job.error = (
+                "Задача была прервана при закрытии приложения. Запустите её снова."
+            )
+            changed = True
+            for key in ("recognition", "diarization"):
+                stage = job.stages[key]
+                if stage["status"] == STAGE_RUNNING:
+                    stage.update(status=STAGE_ERROR, phase="Прервано", progress=1.0)
+                    changed = True
+                elif stage["status"] == STAGE_PENDING:
+                    stage.update(
+                        status=STAGE_SKIPPED, phase="Не выполнялась", progress=0.0
+                    )
+                    changed = True
+            if job.stages["summary"]["status"] in {STAGE_RUNNING, STAGE_PENDING}:
+                job.stages["summary"].update(
+                    status=STAGE_SKIPPED, phase="Нет результата", progress=0.0
+                )
+                changed = True
+            return changed
+
+        if job.status == "done":
+            for key in ("recognition", "diarization"):
+                stage = job.stages[key]
+                if stage["status"] == STAGE_RUNNING:
+                    stage.update(status=STAGE_DONE, phase="Готово", progress=1.0)
+                    changed = True
+            summary = job.stages["summary"]
+            if summary["status"] == STAGE_RUNNING and job.summary is None:
+                summary.update(
+                    status=STAGE_ERROR,
+                    phase="Саммаризация прервана при закрытии приложения.",
+                    progress=1.0,
+                )
+                changed = True
+        return changed
 
     # ------------------------------------------------------------------ #
     # Submission
@@ -396,6 +490,14 @@ class JobManager:
             status=STAGE_PENDING if settings.diarize_enabled else STAGE_SKIPPED,
             phase="Ожидает" if settings.diarize_enabled else "Отключена в настройках",
         )
+        if settings.summarize_enabled:
+            self._set_stage(
+                job,
+                "summary",
+                status=STAGE_PENDING,
+                phase="Ожидает распознавания",
+                progress=0.0,
+            )
         if not settings.recognize_immediately:
             job.paused = True
             job.phase = "Ожидает запуска"
@@ -407,8 +509,7 @@ class JobManager:
             except OSError:
                 log.exception("cannot persist new job %s", job.id)
             if not job.paused:
-                future = self._executor.submit(self._run, job.id, source, work_dir)
-                self._futures[job.id] = future
+                self._begin_run(job.id, source, work_dir)
         return job
 
     def start(self, job_id: str) -> Job:
@@ -448,8 +549,7 @@ class JobManager:
                 self._persist(job)
             except OSError:
                 log.exception("cannot persist started job %s", job.id)
-            future = self._executor.submit(self._run, job.id, source, work_dir)
-            self._futures[job.id] = future
+            self._begin_run(job.id, source, work_dir)
             log.info("job %s started manually", job_id)
             return job
 
@@ -466,9 +566,13 @@ class JobManager:
                 raise ValueError(
                     f"Нельзя отменить задачу со статусом '{job.status}'."
                 )
+            event = self._cancel_events.get(job_id)
+            if event is not None:
+                event.set()
             future = self._futures.pop(job_id, None)
+            was_cancelled = False
             if future is not None:
-                future.cancel()
+                was_cancelled = future.cancel()
             job.status = "cancelled"
             job.phase = "Отменено"
             job.finished_at = utc_now()
@@ -494,22 +598,28 @@ class JobManager:
                     job,
                     "summary",
                     status=STAGE_SKIPPED,
-                    phase="Нет результата",
+                    phase="Отменено",
                     progress=0.0,
                 )
             try:
                 self._persist(job)
             except OSError:
                 log.exception("cannot persist cancelled job %s", job_id)
-            # Освобождаем временные файлы.
-            work_dir = self._paths.temp / "jobs" / job_id
-            self._cleanup_source(work_dir)
+            # A running worker cleans its own temporary directory in ``_run``;
+            # deleting it here used to race with ffmpeg/ASR and produce a
+            # spurious "job failed" state after the user had cancelled.
+            if future is None or was_cancelled or future.done():
+                jobs_temp = self._paths.temp / "jobs"
+                for work_dir in jobs_temp.glob(f"{job_id}*"):
+                    if work_dir.is_dir():
+                        self._cleanup_source(work_dir)
 
     def retry(self, job_id: str) -> Job:
-        """Повтор задачи со статусом error или cancelled.
+        """Restart the *same* task after an error or cancellation.
 
-        Исходный файл берётся из results/<job_id>/source<ext>, который
-        хранится независимо от временной папки.
+        The job id is preserved so the UI, notifications and result folder keep
+        pointing at the same item.  A fresh generation token prevents the old
+        (possibly still stopping) worker from overwriting the new run.
         """
         with self._lock:
             job = self._jobs.get(job_id)
@@ -530,48 +640,77 @@ class JobManager:
                     f"Исходный файл задачи не найден: {source}"
                 )
 
-            # Создаём новую задачу на основе старой.
-            new_job_id = f"{datetime.now(UTC):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}"
-            new_work_dir = self._paths.temp / "jobs" / new_job_id
-            new_work_dir.mkdir(parents=True, exist_ok=True)
-            new_source = new_work_dir / f"input{source.suffix}"
-            shutil.copy2(source, new_source)
+            # Stop the previous worker cooperatively.  Its token is replaced
+            # below, so even if it is inside a long model call it cannot write
+            # to the retried job's state.
+            old_event = self._cancel_events.get(job_id)
+            if old_event is not None:
+                old_event.set()
+            old_future = self._futures.pop(job_id, None)
+            if old_future is not None:
+                old_future.cancel()
 
-            new_job = Job(
-                id=new_job_id,
-                filename=job.filename,
-                model=job.model,
-                size_bytes=source.stat().st_size,
-                audio_format=job.audio_format,
-                source_path=str(source),
-            )
             settings = self._settings()
+            work_dir = (
+                self._paths.temp
+                / "jobs"
+                / f"{job_id}-retry-{uuid.uuid4().hex[:8]}"
+            )
+            work_dir.mkdir(parents=True, exist_ok=True)
+            run_source = work_dir / f"input{source.suffix}"
+            shutil.copy2(source, run_source)
+
+            job.status = "queued"
+            job.progress = 0.0
+            job.phase = "В очереди"
+            job.started_at = None
+            job.finished_at = None
+            job.duration_s = None
+            job.elapsed_s = None
+            job.rtf = None
+            job.text = ""
+            job.error = None
+            job.result_file = None
+            job.summary = None
+            job.paused = False
+            job.segments = []
+            job.stages = default_stages()
+            for key in [key for key in self._stage_started if key[0] == job_id]:
+                self._stage_started.pop(key, None)
             self._set_stage(
-                new_job,
+                job,
                 "diarization",
                 status=STAGE_PENDING if settings.diarize_enabled else STAGE_SKIPPED,
                 phase="Ожидает" if settings.diarize_enabled else "Отключена в настройках",
             )
-            self._jobs[new_job.id] = new_job
+            if settings.summarize_enabled:
+                self._set_stage(
+                    job,
+                    "summary",
+                    status=STAGE_PENDING,
+                    phase="Ожидает распознавания",
+                    progress=0.0,
+                )
             try:
-                self._persist(new_job)
+                self._persist(job)
             except OSError:
-                log.exception("cannot persist retried job %s", new_job.id)
-            future = self._executor.submit(
-                self._run, new_job.id, new_source, new_work_dir
-            )
-            self._futures[new_job.id] = future
-            log.info("job %s retried as %s", job_id, new_job.id)
-            return new_job
+                log.exception("cannot persist retried job %s", job.id)
+            self._begin_run(job.id, run_source, work_dir)
+            log.info("job %s retried in place", job_id)
+            return job
 
     # ------------------------------------------------------------------ #
     # Worker
     # ------------------------------------------------------------------ #
-    def _run(self, job_id: str, source: Path, work_dir: Path) -> None:
+    def _run(self, job_id: str, source: Path, work_dir: Path, token: int) -> None:
         settings = self._settings()
         with self._lock:
+            if not self._token_current(job_id, token):
+                self._cleanup_source(work_dir)
+                return
             job = self._jobs.get(job_id)
-            if job is None:
+            if job is None or job.status == "cancelled":
+                self._cleanup_source(work_dir)
                 return
             job.status = "running"
             job.phase = "Запуск"
@@ -601,11 +740,20 @@ class JobManager:
             except OSError:
                 log.exception("cannot persist started job %s", job.id)
 
+        def check_cancel() -> None:
+            if not self._token_current(job_id, token) or self._cancel_requested(job_id):
+                raise JobCancelled()
+
         def progress(value: float, phase: str) -> None:
+            check_cancel()
             with self._lock:
                 current = self._jobs.get(job_id)
-                if current is None:
-                    return
+                if (
+                    current is None
+                    or current.status == "cancelled"
+                    or not self._token_current(job_id, token)
+                ):
+                    raise JobCancelled()
                 current.progress = max(current.progress, min(max(value, 0.0), 0.99))
                 current.phase = phase
                 try:
@@ -614,12 +762,14 @@ class JobManager:
                     log.exception("cannot persist progress for job %s", job_id)
 
         def stage_progress(stage: str, value: float, phase: str) -> None:
+            check_cancel()
             self._update_stage(
                 job_id,
                 stage,
                 status=STAGE_RUNNING,
                 progress=value,
                 phase=phase,
+                token=token,
             )
 
         try:
@@ -641,133 +791,197 @@ class JobManager:
                 diarize_model_path=settings.diarize_model_path,
                 models_dir=self._paths.models,
             )
+            segment_payload = [asdict(segment) for segment in result.segments]
+            transcript_text = export_txt(segment_payload) or result.text
             transcript_path = self._job_dir(job_id) / "transcript.txt"
-            transcript_path.parent.mkdir(parents=True, exist_ok=True)
-            transcript_path.write_text(result.text + "\n", encoding="utf-8", newline="\n")
+            auto_summary = False
+            stale = False
             with self._lock:
                 job = self._jobs.get(job_id)
-                if job is None:
-                    return
-                job.status = "done"
-                job.phase = "Готово"
-                job.progress = 1.0
-                job.finished_at = utc_now()
-                job.text = result.text
-                job.duration_s = result.duration_s
-                job.elapsed_s = result.elapsed_s
-                job.rtf = result.rtf
-                job.segments = [asdict(segment) for segment in result.segments]
-                job.result_file = str(transcript_path)
-                self._set_stage(
-                    job,
-                    "recognition",
-                    status=STAGE_DONE,
-                    phase="Готово",
-                    progress=1.0,
-                    finished=True,
-                )
-                speakers = {s.speaker for s in result.segments if s.speaker}
-                diarization_phase = str(job.stages["diarization"].get("phase", ""))
-                if not settings.diarize_enabled:
-                    self._set_stage(
-                        job,
-                        "diarization",
-                        status=STAGE_SKIPPED,
-                        phase="Отключена в настройках",
-                        progress=0.0,
+                if (
+                    job is None
+                    or job.status == "cancelled"
+                    or not self._token_current(job_id, token)
+                ):
+                    stale = True
+                else:
+                    transcript_path.parent.mkdir(parents=True, exist_ok=True)
+                    transcript_path.write_text(
+                        transcript_text + "\n", encoding="utf-8", newline="\n"
                     )
-                elif diarization_phase.startswith("Ошибка"):
+                    job.status = "done"
+                    job.phase = "Готово"
+                    job.progress = 1.0
+                    job.finished_at = utc_now()
+                    job.text = result.text
+                    job.duration_s = result.duration_s
+                    job.elapsed_s = result.elapsed_s
+                    job.rtf = result.rtf
+                    job.segments = segment_payload
+                    job.result_file = str(transcript_path)
                     self._set_stage(
                         job,
-                        "diarization",
-                        status=STAGE_ERROR,
-                        progress=1.0,
-                    )
-                elif speakers:
-                    self._set_stage(
-                        job,
-                        "diarization",
+                        "recognition",
                         status=STAGE_DONE,
-                        phase=f"Спикеров: {len(speakers)}",
+                        phase="Готово",
                         progress=1.0,
                         finished=True,
                     )
-                else:
-                    self._set_stage(
-                        job,
-                        "diarization",
-                        status=STAGE_SKIPPED,
-                        phase="Спикеры не найдены",
-                        progress=1.0,
+                    speakers = {s.speaker for s in result.segments if s.speaker}
+                    diarization_phase = str(job.stages["diarization"].get("phase", ""))
+                    if not settings.diarize_enabled:
+                        self._set_stage(
+                            job,
+                            "diarization",
+                            status=STAGE_SKIPPED,
+                            phase="Отключена в настройках",
+                            progress=0.0,
+                        )
+                    elif diarization_phase.startswith("Ошибка"):
+                        self._set_stage(
+                            job,
+                            "diarization",
+                            status=STAGE_ERROR,
+                            progress=1.0,
+                        )
+                    elif speakers:
+                        self._set_stage(
+                            job,
+                            "diarization",
+                            status=STAGE_DONE,
+                            phase=f"Спикеров: {len(speakers)}",
+                            progress=1.0,
+                            finished=True,
+                        )
+                    else:
+                        self._set_stage(
+                            job,
+                            "diarization",
+                            status=STAGE_SKIPPED,
+                            phase="Спикеры не найдены",
+                            progress=1.0,
+                        )
+                    auto_summary = bool(
+                        settings.summarize_enabled and result.text.strip()
                     )
-                self._set_stage(
-                    job,
-                    "summary",
-                    status=STAGE_PENDING,
-                    phase="Можно запросить" if result.text else "Нет текста",
-                    progress=0.0,
-                )
-                try:
-                    self._persist(job)
-                except OSError:
-                    log.exception("cannot persist finished job %s", job.id)
-                try:
-                    notify_job_done(job.id, job.filename)
-                except Exception:  # notifications never break the queue
-                    log.exception("cannot send done notification for job %s", job.id)
+                    if auto_summary and self._summary_runner is None:
+                        auto_summary = False
+                        self._set_stage(
+                            job,
+                            "summary",
+                            status=STAGE_ERROR,
+                            phase=(
+                                "LLM не настроен: установите llama-server и "
+                                "GGUF-модель или выберите провайдера в настройках."
+                            ),
+                            progress=1.0,
+                        )
+                    elif auto_summary:
+                        # Mark the stage as running before persisting "done", so
+                        # the UI immediately starts polling and shows progress.
+                        self._set_stage(
+                            job,
+                            "summary",
+                            status=STAGE_RUNNING,
+                            phase="Подготовка текста",
+                            progress=0.02,
+                        )
+                    elif result.text.strip():
+                        self._set_stage(
+                            job,
+                            "summary",
+                            status=STAGE_PENDING,
+                            phase="Можно запросить",
+                            progress=0.0,
+                        )
+                    else:
+                        self._set_stage(
+                            job,
+                            "summary",
+                            status=STAGE_SKIPPED,
+                            phase="Нет текста",
+                            progress=0.0,
+                        )
+                    try:
+                        self._persist(job)
+                    except OSError:
+                        log.exception("cannot persist finished job %s", job.id)
+            if stale:
+                self._cleanup_source(work_dir)
+                return
+            try:
+                notify_job_done(job_id, job.filename)
+            except Exception:  # notifications never break the queue
+                log.exception("cannot send done notification for job %s", job_id)
+            if auto_summary:
+                self._start_auto_summary(job_id, token)
             if not settings.keep_extracted_audio:
                 self._cleanup_source(work_dir)
+        except JobCancelled:
+            log.info("job %s stopped after cancellation", job_id)
+            self._cleanup_source(work_dir)
         except Exception as exc:  # worker boundary: never let a job kill the queue
             message = str(exc) if isinstance(exc, AsrError) else f"Ошибка обработки: {exc}"
             log.exception("job %s failed: %s", job_id, exc)
+            stale = False
             with self._lock:
                 job = self._jobs.get(job_id)
-                if job is None:
-                    return
-                job.status = "error"
-                job.phase = "Ошибка"
-                job.progress = 1.0
-                job.error = message
-                job.finished_at = utc_now()
-                self._set_stage(
-                    job,
-                    "recognition",
-                    status=STAGE_ERROR,
-                    phase="Ошибка",
-                    progress=1.0,
-                )
-                if job.stages["diarization"]["status"] == STAGE_RUNNING:
+                if (
+                    job is None
+                    or job.status == "cancelled"
+                    or not self._token_current(job_id, token)
+                ):
+                    stale = True
+                else:
+                    job.status = "error"
+                    job.phase = "Ошибка"
+                    job.progress = 1.0
+                    job.error = message
+                    job.finished_at = utc_now()
                     self._set_stage(
                         job,
-                        "diarization",
+                        "recognition",
                         status=STAGE_ERROR,
-                        phase="Прервано",
+                        phase="Ошибка",
                         progress=1.0,
                     )
-                elif job.stages["diarization"]["status"] == STAGE_PENDING:
-                    self._set_stage(
-                        job,
-                        "diarization",
-                        status=STAGE_SKIPPED,
-                        phase="Не выполнялась",
-                        progress=0.0,
-                    )
-                if job.stages["summary"]["status"] == STAGE_PENDING:
-                    self._set_stage(
-                        job,
-                        "summary",
-                        status=STAGE_SKIPPED,
-                        phase="Нет результата",
-                        progress=0.0,
-                    )
-                try:
-                    self._persist(job)
-                except OSError:
-                    log.exception("cannot persist failed job %s", job.id)
-                try:
-                    notify_job_error(job.id, job.filename, message)
-                except Exception:  # notifications never break the queue
-                    log.exception("cannot send error notification for job %s", job.id)
+                    if job.stages["diarization"]["status"] == STAGE_RUNNING:
+                        self._set_stage(
+                            job,
+                            "diarization",
+                            status=STAGE_ERROR,
+                            phase="Прервано",
+                            progress=1.0,
+                        )
+                    elif job.stages["diarization"]["status"] == STAGE_PENDING:
+                        self._set_stage(
+                            job,
+                            "diarization",
+                            status=STAGE_SKIPPED,
+                            phase="Не выполнялась",
+                            progress=0.0,
+                        )
+                    if job.stages["summary"]["status"] == STAGE_PENDING:
+                        self._set_stage(
+                            job,
+                            "summary",
+                            status=STAGE_SKIPPED,
+                            phase="Нет результата",
+                            progress=0.0,
+                        )
+                    try:
+                        self._persist(job)
+                    except OSError:
+                        log.exception("cannot persist failed job %s", job.id)
+            if stale:
+                self._cleanup_source(work_dir)
+                return
+            try:
+                notify_job_error(job_id, job.filename, message)
+            except Exception:  # notifications never break the queue
+                log.exception("cannot send error notification for job %s", job_id)
+            if not settings.keep_extracted_audio:
+                self._cleanup_source(work_dir)
 
     @staticmethod
     def _cleanup_source(work_dir: Path) -> None:
@@ -871,7 +1085,9 @@ class JobManager:
             format = suffix if suffix in EXPORT_EXTENSIONS else "txt"
         if format not in EXPORT_EXTENSIONS:
             raise ValueError(f"Неизвестный формат экспорта: {format}")
-        if target.suffix == "":
+        if format is not None:
+            # The UI/dialog may leave a different extension (for example the
+            # user picked "all files" or typed .txt while SRT is selected).
             target = target.with_suffix(EXPORT_EXTENSIONS[format])
         content = self._export_content(job, format)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -882,6 +1098,78 @@ class JobManager:
     # ------------------------------------------------------------------ #
     # Summary stage
     # ------------------------------------------------------------------ #
+    def _start_auto_summary(self, job_id: str, token: int) -> None:
+        """Queue the automatic summary for a just-finished transcription."""
+        if self._summary_runner is None:
+            self.fail_summary(
+                job_id,
+                "LLM не настроен: установите llama-server и GGUF-модель "
+                "или выберите провайдера в настройках.",
+            )
+            return
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if (
+                job is None
+                or job.status != "done"
+                or not self._token_current(job_id, token)
+                or self._cancel_requested(job_id)
+            ):
+                return
+            self._set_stage(
+                job,
+                "summary",
+                status=STAGE_RUNNING,
+                phase="Подготовка текста",
+                progress=0.02,
+            )
+            try:
+                self._persist(job)
+            except OSError:
+                log.exception("cannot persist auto summary start for %s", job_id)
+        try:
+            future = self._summary_executor.submit(
+                self._auto_summary, job_id, token
+            )
+            self._summary_futures[job_id] = future
+        except RuntimeError:
+            log.exception("cannot queue automatic summary for %s", job_id)
+            self.fail_summary(job_id, "Не удалось запустить саммаризацию.")
+
+    def _auto_summary(self, job_id: str, token: int) -> None:
+        runner = self._summary_runner
+        if runner is None:
+            return
+
+        def progress(value: float, phase: str) -> None:
+            if not self._token_current(job_id, token) or self._cancel_requested(job_id):
+                raise JobCancelled()
+            self.update_summary(job_id, value, phase)
+
+        try:
+            summary = runner(job_id, progress)
+        except JobCancelled:
+            return
+        except Exception as exc:  # summary errors must not fail the transcript
+            log.exception("automatic summary failed for job %s", job_id)
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if (
+                    job is not None
+                    and job.status == "done"
+                    and self._token_current(job_id, token)
+                ):
+                    self.fail_summary(job_id, f"Саммаризация: {exc}")
+            return
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if (
+                job is not None
+                and job.status == "done"
+                and self._token_current(job_id, token)
+            ):
+                self.finish_summary(job_id, summary)
+
     def begin_summary(self, job_id: str) -> None:
         self._update_stage(
             job_id,
@@ -929,6 +1217,7 @@ class JobManager:
         )
 
     def shutdown(self) -> None:
+        self._summary_executor.shutdown(wait=False, cancel_futures=True)
         self._executor.shutdown(wait=False, cancel_futures=True)
         try:
             self._db.close()

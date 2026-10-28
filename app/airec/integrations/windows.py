@@ -68,6 +68,70 @@ def _set_value(key, name: str, value: str) -> None:
     winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
 
 
+def _context_menu_paths() -> tuple[str, ...]:
+    """Registry paths Shell actually merges into a file's context menu.
+
+    A verb under ``Software\\Classes\\.mp3\\shell`` is written successfully but
+    is not returned by ``Shell.Application`` for files whose association comes
+    from a ProgID (VLC, Movies & TV, ...).  Per-extension entries must live under
+    ``SystemFileAssociations``; this was verified with the Shell COM API.
+    """
+    return tuple(
+        rf"Software\Classes\SystemFileAssociations\{extension}\shell\{CONTEXT_MENU_KEY}"
+        for extension in SUPPORTED_EXTENSIONS
+    )
+
+
+def _legacy_context_menu_paths() -> tuple[str, ...]:
+    """Old (pre-0.3.1) paths; removed so the menu is not registered twice."""
+    return tuple(
+        rf"Software\Classes\{extension}\shell\{CONTEXT_MENU_KEY}"
+        for extension in SUPPORTED_EXTENSIONS
+    )
+
+
+def _reg_delete(key_path: str) -> bool:
+    """Delete a whole registry subtree via ``reg.exe``.
+
+    Unlike ``winreg.DeleteKey`` this also works when Explorer currently keeps
+    a handle on the key open.
+    """
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        completed = subprocess.run(
+            ["reg.exe", "delete", key_path, "/f"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            creationflags=creationflags,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        log.debug("cannot run reg.exe delete for %s", key_path, exc_info=True)
+        return False
+    return completed.returncode in {0, 1}  # 1 = key did not exist
+
+
+def _refresh_explorer() -> None:
+    """Tell Explorer that file associations changed.
+
+    Without this the verb may stay invisible until Explorer or Windows is
+    restarted, which made the context-menu setting look broken.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        SHCNE_ASSOCCHANGED = 0x08000000
+        SHCNF_IDLIST = 0x0000
+        ctypes.windll.shell32.SHChangeNotify(
+            SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None
+        )
+    except Exception:  # pragma: no cover - best effort on Windows
+        log.debug("SHChangeNotify failed", exc_info=True)
+
+
 def register_context_menu() -> bool:
     """Register the Explorer context-menu item for supported file types."""
     if os.name != "nt":
@@ -76,8 +140,10 @@ def register_context_menu() -> bool:
     command = _command(file_arg=True)
     icon = f'"{_shell_executable()[0]}",0'
     try:
-        for extension in SUPPORTED_EXTENSIONS:
-            path = rf"Software\Classes\{extension}\shell\{CONTEXT_MENU_KEY}"
+        # Migrate away from the legacy paths that Shell ignored.
+        for legacy in _legacy_context_menu_paths():
+            _reg_delete("HKCU\\" + legacy)
+        for path in _context_menu_paths():
             with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_WRITE) as key:
                 winreg.SetValueEx(key, "", 0, winreg.REG_SZ, CONTEXT_MENU_LABEL)
                 winreg.SetValueEx(key, "Icon", 0, winreg.REG_SZ, icon)
@@ -88,6 +154,7 @@ def register_context_menu() -> bool:
     except OSError:
         log.exception("cannot register the Explorer context menu")
         return False
+    _refresh_explorer()
     log.info("context menu registered for %d extensions", len(SUPPORTED_EXTENSIONS))
     return True
 
@@ -96,29 +163,11 @@ def unregister_context_menu() -> bool:
     """Remove the Explorer context-menu item."""
     if os.name != "nt":
         return False
-    # ``reg.exe delete`` handles a whole subtree and works even when Explorer
-    # or another process keeps a handle on the key open.  Plain
-    # ``winreg.DeleteKey`` fails with access denied in that situation.
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     ok = True
-    for extension in SUPPORTED_EXTENSIONS:
-        path = rf"HKCU\Software\Classes\{extension}\shell\{CONTEXT_MENU_KEY}"
-        try:
-            completed = subprocess.run(
-                ["reg.exe", "delete", path, "/f"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-                creationflags=creationflags,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            log.debug("cannot run reg.exe delete for %s", path, exc_info=True)
+    for path in (*_context_menu_paths(), *_legacy_context_menu_paths()):
+        if not _reg_delete("HKCU\\" + path):
             ok = False
-            continue
-        if completed.returncode not in {0, 1}:  # 1 = key did not exist
-            log.debug("reg.exe delete failed for %s (%s)", path, completed.returncode)
-            ok = False
+    _refresh_explorer()
     log.info("context menu removed")
     return ok
 
@@ -128,10 +177,11 @@ def context_menu_registered() -> bool:
     if os.name != "nt":
         return False
     winreg = _winreg()
-    for extension in SUPPORTED_EXTENSIONS:
-        path = rf"Software\Classes\{extension}\shell\{CONTEXT_MENU_KEY}\command"
+    for path in _context_menu_paths():
         try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path):
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, path + r"\command"
+            ):
                 return True
         except OSError:
             continue

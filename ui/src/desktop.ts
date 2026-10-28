@@ -20,6 +20,7 @@ interface PywebviewApi {
   save_result?: (
     jobId: string,
     defaultName: string,
+    format?: string,
   ) => Promise<BridgeResult> | BridgeResult;
 }
 
@@ -67,10 +68,11 @@ export async function openResultFolder(jobId: string): Promise<BridgeResult | nu
 export async function saveResultAs(
   jobId: string,
   defaultName: string,
+  format = 'txt',
 ): Promise<BridgeResult | null> {
   const bridge = api();
   if (!bridge?.save_result) {
     return null;
   }
-  return bridge.save_result(jobId, defaultName);
+  return bridge.save_result(jobId, defaultName, format);
 }

@@ -769,6 +769,25 @@ export function SettingsPage({
 
               <div className="settings-row">
                 <div className="settings-row-text">
+                  <span className="settings-label">Составлять саммари автоматически</span>
+                  <span className="settings-hint">
+                    После успешного распознавания сразу запускать LLM-саммари.
+                    Требуется выбранный провайдер и установленная модель.
+                  </span>
+                </div>
+                <div className="settings-control">
+                  <Switch
+                    aria-label="Автоматическая саммаризация"
+                    checked={settings.summarize_enabled}
+                    onChange={(_event, data) => {
+                      update({ summarize_enabled: data.checked });
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
                   <span className="settings-label">Адрес внешнего API</span>
                   <span className="settings-hint">
                     Для ollama / OpenAI-совместимого API. Например http://127.0.0.1:11434.

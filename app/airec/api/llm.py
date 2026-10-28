@@ -26,9 +26,14 @@ def _manager(request: Request) -> JobManager:
     return request.app.state.jobs
 
 
-def _resolve_llm_model(request: Request, settings: Settings) -> str:
+def _app_of(target: Any) -> Any:
+    """Accept either a FastAPI Request or the application itself."""
+    return getattr(target, "app", target)
+
+
+def _resolve_llm_model(target: Any, settings: Settings) -> str:
     """Resolve a GGUF name from Settings to the real file in ``models/``."""
-    models_dir = Path(request.app.state.paths.models)
+    models_dir = Path(_app_of(target).state.paths.models)
     value = (settings.llm_model or "").strip()
     if value and value != "auto":
         candidate = Path(value)
@@ -49,12 +54,13 @@ def _resolve_llm_model(request: Request, settings: Settings) -> str:
     return value or "auto"
 
 
-def _provider(request: Request, settings: Settings) -> Any:
+def _provider(target: Any, settings: Settings) -> Any:
+    app = _app_of(target)
     kind = settings.llm_provider
     if settings.external_llm_enabled and kind == "llamacpp-local":
         kind = "external"
     local_model = (
-        _resolve_llm_model(request, settings)
+        _resolve_llm_model(app, settings)
         if kind == "llamacpp-local"
         else settings.llm_model
     )
@@ -66,7 +72,7 @@ def _provider(request: Request, settings: Settings) -> Any:
         settings.llm_ctx_size,
         settings.llm_threads,
     )
-    cached = getattr(request.app.state, PROVIDER_STATE_KEY, None)
+    cached = getattr(app.state, PROVIDER_STATE_KEY, None)
     if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == signature:
         return cached[1]
     if cached is not None:
@@ -84,10 +90,39 @@ def _provider(request: Request, settings: Settings) -> Any:
         api_key=settings.external_llm_api_key or None,
         ctx_size=settings.llm_ctx_size,
         threads=settings.llm_threads,
-        binary=request.app.state.paths.bin if kind == "llamacpp-local" else None,
+        binary=app.state.paths.bin if kind == "llamacpp-local" else None,
     )
-    setattr(request.app.state, PROVIDER_STATE_KEY, (signature, provider))
+    setattr(app.state, PROVIDER_STATE_KEY, (signature, provider))
     return provider
+
+
+def _summarize_text(
+    target: Any,
+    text: str,
+    progress: Any,
+) -> dict[str, Any]:
+    """Run the summarizer for *text* using the configured LLM provider."""
+    app = _app_of(target)
+    settings = app.state.settings
+    provider = _provider(app, settings)
+    summarizer = Summarizer(provider)
+    glossary = getattr(app.state, "llm_glossary", None)
+    if not isinstance(glossary, Glossary):
+        glossary = Glossary.from_dicts([])
+    return summarizer.summarize(glossary.apply(text), progress=progress)
+
+
+def make_summary_runner(app: Any) -> Any:
+    """Build the callback used by the job manager for automatic summaries."""
+
+    def runner(job_id: str, progress: Any) -> dict[str, Any]:
+        manager: JobManager = app.state.jobs
+        job = manager.get(job_id)
+        if job is None or not job.text.strip():
+            raise ValueError("Транскрипт пуст.")
+        return _summarize_text(app, job.text, progress)
+
+    return runner
 
 
 @router.get("/providers")
@@ -119,7 +154,6 @@ def list_providers(request: Request) -> dict[str, Any]:
     return {"active": kind, "health": health}
 
 
-
 @router.post("/summarize/{job_id}")
 def summarize_job(request: Request, job_id: str) -> dict[str, Any]:
     """Produce structured summary for a finished transcription job."""
@@ -132,16 +166,12 @@ def summarize_job(request: Request, job_id: str) -> dict[str, Any]:
     if not job.text:
         raise HTTPException(status_code=409, detail="Транскрипт пуст.")
 
-    settings = request.app.state.settings
     manager.begin_summary(job_id)
     try:
-        provider = _provider(request, settings)
-        summarizer = Summarizer(provider)
-        glossary = Glossary.from_dicts([])  # TODO: load persisted glossary
-        text = glossary.apply(job.text)
-        summary = summarizer.summarize(
-            text,
-            progress=lambda value, phase: manager.update_summary(job_id, value, phase),
+        summary = _summarize_text(
+            request,
+            job.text,
+            lambda value, phase: manager.update_summary(job_id, value, phase),
         )
         manager.finish_summary(job_id, summary)
         return {"job_id": job_id, "summary": summary}

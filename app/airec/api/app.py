@@ -85,7 +85,11 @@ def create_app(
     app.state.pid = os.getpid()
     app.state.port = port
     app.state.started_at = time.time()
-    app.state.jobs = JobManager(paths, lambda: app.state.settings)
+    app.state.jobs = JobManager(
+        paths,
+        lambda: app.state.settings,
+        summary_runner=llm_api.make_summary_runner(app),
+    )
     app.state.models = ModelManager(paths.models)
 
     app.add_middleware(TokenAuthMiddleware, token=token, enabled=auth_enabled)

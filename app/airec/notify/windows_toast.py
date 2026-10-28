@@ -8,6 +8,7 @@ registered by :mod:`airec.integrations.windows`.
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import subprocess
@@ -23,7 +24,7 @@ _SCRIPT = rf"""
 $ErrorActionPreference = 'Stop'
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] | Out-Null
-$xmlText = [Console]::In.ReadToEnd()
+$xmlText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{{XML_BASE64}}'))
 $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
 $xml.LoadXml($xmlText)
 $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
@@ -56,6 +57,8 @@ def show_job_toast(job_id: str, filename: str, *, error: bool = False) -> bool:
     if os.name != "nt":
         return False
     xml = _toast_xml(job_id, filename, error=error)
+    encoded = base64.b64encode(xml.encode("utf-8")).decode("ascii")
+    script = _SCRIPT.replace("{XML_BASE64}", encoded)
     try:
         completed = subprocess.run(
             [
@@ -65,9 +68,8 @@ def show_job_toast(job_id: str, filename: str, *, error: bool = False) -> bool:
                 "-ExecutionPolicy",
                 "Bypass",
                 "-Command",
-                _SCRIPT,
+                script,
             ],
-            input=xml.encode("utf-8"),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             timeout=15,
