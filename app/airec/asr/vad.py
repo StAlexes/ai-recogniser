@@ -56,6 +56,10 @@ class SpeechSegment:
     """Segment recognized text."""
     speaker: str | None = None
     """Optional speaker label (e.g. «Спикер 1») after diarization."""
+    token_times: tuple[float, ...] | None = None
+    """Absolute token start times, seconds (recognition only, not persisted)."""
+    tokens: tuple[str, ...] | None = None
+    """Token texts aligned with :attr:`token_times` (recognition only)."""
 
     def as_dict(self) -> dict[str, float | str | None]:
         return {
@@ -124,11 +128,15 @@ def segment_and_recognize(
     speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS,
     threshold: float = DEFAULT_THRESHOLD,
 ) -> Iterator[SpeechSegment]:
-    """Yield recognised speech regions of *wav_path*.
+    """Yield recognised speech regions of *wav_path* with token timestamps.
 
     ``onnx-asr`` reads the WAV, runs Silero VAD and recognises each segment in
     small batches.  Segments are capped at ``max_segment_s`` and split at pauses
     of at least ``min_silence_ms``.  Empty segments are skipped.
+
+    Token timestamps are relative to the segment start (onnx-asr behaviour),
+    so they are shifted to absolute time here: diarization uses them to cut a
+    VAD segment at speaker turns.
     """
     vad = load_vad(cpu_threads)
     adapter = model.with_vad(
@@ -139,16 +147,30 @@ def segment_and_recognize(
         min_silence_duration_ms=min_silence_ms,
         speech_pad_ms=speech_pad_ms,
         batch_size=DEFAULT_BATCH_SIZE,
-    )
+    ).with_timestamps()
 
     for result in adapter.recognize(str(wav_path), channel="mean"):
         text = (getattr(result, "text", "") or "").strip()
         if not text:
             continue
+        start = float(result.start)
+        timestamps = getattr(result, "timestamps", None)
+        tokens = getattr(result, "tokens", None)
+        # onnx-asr returns token times relative to the segment start.
+        abs_times = (
+            [start + float(value) for value in timestamps]
+            if timestamps and tokens and len(timestamps) == len(tokens)
+            else None
+        )
+        if abs_times is None or not abs_times:
+            yield SpeechSegment(start_s=start, end_s=float(result.end), text=text)
+            continue
         yield SpeechSegment(
-            start_s=float(result.start),
+            start_s=start,
             end_s=float(result.end),
             text=text,
+            token_times=tuple(abs_times),
+            tokens=tuple(tokens),
         )
 
 

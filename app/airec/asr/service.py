@@ -287,8 +287,20 @@ def transcribe(
             )
         else:
             recognition_progress(0.4, "Распознавание")
+            tokens: list[str] = []
+            times: list[float] = []
             try:
-                text = model.recognize(str(wav_path), channel="mean")
+                if diarize_enabled:
+                    # Keep token timestamps: the whole-file segment may span
+                    # several speakers and is cut at the turns afterwards.
+                    timed = model.with_timestamps().recognize(
+                        str(wav_path), channel="mean"
+                    )
+                    text = timed.text
+                    tokens = list(timed.tokens or [])
+                    times = [float(value) for value in (timed.timestamps or [])]
+                else:
+                    text = model.recognize(str(wav_path), channel="mean")
             except AudioError:
                 raise
             except Exception as exc:
@@ -298,7 +310,18 @@ def transcribe(
                 raise AsrError("Модель вернула неожиданный результат.")
             text = text.strip()
             if text:
-                segments = (SpeechSegment(0.0, duration or 0.0, text),)
+                if diarize_enabled and tokens and len(tokens) == len(times):
+                    segments = (
+                        SpeechSegment(
+                            0.0,
+                            duration or 0.0,
+                            text,
+                            token_times=tuple(times),
+                            tokens=tuple(tokens),
+                        ),
+                    )
+                else:
+                    segments = (SpeechSegment(0.0, duration or 0.0, text),)
 
         # Диаризация: кластеризация сегментов по спикерам (Wespeaker embeddings).
         if diarize_enabled and segments:
@@ -306,7 +329,15 @@ def transcribe(
             stage_notify("diarization", 0.08, "Загрузка модели спикеров")
             try:
                 audio = read_pcm16_mono(wav_path, sample_rate=SAMPLE_RATE)
-                segment_dicts = [s.as_dict() for s in segments]
+                # as_dict() omits token data (it is not persisted), but
+                # diarization needs it to split segments at speaker turns.
+                segment_dicts = []
+                for item in segments:
+                    item_dict = item.as_dict()
+                    if item.token_times and item.tokens:
+                        item_dict["token_times"] = list(item.token_times)
+                        item_dict["tokens"] = list(item.tokens)
+                    segment_dicts.append(item_dict)
                 repo_id, model_path = _resolve_diarization(
                     diarize_model, diarize_model_path, models_dir
                 )
@@ -322,7 +353,12 @@ def transcribe(
                 )
                 segments = tuple(
                     SpeechSegment(
-                        s["start_s"], s["end_s"], s["text"], speaker=s.get("speaker")
+                        s["start_s"],
+                        s["end_s"],
+                        s["text"],
+                        speaker=s.get("speaker"),
+                        token_times=s.get("token_times"),
+                        tokens=s.get("tokens"),
                     )
                     for s in diarized
                 )
@@ -340,6 +376,12 @@ def transcribe(
         rtf = duration / elapsed if duration and duration > 0 else None
         recognition_progress(0.92, "Сохранение результата")
         stage_notify("recognition", 1.0, "Готово")
+        # token_times/tokens are internal: they exist only so diarization can
+        # split segments at speaker turns and are not part of the result.
+        segments = tuple(
+            SpeechSegment(s.start_s, s.end_s, s.text, speaker=s.speaker)
+            for s in segments
+        )
         return TranscriptionResult(
             text=text.strip(),
             model_id=model_id,

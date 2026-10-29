@@ -131,6 +131,66 @@ def test_diarize_with_pyannote(monkeypatch) -> None:
     assert [segment["speaker"] for segment in result] == ["Спикер 1", "Спикер 2"]
 
 
+def test_pyannote_splits_segment_at_speaker_turn(monkeypatch) -> None:
+    """A VAD segment spanning two speakers is cut, with its text split too."""
+    monkeypatch.setattr(
+        diarization, "load_pyannote", lambda *_args, **_kwargs: FakePyannoteSession()
+    )
+
+    sample_rate = 16_000
+    audio = np.zeros(6 * sample_rate, dtype=np.float32)
+    # Speaker A speaks 0-3 s (region «Спикер 1»), B after 3 s («Спикер 2»);
+    # VAD returned one segment over the whole file.  Tokens mimic the real
+    # GigaAM vocabulary: spaces are standalone " " or leading-space tokens
+    # like " как" — there are no bare word-space tokens.
+    tokens = ["привет", " ", "друг", " как", " дела"]
+    times = [0.5, 1.0, 1.5, 3.5, 4.2]
+    segments = [
+        {
+            "start_s": 0.5,
+            "end_s": 5.0,
+            "text": "привет друг как дела",
+            "token_times": times,
+            "tokens": tokens,
+        }
+    ]
+
+    result = diarization.diarize_segments(
+        segments, audio, sample_rate, repo_id="onnx-community/pyannote-segmentation-3.0"
+    )
+
+    assert len(result) == 2
+    first, second = result
+    assert first["speaker"] == "Спикер 1"
+    assert first["start_s"] == 0.5
+    assert first["text"] == "привет друг"
+    assert second["speaker"] == "Спикер 2"
+    assert second["start_s"] == 3.5
+    assert second["end_s"] == 5.0
+    assert second["text"] == "как дела"
+    # Internal token fields must not leak into the result.
+    assert "token_times" not in first and "tokens" not in first
+    assert "token_times" not in second and "tokens" not in second
+
+
+def test_pyannote_keeps_segment_without_tokens(monkeypatch) -> None:
+    monkeypatch.setattr(
+        diarization, "load_pyannote", lambda *_args, **_kwargs: FakePyannoteSession()
+    )
+
+    sample_rate = 16_000
+    audio = np.zeros(6 * sample_rate, dtype=np.float32)
+    segments = [{"start_s": 0.5, "end_s": 5.0, "text": "целиком"}]
+
+    result = diarization.diarize_segments(
+        segments, audio, sample_rate, repo_id="onnx-community/pyannote-segmentation-3.0"
+    )
+
+    assert len(result) == 1
+    assert result[0]["speaker"] == "Спикер 1"
+    assert result[0]["text"] == "целиком"
+
+
 def test_manifest_includes_pyannote() -> None:
     manifest = load_manifest(manifest_dir())
     entry = find_model(manifest, "pyannote-segmentation-3.0")

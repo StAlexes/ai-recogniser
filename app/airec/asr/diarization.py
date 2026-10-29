@@ -24,7 +24,9 @@ without a speaker label, but recognition keeps working.
 from __future__ import annotations
 
 import logging
+import re
 import threading
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -463,6 +465,14 @@ def _diarize_with_pyannote(
             segment["speaker"] = "Спикер 1"
         return segments
 
+    # A VAD segment may contain several speakers: Silero only splits at real
+    # pauses, and a speaker change is often seamless.  Segments with token
+    # timestamps are cut at speaker turns; each piece keeps the tokens that
+    # fall inside its own time range, so the text is split correctly too.
+    segments = _split_at_speaker_turns(segments, regions)
+    if len(segments) > 1:
+        log.info("speaker turns: %d segments after split", len(segments))
+
     # Longest overlap wins; ties prefer the earlier region.
     total = max(len(segments), 1)
     for position, segment in enumerate(segments):
@@ -484,6 +494,191 @@ def _diarize_with_pyannote(
                 f"Разметка сегментов: {position + 1} из {len(segments)}",
             )
     return segments
+
+
+# A turn shorter than this is not split off: too short pieces are useless and
+# usually mean a token-time jitter right at the boundary.
+MIN_TURN_S = 0.6
+
+# Same decoding rule as onnx-asr's ``DECODE_SPACE_PATTERN``: a token that is a
+# lone space is dropped, spaces attached to a word boundary are kept as one.
+_DECODE_SPACE_PATTERN = re.compile(r"\A\s|\s\B|(\s)\b")
+
+
+def _decode_tokens(tokens: list[str]) -> str:
+    return _DECODE_SPACE_PATTERN.sub(
+        lambda match: " " if match.group(1) else "", "".join(tokens)
+    ).strip()
+
+
+def _token_midpoint(times: list[float], index: int, end_time: float) -> float:
+    """Midpoint time of token *index* (tokens carry their start time)."""
+    start = times[index]
+    end = times[index + 1] if index + 1 < len(times) else end_time
+    return (max(start, 0.0) + max(end, start)) / 2.0
+
+
+def _token_starts_word(index: int, tokens: list[str]) -> bool:
+    """True when token *index* begins a new word in the GigaAM stream.
+
+    The vocabulary has no word-space tokens: a space is either a standalone
+    ``" "`` token or a leading-space token like ``" как"``.  Letters and
+    punctuation continue the current word.
+    """
+    token = tokens[index]
+    if token == " ":
+        # A standalone space opens the next word (if there is one).
+        return index + 1 < len(tokens) and tokens[index + 1] != " "
+    return token.startswith(" ")
+
+
+def _split_at_speaker_turns(
+    segments: list[dict[str, Any]],
+    regions: list[tuple[str, float, float]],
+) -> list[dict[str, Any]]:
+    """Cut segments that span several speakers into per-speaker pieces.
+
+    A segment is only split when it carries token timestamps (from the
+    recognition stage).  Tokens are grouped into words, each word votes with
+    the speaker of its middle tokens, single-word flips are smoothed away and
+    micro-runs under :data:`MIN_TURN_S` fold into the previous piece — so one
+    token straddling the boundary can neither tear a word apart nor spawn a
+    useless fragment.  Every remaining change of speaker starts a new piece
+    with its own decoded text.  Segments without tokens are unchanged.
+    """
+    if not regions:
+        return segments
+
+    result: list[dict[str, Any]] = []
+    for segment in segments:
+        times = segment.get("token_times")
+        tokens = segment.get("tokens")
+        if not times or not tokens or len(times) != len(tokens):
+            result.append(segment)
+            continue
+
+        times = list(times)
+        tokens = list(tokens)
+        start = float(segment.get("start_s", 0.0))
+        end = max(float(segment.get("end_s", start)), start)
+
+        def label_at(moment: float, default: str) -> str:
+            # Point-in-region check: a moment inside a region belongs to that
+            # speaker; tokens in a gap between regions stay unlabelled.
+            for label, region_start, region_end in regions:
+                if region_start <= moment < region_end:
+                    return label
+            return default
+
+        # One vote per token ("" = no region covers it), grouped into words.
+        labels = [
+            label_at(_token_midpoint(times, index, end), "")
+            for index in range(len(tokens))
+        ]
+        words: list[list[int]] = []
+        for index in range(len(tokens)):
+            if index == 0 or _token_starts_word(index, tokens):
+                words.append([index])
+            else:
+                words[-1].append(index)
+
+        word_labels: list[str] = []
+        for word in words:
+            counted = Counter(
+                label for label in (labels[index] for index in word) if label
+            )
+            best = counted.most_common(1)
+            word_labels.append(best[0][0] if best else "")
+
+        if not any(word_labels):
+            # No region covers this segment at all.
+            result.append(segment)
+            continue
+
+        # Words outside every region keep the surrounding speaker.
+        first_label = next(label for label in word_labels if label)
+        previous = ""
+        for position, label in enumerate(word_labels):
+            if not label:
+                word_labels[position] = previous or first_label
+            else:
+                previous = label
+
+        # Smooth single-word flips (label jitter right at the boundary).
+        for position, label in enumerate(word_labels):
+            if (
+                0 < position < len(word_labels) - 1
+                and word_labels[position - 1] == word_labels[position + 1]
+                and word_labels[position - 1] != label
+            ):
+                word_labels[position] = word_labels[position - 1]
+
+        # Runs of consecutive words with the same speaker; short runs fold
+        # into the previous piece and repeated labels merge back together.
+        runs: list[list[int]] = []
+        for position, label in enumerate(word_labels):
+            if runs and word_labels[runs[-1][0]] == label:
+                runs[-1].append(position)
+            else:
+                runs.append([position])
+        stable_runs: list[list[int]] = []
+        for position, run in enumerate(runs):
+            run_start = times[words[run[0]][0]]
+            run_end = (
+                times[words[runs[position + 1][0]][0]]
+                if position + 1 < len(runs)
+                else end
+            )
+            short = run_end - run_start < MIN_TURN_S
+            same = (
+                bool(stable_runs)
+                and word_labels[stable_runs[-1][0]] == word_labels[run[0]]
+            )
+            if stable_runs and (short or same):
+                stable_runs[-1].extend(run)
+            else:
+                stable_runs.append(list(run))
+
+        pieces: list[dict[str, Any]] = []
+        piece_start = start
+        for run_position, run in enumerate(stable_runs):
+            is_last = run_position + 1 == len(stable_runs)
+            if is_last:
+                piece_end = end
+            else:
+                next_first = words[stable_runs[run_position + 1][0]][0]
+                piece_end = max(_token_midpoint(times, next_first, end), piece_start)
+            piece_tokens = [
+                tokens[index] for word_position in run for index in words[word_position]
+            ]
+            pieces.append(
+                {
+                    **segment,
+                    "start_s": piece_start,
+                    "end_s": piece_end,
+                    "speaker": word_labels[run[0]],
+                    "text": _decode_tokens(piece_tokens),
+                }
+            )
+            if not is_last:
+                piece_start = times[next_first]
+
+        if len(pieces) == 1:
+            # One speaker in this segment: keep the original bounds and text.
+            pieces[0]["start_s"] = start
+            pieces[0]["end_s"] = end
+            pieces[0]["text"] = (
+                str(segment.get("text") or "").strip() or pieces[0]["text"]
+            )
+        else:
+            for piece in pieces:
+                piece["text"] = piece["text"].strip() or "…"
+        for piece in pieces:
+            # Token data has done its job and must not leak further.
+            piece.pop("token_times", None)
+            piece.pop("tokens", None)
+        result.extend(pieces)
+    return result
 
 
 def _diarize_with_embeddings(
