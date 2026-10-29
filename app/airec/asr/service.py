@@ -290,17 +290,15 @@ def transcribe(
             tokens: list[str] = []
             times: list[float] = []
             try:
-                if diarize_enabled:
-                    # Keep token timestamps: the whole-file segment may span
-                    # several speakers and is cut at the turns afterwards.
-                    timed = model.with_timestamps().recognize(
-                        str(wav_path), channel="mean"
-                    )
-                    text = timed.text
-                    tokens = list(timed.tokens or [])
-                    times = [float(value) for value in (timed.timestamps or [])]
-                else:
-                    text = model.recognize(str(wav_path), channel="mean")
+                # Keep token timestamps: the whole-file segment may span
+                # several speakers, and the (independent) diarization stage
+                # cuts it at the turns afterwards.
+                timed = model.with_timestamps().recognize(
+                    str(wav_path), channel="mean"
+                )
+                text = timed.text
+                tokens = list(timed.tokens or [])
+                times = [float(value) for value in (timed.timestamps or [])]
             except AudioError:
                 raise
             except Exception as exc:
@@ -310,7 +308,7 @@ def transcribe(
                 raise AsrError("Модель вернула неожиданный результат.")
             text = text.strip()
             if text:
-                if diarize_enabled and tokens and len(tokens) == len(times):
+                if tokens and len(tokens) == len(times):
                     segments = (
                         SpeechSegment(
                             0.0,
@@ -376,12 +374,10 @@ def transcribe(
         rtf = duration / elapsed if duration and duration > 0 else None
         recognition_progress(0.92, "Сохранение результата")
         stage_notify("recognition", 1.0, "Готово")
-        # token_times/tokens are internal: they exist only so diarization can
-        # split segments at speaker turns and are not part of the result.
-        segments = tuple(
-            SpeechSegment(s.start_s, s.end_s, s.text, speaker=s.speaker)
-            for s in segments
-        )
+        # token_times/tokens stay on the segments: they are an internal
+        # channel to the independent diarization stage (which cuts segments
+        # at speaker turns) and are stripped from API responses by the
+        # manager's detail().
         return TranscriptionResult(
             text=text.strip(),
             model_id=model_id,

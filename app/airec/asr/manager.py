@@ -174,6 +174,12 @@ class Job:
 
     def detail(self) -> dict[str, Any]:
         data = asdict(self)
+        # Token timestamps are an internal channel between the recognition
+        # and diarization stages; they must not leak into API responses.
+        data["segments"] = [
+            {key: value for key, value in segment.items() if key not in ("token_times", "tokens")}
+            for segment in self.segments
+        ]
         data["result_url"] = (
             f"/api/v1/jobs/{self.id}/result" if self.status == "done" else None
         )
