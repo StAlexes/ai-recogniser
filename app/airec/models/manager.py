@@ -102,6 +102,7 @@ class ModelManager:
         url: str,
         *,
         sha256: str | None = None,
+        size_bytes: int | None = None,
         filename: str | None = None,
         extra_files: list[dict[str, str]] | None = None,
         progress: Callable[[float, str], None] | None = None,
@@ -128,6 +129,7 @@ class ModelManager:
                     model_id,
                     url,
                     sha256,
+                    size_bytes,
                     filename,
                     extra_files or [],
                     progress,
@@ -143,6 +145,7 @@ class ModelManager:
         model_id: str,
         url: str,
         sha256: str | None,
+        size_bytes: int | None,
         filename: str | None,
         extra_files: list[dict[str, str]],
         progress: Callable[[float, str], None] | None,
@@ -196,6 +199,11 @@ class ModelManager:
                 else report
             )
             self._perform_download(url, tmp_file, main_notify)
+            if size_bytes and tmp_file.stat().st_size != size_bytes:
+                raise ModelError(
+                    "размер модели не совпадает: "
+                    f"ожидалось {size_bytes}, получено {tmp_file.stat().st_size}"
+                )
             if sha256:
                 report(0.95, "Проверка контрольной суммы")
                 actual = self._sha256(tmp_file, report)

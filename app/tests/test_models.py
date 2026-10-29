@@ -126,6 +126,38 @@ def test_download_keeps_manifest_filename(tmp_path: Path) -> None:
     assert manager.is_installed("wespeaker-voxceleb-resnet34")
 
 
+def test_download_rejects_wrong_size(tmp_path: Path) -> None:
+    payload = b"truncated"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=payload,
+            headers={"content-length": str(len(payload))},
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    manager = ModelManager(tmp_path, client=client)
+    manager.download(
+        "qwen",
+        "https://example.test/model.gguf",
+        filename="model.gguf",
+        size_bytes=len(payload) + 1,
+    )
+
+    status = None
+    for _ in range(300):
+        status = manager.download_status("qwen")
+        if status is not None and status.get("status") in {"done", "error"}:
+            break
+        time.sleep(0.01)
+
+    assert status is not None
+    assert status["status"] == "error"
+    assert "размер" in str(status.get("phase", ""))
+    assert not (tmp_path / "qwen" / "model.gguf").exists()
+
+
 def test_partial_download_is_not_installed(tmp_path: Path) -> None:
     directory = tmp_path / "half"
     directory.mkdir()

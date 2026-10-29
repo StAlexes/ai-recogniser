@@ -166,6 +166,7 @@ async def download_model_by_id(
 
     entry = find_model(manifest, model_id)
     filename: str | None = None
+    size_bytes: int | None = None
     extra_files: list[dict[str, str]] = []
     if entry is None:
         try:
@@ -178,12 +179,15 @@ async def download_model_by_id(
         url = body.get("url")
         sha256 = body.get("sha256")
         filename = body.get("filename")
+        raw_size = body.get("size_bytes")
+        size_bytes = int(raw_size) if raw_size else None
         if not url:
             raise HTTPException(status_code=400, detail="требуется поле url")
     else:
         url = entry.get("url", "")
         sha256 = entry.get("sha256") or None
         filename = entry.get("filename")
+        size_bytes = int(entry.get("size_bytes") or 0) or None
         extra_files = entry.get("extra_files") or []
         if not url:
             raise HTTPException(status_code=400, detail="модель без URL скачивания")
@@ -246,6 +250,7 @@ async def download_model_by_id(
                 model_id,
                 url,
                 sha256=sha256,
+                size_bytes=size_bytes,
                 filename=filename,
                 extra_files=extra_files,
                 progress=progress,
