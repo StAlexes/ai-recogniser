@@ -3,14 +3,14 @@
 All formats except WAV are decoded by ffmpeg into the canonical 16 kHz mono
 PCM16 WAV that onnx-asr expects.  ffmpeg is optional at import time: a missing
 binary becomes a clear per-job error instead of preventing the core from
-starting.
+starting.  The LGPL ffmpeg runtime is fetched on demand by
+:mod:`airec.asr.ffmpeg_runtime`.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import shutil
 import subprocess
 import wave
 from pathlib import Path
@@ -38,30 +38,6 @@ CREATE_NO_WINDOW = 0x08000000
 
 class AudioError(RuntimeError):
     """The input cannot be converted into a readable WAV file."""
-
-
-def find_ffmpeg(bin_dir: Path | None = None) -> str | None:
-    """Locate ffmpeg in the app's bin directory, PATH, or imageio-ffmpeg."""
-    candidates: list[Path] = []
-    if bin_dir is not None:
-        candidates.extend([bin_dir / "ffmpeg.exe", bin_dir / "ffmpeg"])
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
-
-    on_path = shutil.which("ffmpeg")
-    if on_path:
-        return on_path
-
-    try:
-        import imageio_ffmpeg
-
-        bundled = Path(imageio_ffmpeg.get_ffmpeg_exe())
-        if bundled.is_file():
-            return str(bundled)
-    except (ImportError, OSError, RuntimeError):
-        log.warning("imageio-ffmpeg is not available; only PCM WAV input will work")
-    return None
 
 
 def _run_ffmpeg(command: list[str]) -> None:
@@ -118,7 +94,8 @@ def prepare_wav(
 
     if ffmpeg is None:
         raise AudioError(
-            "Для mp3/mp4/flac/ogg нужен ffmpeg. Переустановите приложение "
+            "Для mp3/mp4/flac/ogg нужен ffmpeg. Приложение скачивает его "
+            "автоматически при первом таком файле; проверьте подключение к сети "
             "или положите ffmpeg.exe в папку bin рядом с программой."
         )
 

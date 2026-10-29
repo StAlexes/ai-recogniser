@@ -26,7 +26,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from airec.asr.audio import SUPPORTED_EXTENSIONS, find_ffmpeg
+from airec.asr import ffmpeg_runtime
+from airec.asr.audio import SUPPORTED_EXTENSIONS, AudioError
 from airec.asr.diarization import DiarizationCancelled, DiarizationError
 from airec.asr.export import (
     EXPORT_CONTENT_TYPES,
@@ -212,13 +213,53 @@ class JobManager:
         self._summary_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="airec-summary"
         )
-        self._ffmpeg = find_ffmpeg(paths.bin)
+        self._ffmpeg = ffmpeg_runtime.find_ffmpeg(paths)
+        self._ffmpeg_lock = threading.Lock()
         self._db = Database(paths.data / "airec_jobs.sqlite")
         self._load_existing()
 
     def set_summary_runner(self, runner: SummaryRunner | None) -> None:
         """Attach the LLM-backed summary implementation after app startup."""
         self._summary_runner = runner
+
+    def _resolve_ffmpeg(
+        self,
+        source: Path,
+        *,
+        progress: Callable[[float, str], None] | None = None,
+        cancel: Callable[[], None] | None = None,
+    ) -> str | None:
+        """Return an ffmpeg path, downloading the LGPL runtime on first use.
+
+        PCM WAV input never needs ffmpeg (onnx-asr resamples it itself), so the
+        runtime is only fetched when a compressed/video file is queued.  The
+        download is verified (size + SHA-256) and unpacked into the data dir.
+        """
+        cached = self._ffmpeg
+        if cached and Path(cached).is_file():
+            return cached
+        found = ffmpeg_runtime.find_ffmpeg(self._paths)
+        if found is not None:
+            self._ffmpeg = str(found)
+            return self._ffmpeg
+        if source.suffix.lower() == ".wav":
+            return None
+        with self._ffmpeg_lock:
+            found = ffmpeg_runtime.find_ffmpeg(self._paths)
+            if found is None:
+                log.info("ffmpeg not found; downloading the LGPL runtime")
+                try:
+                    found = ffmpeg_runtime.ensure_ffmpeg(
+                        self._paths, progress=progress, cancel=cancel
+                    )
+                except Exception as exc:
+                    log.exception("cannot install ffmpeg runtime")
+                    raise AudioError(
+                        "Не удалось скачать FFmpeg для чтения mp3/mp4/flac/ogg. "
+                        "Проверьте подключение к сети или положите ffmpeg.exe в папку bin."
+                    ) from exc
+            self._ffmpeg = str(found)
+            return self._ffmpeg
 
     @property
     def results_dir(self) -> Path:
@@ -774,11 +815,12 @@ class JobManager:
             )
 
         try:
+            ffmpeg = self._resolve_ffmpeg(source, progress=progress, cancel=check_cancel)
             result = self._transcriber(
                 source,
                 model_id=job.model,
                 cpu_threads=settings.cpu_threads,
-                ffmpeg=self._ffmpeg,
+                ffmpeg=ffmpeg,
                 work_dir=work_dir,
                 progress=progress,
                 stage_progress=stage_progress,
@@ -926,7 +968,11 @@ class JobManager:
             log.info("job %s stopped after cancellation", job_id)
             self._cleanup_source(work_dir)
         except Exception as exc:  # worker boundary: never let a job kill the queue
-            message = str(exc) if isinstance(exc, AsrError) else f"Ошибка обработки: {exc}"
+            message = (
+                str(exc)
+                if isinstance(exc, (AsrError, AudioError))
+                else f"Ошибка обработки: {exc}"
+            )
             log.exception("job %s failed: %s", job_id, exc)
             stale = False
             with self._lock:
@@ -1358,7 +1404,7 @@ class JobManager:
                 source,
                 list(job.segments),
                 cpu_threads=settings.cpu_threads,
-                ffmpeg=self._ffmpeg,
+                ffmpeg=self._resolve_ffmpeg(source, cancel=check_cancel),
                 work_dir=work_dir,
                 stage_progress=lambda _stage, value, phase: progress(value, phase),
                 cancel=check_cancel,

@@ -47,8 +47,9 @@ hiddenimports = [
 
 # pywebview ships WebView2 .NET assemblies and helper DLLs; pythonnet/clr_loader
 # load them dynamically, so PyInstaller cannot discover them by static imports.
-# The ASR stack is also dynamic: onnx-asr imports onnxruntime at runtime, and
-# imageio-ffmpeg contains the ffmpeg executable as package data.
+# The ASR stack is also dynamic: onnx-asr imports onnxruntime at runtime.
+# FFmpeg is NOT bundled: the LGPL build is downloaded on demand (see
+# airec.asr.ffmpeg_runtime), so no GPL binary ends up in the distribution.
 for package in (
     "webview",
     "clr_loader",
@@ -56,7 +57,6 @@ for package in (
     "pystray",
     "onnx_asr",
     "onnxruntime",
-    "imageio_ffmpeg",
     "multipart",
     "python_multipart",
 ):
@@ -77,7 +77,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter", "pytest", "setuptools", "pip"],
+    excludes=["tkinter", "pytest", "setuptools", "pip", "imageio_ffmpeg"],
     noarchive=False,
     optimize=0,
 )

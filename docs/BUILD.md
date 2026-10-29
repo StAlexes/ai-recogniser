@@ -10,7 +10,7 @@
 dist\
   AI Recogniser <версия>\
     AI Recogniser.exe    # оболочка + точка входа ядра, без консоли
-    _internal\           # CPython, библиотеки, UI, иконки, ASR, ffmpeg, .NET-сборки WebView2
+    _internal\           # CPython, библиотеки, UI, иконки, ASR, .NET-сборки WebView2
     version.json         # версия, дата сборки, git-коммит и статус дерева
 ```
 
@@ -78,10 +78,12 @@ PyInstaller — только сборочная зависимость (extra `b
 | `onnxruntime\` | пакет onnxruntime | CPU-инференс ASR (`onnxruntime.dll` ~18.4 МБ) |
 | `onnx_asr\` | пакет onnx-asr | загрузка/запуск GigaAM |
 | `numpy\`, `yaml\`, `huggingface_hub\` | зависимости ASR | массивы, конфиг, загрузка модели |
-| `imageio_ffmpeg\binaries\ffmpeg-*.exe` | imageio-ffmpeg | извлечение аудио из видео и конвертация (ffmpeg ~83.6 МБ) |
 | `multipart\`, `python_multipart\` | python-multipart | приём загруженных файлов |
 
-Спецификация использует `collect_all` для `onnx_asr`, `onnxruntime`, `imageio_ffmpeg` и
+FFmpeg в поставку не входит: LGPL-сборка скачивается по требованию в папку данных
+(`data\runtime\ffmpeg\`) при первом не-WAV файле и проверяется по размеру и SHA-256.
+
+Спецификация использует `collect_all` для `onnx_asr`, `onnxruntime` и
 `python-multipart`, потому что часть импортов и бинарников создаётся динамически и не видна
 статическому анализатору PyInstaller. Предупреждение `onnxruntime.quantization requires onnx`
 безвредно: квантование приложению не нужно, ASR-модель уже в int8.
