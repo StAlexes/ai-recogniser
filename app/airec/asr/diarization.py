@@ -309,6 +309,11 @@ def _pyannote_speaker_regions(
                 f"Анализ спикеров: окно {index + 1} из {len(starts)}",
             )
 
+    # Rename raw speaker channels to consecutive labels in order of first
+    # appearance: the network may pick any of its three slots (e.g. classes
+    # 2 and 3 for two voices), but users expect «Спикер 1», «Спикер 2», ...
+    channel_labels: dict[int, str] = {}
+
     regions: list[tuple[str, float, float]] = []
     min_duration = int(min_duration_s * sample_rate)
     for spk in range(num_speakers):
@@ -319,6 +324,7 @@ def _pyannote_speaker_regions(
         mask = active & (averaged >= onset)
         if not mask.any():
             continue
+        label = channel_labels.setdefault(spk, f"Спикер {len(channel_labels) + 1}")
         edges = np.diff(mask.astype(np.int8))
         region_starts = np.flatnonzero(edges == 1) + 1
         region_ends = np.flatnonzero(edges == -1) + 1
@@ -329,7 +335,7 @@ def _pyannote_speaker_regions(
         for region_start, region_end in zip(region_starts, region_ends, strict=False):
             if region_end - region_start >= min_duration:
                 regions.append(
-                    (f"Спикер {spk + 1}", region_start / sample_rate, region_end / sample_rate)
+                    (label, region_start / sample_rate, region_end / sample_rate)
                 )
     regions.sort(key=lambda item: item[1])
     return regions

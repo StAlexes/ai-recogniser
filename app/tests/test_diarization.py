@@ -102,11 +102,13 @@ class FakePyannoteSession:
     """
 
     def run(self, _outputs: object, feeds: object) -> list[np.ndarray]:
-        # 20 frames per 10 s window → 0.5 s of audio per frame.
+        # 20 frames per 10 s window → 0.5 s of audio per frame.  The raw
+        # classes deliberately start at slot 2 (like the real model, which
+        # often ignores slot 1) — labels must still begin at «Спикер 1».
         frames = 20
         logits = np.full((1, frames, 7), -10.0, dtype=np.float32)
-        logits[:, :6, 1] = 0.0  # speaker 1: 0-3 s
-        logits[:, 6:, 2] = 0.0  # speaker 2: 3-10 s
+        logits[:, :6, 2] = 0.0  # speaker A: 0-3 s
+        logits[:, 6:, 3] = 0.0  # speaker B: 3-10 s
         return [logits]
 
 
