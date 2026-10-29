@@ -17,6 +17,7 @@ import hashlib
 import logging
 import os
 import shutil
+import time
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -42,6 +43,14 @@ DEFAULT_URL = (
 DEFAULT_SHA256 = "0448C3F3B9BDC724CC0189D5CE6E6BFA5B8937E7EC408E1E97FB08719BDB3B92"
 DEFAULT_SIZE_BYTES = 81_649_021
 
+# Download attempts: the first two honour the system proxy configuration (for
+# some users it is the only way out), the last one ignores it — a hanging or
+# half-broken local proxy must not look like "no network".
+DOWNLOAD_ATTEMPTS = 3
+RETRY_DELAYS_S = (2.0, 5.0)
+#: TLS handshake through a slow proxy chain can easily exceed 30 s.
+CONNECT_TIMEOUT_S = 60.0
+
 EXECUTABLE_NAMES = ("ffmpeg.exe", "ffmpeg")
 ProgressCallback = Callable[[float, str], None]
 CancelCallback = Callable[[], None]
@@ -50,6 +59,10 @@ CHUNK_BYTES = 1024 * 1024
 
 class FfmpegInstallError(RuntimeError):
     """FFmpeg download/install error."""
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class FfmpegCancelled(RuntimeError):
@@ -175,6 +188,96 @@ def install_ffmpeg_zip(zip_path: Path, paths: AppPaths) -> Path:
     return found
 
 
+def _stream_response(
+    response: httpx.Response,
+    target: Path,
+    *,
+    existing: int,
+    notify: ProgressCallback,
+    cancel: CancelCallback | None,
+) -> None:
+    """Write a (possibly resumed) streaming response to *target*."""
+    if response.status_code == 200 and existing:
+        existing = 0
+        target.unlink(missing_ok=True)
+    total_header = response.headers.get("content-length")
+    total = (
+        existing + int(total_header) if total_header and total_header.isdigit() else 0
+    )
+    downloaded = existing
+    mode = "ab" if existing and response.status_code == 206 else "wb"
+    with target.open(mode) as handle:
+        for chunk in response.iter_bytes(CHUNK_BYTES):
+            if cancel is not None:
+                cancel()
+            if not chunk:
+                continue
+            handle.write(chunk)
+            downloaded += len(chunk)
+            if total > 0:
+                notify(min(downloaded / total * 0.8, 0.8), "Скачивание FFmpeg")
+    notify(0.82, "Проверка FFmpeg")
+
+
+def _single_attempt(
+    url: str,
+    target: Path,
+    *,
+    trust_env: bool,
+    progress: ProgressCallback | None,
+    cancel: CancelCallback | None,
+) -> None:
+    """One download attempt; resumes a partial file via the Range header."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    existing = target.stat().st_size if target.is_file() else 0
+    headers = {"Range": f"bytes={existing}-"} if existing else {}
+    notify = progress or (lambda _value, _phase: None)
+    http = httpx.Client(
+        follow_redirects=True,
+        timeout=httpx.Timeout(120.0, connect=CONNECT_TIMEOUT_S),
+        trust_env=trust_env,
+    )
+    try:
+        with http.stream("GET", url, headers=headers) as response:
+            if response.status_code not in {200, 206}:
+                raise FfmpegInstallError(
+                    f"Не удалось скачать FFmpeg: HTTP {response.status_code}"
+                )
+            _stream_response(response, target, existing=existing, notify=notify, cancel=cancel)
+    except httpx.TimeoutException as exc:
+        raise FfmpegInstallError(f"Таймаут соединения: {exc}", retryable=True) from exc
+    except httpx.HTTPError as exc:
+        raise FfmpegInstallError(f"Ошибка сети: {exc}", retryable=True) from exc
+    finally:
+        http.close()
+
+
+def _download_via_client(
+    url: str,
+    target: Path,
+    *,
+    client: httpx.Client,
+    progress: ProgressCallback | None,
+    cancel: CancelCallback | None,
+) -> None:
+    """Download through a caller-provided client (tests, custom transports)."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    existing = target.stat().st_size if target.is_file() else 0
+    headers = {"Range": f"bytes={existing}-"} if existing else {}
+    notify = progress or (lambda _value, _phase: None)
+    try:
+        with client.stream("GET", url, headers=headers) as response:
+            if response.status_code not in {200, 206}:
+                raise FfmpegInstallError(
+                    f"Не удалось скачать FFmpeg: HTTP {response.status_code}"
+                )
+            _stream_response(response, target, existing=existing, notify=notify, cancel=cancel)
+    except httpx.TimeoutException as exc:
+        raise FfmpegInstallError(f"Таймаут соединения: {exc}", retryable=True) from exc
+    except httpx.HTTPError as exc:
+        raise FfmpegInstallError(f"Ошибка сети: {exc}", retryable=True) from exc
+
+
 def _download(
     url: str,
     target: Path,
@@ -183,49 +286,57 @@ def _download(
     client: httpx.Client | None = None,
     cancel: CancelCallback | None = None,
 ) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    existing = target.stat().st_size if target.is_file() else 0
-    headers = {"Range": f"bytes={existing}-"} if existing else {}
-    notify = progress or (lambda _value, _phase: None)
-    owned = client is None
-    http = client or httpx.Client(
-        follow_redirects=True,
-        timeout=httpx.Timeout(120.0, connect=30.0),
-    )
-    try:
-        with http.stream("GET", url, headers=headers) as response:
-            if response.status_code not in {200, 206}:
-                raise FfmpegInstallError(
-                    f"Не удалось скачать FFmpeg: HTTP {response.status_code}"
-                )
-            if response.status_code == 200 and existing:
-                existing = 0
-                target.unlink(missing_ok=True)
-            total_header = response.headers.get("content-length")
-            total = (
-                existing + int(total_header)
-                if total_header and total_header.isdigit()
-                else 0
+    """Download *url* to *target* with retries and a proxy fallback.
+
+    The first attempts use the system proxy configuration (``trust_env``):
+    for users behind a mandatory proxy that is the only route out.  If the
+    connection keeps failing — typically a TLS handshake that hangs inside a
+    local proxy client while the network itself is fine — the final attempt
+    bypasses the proxy settings entirely and connects directly.  A partial
+    download is resumed between attempts via the Range header.  Only transient
+    network errors (timeouts, broken connections) are retried; deterministic
+    ones (HTTP status) fail immediately.
+    """
+    if client is not None:
+        _download_via_client(
+            url, target, client=client, progress=progress, cancel=cancel
+        )
+        return
+
+    last_error: Exception | None = None
+    for attempt in range(DOWNLOAD_ATTEMPTS):
+        if cancel is not None:
+            cancel()
+        trust_env = attempt < DOWNLOAD_ATTEMPTS - 1
+        if attempt > 0:
+            delay = RETRY_DELAYS_S[min(attempt - 1, len(RETRY_DELAYS_S) - 1)]
+            log.warning(
+                "ffmpeg download attempt %d failed (%s); retrying in %.0f s %s",
+                attempt,
+                last_error,
+                delay,
+                "direct (no proxy)" if not trust_env else "",
             )
-            downloaded = existing
-            mode = "ab" if existing and response.status_code == 206 else "wb"
-            with target.open(mode) as handle:
-                for chunk in response.iter_bytes(CHUNK_BYTES):
-                    if cancel is not None:
-                        cancel()
-                    if not chunk:
-                        continue
-                    handle.write(chunk)
-                    downloaded += len(chunk)
-                    if total > 0:
-                        notify(
-                            min(downloaded / total * 0.8, 0.8),
-                            "Скачивание FFmpeg",
-                        )
-            notify(0.82, "Проверка FFmpeg")
-    finally:
-        if owned:
-            http.close()
+            time.sleep(delay)
+        try:
+            _single_attempt(
+                url,
+                target,
+                trust_env=trust_env,
+                progress=progress,
+                cancel=cancel,
+            )
+            return
+        except FfmpegCancelled:
+            raise
+        except FfmpegInstallError as exc:
+            # Deterministic failures (HTTP status) are not retried.
+            if not exc.retryable:
+                raise
+            last_error = exc
+    raise FfmpegInstallError(
+        f"Не удалось скачать FFmpeg после {DOWNLOAD_ATTEMPTS} попыток: {last_error}"
+    )
 
 
 def ensure_ffmpeg(

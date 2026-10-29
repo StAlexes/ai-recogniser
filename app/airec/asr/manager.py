@@ -261,7 +261,7 @@ class JobManager:
                 except Exception as exc:
                     log.exception("cannot install ffmpeg runtime")
                     raise AudioError(
-                        "Не удалось скачать FFmpeg для чтения mp3/mp4/flac/ogg. "
+                        f"Не удалось скачать FFmpeg для чтения mp3/mp4/flac/ogg: {exc}. "
                         "Проверьте подключение к сети или положите ffmpeg.exe в папку bin."
                     ) from exc
             self._ffmpeg = str(found)

@@ -200,3 +200,77 @@ def test_resolve_ffmpeg_downloads_for_compressed(
 
     assert resolved == str(installed)
     assert manager._ffmpeg == str(installed)
+
+
+def test_download_retries_then_falls_back_to_direct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hanging proxy must not look like "no network": retry, then go direct."""
+    _no_path_ffmpeg(monkeypatch)
+    paths = paths_for(tmp_path)
+    payload = ffmpeg_zip()
+    entry = {
+        "id": ffmpeg_runtime.FFMPEG_ID,
+        "url": "https://example.test/ffmpeg.zip",
+        "filename": "ffmpeg.zip",
+        "size_bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest().upper(),
+    }
+    monkeypatch.setattr(ffmpeg_runtime, "_runtime_entry", lambda: entry)
+    monkeypatch.setattr(ffmpeg_runtime.time, "sleep", lambda _s: None)
+
+    attempts: list[bool] = []
+
+    def fake_single_attempt(
+        url: str,
+        target: Path,
+        *,
+        trust_env: bool,
+        progress: object,
+        cancel: object,
+    ) -> None:
+        attempts.append(trust_env)
+        if len(attempts) < ffmpeg_runtime.DOWNLOAD_ATTEMPTS:
+            raise ffmpeg_runtime.FfmpegInstallError(
+                "Таймаут соединения: handshake", retryable=True
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+
+    monkeypatch.setattr(ffmpeg_runtime, "_single_attempt", fake_single_attempt)
+
+    found = ffmpeg_runtime.ensure_ffmpeg(paths)
+
+    assert found.name == "ffmpeg.exe"
+    # Two attempts through the system proxy, the last one bypassing it.
+    assert attempts == [True, True, False]
+
+
+def test_download_does_not_retry_http_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deterministic failures (HTTP 404) fail on the first attempt."""
+    _no_path_ffmpeg(monkeypatch)
+    paths = paths_for(tmp_path)
+    entry = {
+        "id": ffmpeg_runtime.FFMPEG_ID,
+        "url": "https://example.test/ffmpeg.zip",
+        "filename": "ffmpeg.zip",
+    }
+    monkeypatch.setattr(ffmpeg_runtime, "_runtime_entry", lambda: entry)
+    monkeypatch.setattr(ffmpeg_runtime.time, "sleep", lambda _s: None)
+
+    calls = 0
+
+    def fake_single_attempt(*_args: object, **_kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        raise ffmpeg_runtime.FfmpegInstallError("Не удалось скачать FFmpeg: HTTP 404")
+
+    monkeypatch.setattr(ffmpeg_runtime, "_single_attempt", fake_single_attempt)
+
+    with pytest.raises(ffmpeg_runtime.FfmpegInstallError) as exc_info:
+        ffmpeg_runtime.ensure_ffmpeg(paths)
+
+    assert calls == 1
+    assert "HTTP 404" in str(exc_info.value)
