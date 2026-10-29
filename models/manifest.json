@@ -137,10 +137,10 @@
     {
       "id": "silero-vad-v5-onnx",
       "kind": "vad",
-      "title": "Silero VAD v5 ONNX",
+      "title": "Silero VAD ONNX",
       "filename": "silero_vad.onnx",
       "url": "https://huggingface.co/istupakov/silero-vad-onnx/resolve/main/silero_vad.onnx",
-      "size_bytes": 2432648,
+      "size_bytes": 2327524,
       "sha256": "",
       "license": "MIT",
       "note": "Нарезка длинных аудио на речевые сегменты",
