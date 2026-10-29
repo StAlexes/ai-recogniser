@@ -17,7 +17,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # All Job dataclass fields that are persisted, in column order.
 JOB_COLUMNS = (
@@ -37,6 +37,9 @@ JOB_COLUMNS = (
     "size_bytes",
     "audio_format",
     "text",
+    "text_plain",
+    "text_speakers",
+    "summary_text",
     "error",
     "result_file",
     "source_path",
@@ -54,6 +57,11 @@ JOB_COLUMN_MIGRATIONS: dict[str, str] = {
     "segment_count": "INTEGER NOT NULL DEFAULT 0",
     "paused": "INTEGER NOT NULL DEFAULT 0",
     "stages": "TEXT",
+    # Saved text of each stage: plain transcript, transcript with speakers,
+    # rendered summary (see Job fields of the same names).
+    "text_plain": "TEXT",
+    "text_speakers": "TEXT",
+    "summary_text": "TEXT",
 }
 
 CREATE_JOBS_TABLE = """
@@ -74,6 +82,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     size_bytes INTEGER NOT NULL DEFAULT 0,
     audio_format TEXT NOT NULL DEFAULT '',
     text TEXT NOT NULL DEFAULT '',
+    text_plain TEXT,
+    text_speakers TEXT,
+    summary_text TEXT,
     error TEXT,
     result_file TEXT,
     source_path TEXT,
@@ -173,6 +184,9 @@ class Database:
                     size_bytes=excluded.size_bytes,
                     audio_format=excluded.audio_format,
                     text=excluded.text,
+                    text_plain=excluded.text_plain,
+                    text_speakers=excluded.text_speakers,
+                    summary_text=excluded.summary_text,
                     error=excluded.error,
                     result_file=excluded.result_file,
                     source_path=excluded.source_path,

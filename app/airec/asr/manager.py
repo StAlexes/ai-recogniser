@@ -34,6 +34,7 @@ from airec.asr.export import (
     EXPORT_DOWNLOAD_NAMES,
     EXPORT_EXTENSIONS,
     export_txt,
+    format_summary,
 )
 from airec.asr.service import (
     AsrError,
@@ -134,6 +135,12 @@ class Job:
     result_file: str | None = None
     source_path: str | None = None
     summary: dict[str, Any] | None = None
+    # Saved text of every finished stage, so the UI can switch between the
+    # plain transcript, the speaker-attributed one and the summary without
+    # rebuilding them from (already replaced) segments.
+    text_plain: str = ""
+    text_speakers: str = ""
+    summary_text: str = ""
     paused: bool = False
     stages: dict[str, dict[str, Any]] = field(default_factory=default_stages)
 
@@ -166,7 +173,9 @@ class Job:
 
     def as_dict_summary(self) -> dict[str, Any]:
         data = asdict(self)
-        data.pop("text", None)
+        # The queue list must stay light: no transcript texts, no segments.
+        for key in ("text", "text_plain", "text_speakers", "summary_text"):
+            data.pop(key, None)
         data.pop("result_file", None)
         data["segment_count"] = len(self.segments)
         data.pop("segments", None)
@@ -344,6 +353,18 @@ class JobManager:
     def _job_meta_path(self, job_id: str) -> Path:
         return self._job_dir(job_id) / "job.json"
 
+    def _stage_file_path(self, job_id: str, name: str) -> Path:
+        return self._job_dir(job_id) / name
+
+    def _invalidate_summary(self, job: Job) -> None:
+        """Drop a stored summary and its file; the transcript it was based on changed."""
+        job.summary = None
+        job.summary_text = ""
+        try:
+            self._stage_file_path(job.id, "summary.md").unlink(missing_ok=True)
+        except OSError:
+            log.exception("cannot remove stale summary.md for %s", job.id)
+
     def result_dir(self, job_id: str) -> Path:
         """Return the per-job result folder, creating it when needed."""
         directory = self._job_dir(job_id)
@@ -492,7 +513,10 @@ class JobManager:
             segments = []
         row["segments"] = segments
         job = Job.from_dict(row)
+        changed = self._backfill_stage_texts(job)
         if self._recover_interrupted(job):
+            changed = True
+        if changed:
             try:
                 self._db.upsert_job(asdict(job))
                 self._write_job_json(job)
@@ -500,6 +524,25 @@ class JobManager:
                 log.exception("cannot persist recovered job %s", job.id)
         with self._lock:
             self._jobs[job.id] = job
+
+    @staticmethod
+    def _backfill_stage_texts(job: Job) -> bool:
+        """Rebuild per-stage texts for jobs created by older releases."""
+        changed = False
+        if not job.text_plain and job.text:
+            # Old jobs only kept the raw text; the formatted stage-1
+            # transcript cannot be recovered, so show the raw one.
+            job.text_plain = job.text
+            changed = True
+        if not job.text_speakers and any(
+            segment.get("speaker") for segment in job.segments
+        ):
+            job.text_speakers = export_txt(job.segments)
+            changed = True
+        if job.summary is not None and not job.summary_text:
+            job.summary_text = format_summary(job.summary, title=job.filename)
+            changed = True
+        return changed
 
     @staticmethod
     def _recover_interrupted(job: Job) -> bool:
@@ -871,6 +914,18 @@ class JobManager:
                     job.rtf = result.rtf
                     job.segments = segment_payload
                     job.result_file = str(transcript_path)
+                    # Stage 1 result: the plain transcript, saved as its own
+                    # file and field so diarization cannot overwrite it.
+                    job.text_plain = transcript_text
+                    job.text_speakers = ""
+                    job.summary_text = ""
+                    for stale_name in ("transcript_speakers.txt", "summary.md"):
+                        try:
+                            self._stage_file_path(job_id, stale_name).unlink(
+                                missing_ok=True
+                            )
+                        except OSError:
+                            log.exception("cannot remove stale %s for %s", stale_name, job_id)
                     self._set_stage(
                         job,
                         "recognition",
@@ -1283,6 +1338,15 @@ class JobManager:
             job.summary = None
             job.paused = False
             job.segments = []
+            # A fresh run discards the stage texts and files of the old one.
+            job.text_plain = ""
+            job.text_speakers = ""
+            job.summary_text = ""
+            for stale_name in ("transcript_speakers.txt", "summary.md"):
+                try:
+                    self._stage_file_path(job_id, stale_name).unlink(missing_ok=True)
+                except OSError:
+                    log.exception("cannot remove stale %s for %s", stale_name, job_id)
             job.stages = default_stages()
             for key in [key for key in self._stage_started if key[0] == job_id]:
                 self._stage_started.pop(key, None)
@@ -1337,7 +1401,7 @@ class JobManager:
             )
             self._stop_stage_worker(job_id, "summary")
             if summarize_enabled and has_text:
-                job.summary = None
+                self._invalidate_summary(job)
                 self._set_stage(
                     job,
                     "summary",
@@ -1346,7 +1410,7 @@ class JobManager:
                     progress=0.0,
                 )
             elif stale_summary:
-                job.summary = None
+                self._invalidate_summary(job)
                 self._set_stage(
                     job,
                     "summary",
@@ -1421,7 +1485,7 @@ class JobManager:
             )
             payload = [asdict(segment) for segment in segments]
             speakers = {segment.speaker for segment in segments if segment.speaker}
-            transcript_path = self._job_dir(job_id) / "transcript.txt"
+            speakers_path = self._stage_file_path(job_id, "transcript_speakers.txt")
             stale = False
             with self._lock:
                 current = self._jobs.get(job_id)
@@ -1433,13 +1497,20 @@ class JobManager:
                     stale = True
                 else:
                     current.segments = payload
-                    current.summary = None
-                    transcript_path.parent.mkdir(parents=True, exist_ok=True)
-                    transcript_path.write_text(
-                        (export_txt(payload) or current.text) + "\n",
-                        encoding="utf-8",
-                        newline="\n",
-                    )
+                    # Stage 2 result: the speaker-attributed transcript.  The
+                    # plain transcript.txt stays as the stage-1 artefact; the
+                    # downloadable result always points at the newest file.
+                    speakers_text = export_txt(payload) or current.text
+                    current.text_speakers = speakers_text if speakers else ""
+                    self._invalidate_summary(current)
+                    if speakers:
+                        speakers_path.parent.mkdir(parents=True, exist_ok=True)
+                        speakers_path.write_text(
+                            speakers_text + "\n",
+                            encoding="utf-8",
+                            newline="\n",
+                        )
+                        current.result_file = str(speakers_path)
                     self._set_stage(
                         current,
                         "diarization",
@@ -1545,7 +1616,7 @@ class JobManager:
                 raise ValueError("Саммаризация уже выполняется.")
             self._stop_stage_worker(job_id, "summary")
             if self._summary_runner is None:
-                job.summary = None
+                self._invalidate_summary(job)
                 self._set_stage(
                     job,
                     "summary",
@@ -1562,7 +1633,7 @@ class JobManager:
                     log.exception("cannot persist missing LLM state for %s", job_id)
                 return job
             token = self._new_stage_token(job_id, "summary")
-            job.summary = None
+            self._invalidate_summary(job)
             self._set_stage(
                 job,
                 "summary",
@@ -1653,6 +1724,9 @@ class JobManager:
             if job is None:
                 return
             job.summary = summary
+            # Stage 3 result: the rendered summary text, also saved as
+            # summary.md next to the transcript files.
+            job.summary_text = format_summary(summary, title=job.filename)
             self._set_stage(
                 job,
                 "summary",
@@ -1665,6 +1739,14 @@ class JobManager:
                 self._persist(job)
             except OSError:
                 log.exception("cannot persist summary for job %s", job.id)
+            try:
+                summary_path = self._stage_file_path(job_id, "summary.md")
+                summary_path.parent.mkdir(parents=True, exist_ok=True)
+                summary_path.write_text(
+                    job.summary_text + "\n", encoding="utf-8", newline="\n"
+                )
+            except OSError:
+                log.exception("cannot write summary.md for job %s", job_id)
 
     def fail_summary(self, job_id: str, error: str) -> None:
         self._update_stage(

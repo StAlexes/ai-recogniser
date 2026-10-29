@@ -837,6 +837,12 @@ textarea {
   border-bottom: 1px solid var(--surface-border);
 }
 
+/* Stage-result switcher on the job page (расшифровка / диаризация / саммари). */
+.transcript-head .job-result-switch {
+  flex-shrink: 0;
+  min-width: 230px;
+}
+
 .transcript-head > div:first-child {
   min-width: 0;
 }
@@ -946,6 +952,14 @@ textarea {
   height: auto;
   min-height: 0;
   max-height: none;
+}
+
+/* Formatted summary shown in place of the textarea when «Саммари» is picked. */
+.summary-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 16px 16px;
 }
 
 .info-grid {
@@ -1905,6 +1919,11 @@ textarea {
 
   .transcript-head {
     flex-direction: column;
+  }
+
+  .transcript-head .job-result-switch {
+    width: 100%;
+    min-width: 0;
   }
 
   .transcript-actions {

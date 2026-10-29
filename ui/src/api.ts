@@ -91,6 +91,9 @@ export interface JobSegment {
 
 export interface JobDetail extends JobSummary {
   text: string;
+  text_plain: string | null;
+  text_speakers: string | null;
+  summary_text: string | null;
   result_file: string | null;
   result_url: string | null;
   segments: JobSegment[];

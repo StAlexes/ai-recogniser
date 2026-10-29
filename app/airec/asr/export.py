@@ -128,6 +128,89 @@ def export_json(segments: list[dict[str, Any]], *, metadata: dict[str, Any] | No
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def _summary_items(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _summary_item_text(item: Any) -> str:
+    if isinstance(item, dict):
+        return str(item.get("formulation") or item.get("quote") or "").strip()
+    return str(item).strip()
+
+
+def format_summary(summary: Any, *, title: str | None = None) -> str:
+    """Human-readable text of a structured summary (summary.md and the UI).
+
+    Mirrors the structure produced by the LLM (tl_dr, topics, decisions,
+    action items, ...); tolerates missing keys and non-dict payloads.
+    """
+    if not isinstance(summary, dict):
+        return str(summary).strip()
+    lines: list[str] = []
+    if title:
+        lines += [f"# Саммари — {title}", ""]
+    tldr = str(summary.get("tl_dr") or "").strip()
+    if tldr:
+        lines += ["## Кратко", tldr, ""]
+    topics = [str(t).strip() for t in _summary_items(summary.get("topics")) if str(t).strip()]
+    if topics:
+        lines += ["## Темы", *[f"- {topic}" for topic in topics], ""]
+    decisions: list[str] = []
+    for item in _summary_items(summary.get("decisions")):
+        text = _summary_item_text(item)
+        if not text:
+            continue
+        timecode = item.get("timecode") if isinstance(item, dict) else None
+        decisions.append(f"- {text}" + (f" [{timecode}]" if timecode else ""))
+    if decisions:
+        lines += ["## Решения", *decisions, ""]
+    actions: list[str] = []
+    for item in _summary_items(summary.get("action_items")):
+        text = _summary_item_text(item)
+        if not text:
+            continue
+        if not isinstance(item, dict):
+            actions.append(f"- {text}")
+            continue
+        parts = [text]
+        for key in ("owner", "deadline"):
+            detail = str(item.get(key) or "").strip()
+            if detail:
+                parts.append(detail)
+        line = "- " + " — ".join(parts)
+        timecode = str(item.get("timecode") or "").strip()
+        if timecode:
+            line += f" [{timecode}]"
+        actions.append(line)
+    if actions:
+        lines += ["## Задачи", *actions, ""]
+    questions = [
+        str(q).strip() for q in _summary_items(summary.get("questions_open")) if str(q).strip()
+    ]
+    if questions:
+        lines += ["## Открытые вопросы", *[f"- {q}" for q in questions], ""]
+    risks = [str(r).strip() for r in _summary_items(summary.get("risks")) if str(r).strip()]
+    if risks:
+        lines += ["## Риски", *[f"- {risk}" for risk in risks], ""]
+    quotes: list[str] = []
+    for item in _summary_items(summary.get("quotes")):
+        text = _summary_item_text(item)
+        if not text:
+            continue
+        line = f"- «{text}»"
+        if isinstance(item, dict):
+            speaker = str(item.get("speaker") or "").strip()
+            timecode = str(item.get("timecode") or "").strip()
+            if speaker:
+                line += f" — {speaker}"
+            if timecode:
+                line += f" [{timecode}]"
+        quotes.append(line)
+    if quotes:
+        lines += ["## Цитаты", *quotes, ""]
+    return "\n".join(lines).strip()
+
+
 FORMATS: dict[str, callable] = {
     "txt": export_txt,
     "srt": export_srt,

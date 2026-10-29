@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Badge,
   Button,
@@ -48,7 +48,6 @@ import {
   stageStatusText,
   statusColor,
   statusLabel,
-  transcriptText,
 } from '../jobUtils';
 
 type ExportFormat = 'txt' | 'srt' | 'vtt' | 'md' | 'json';
@@ -63,6 +62,15 @@ const EXPORT_EXTENSIONS: Record<ExportFormat, string> = {
 
 const SUMMARY_MAX_POINTS = 8;
 
+/** The saved results a finished job can show: one per processing stage. */
+type ResultView = 'recognition' | 'diarization' | 'summary';
+
+const RESULT_LABELS: Record<ResultView, string> = {
+  recognition: 'Расшифровка',
+  diarization: 'Расшифровка с диаризацией',
+  summary: 'Саммари',
+};
+
 interface JobPageProps {
   jobId: string;
   onBack: () => void;
@@ -73,16 +81,14 @@ function summaryList(value: unknown): any[] {
   return Array.isArray(value) ? value.slice(0, SUMMARY_MAX_POINTS) : [];
 }
 
-function SummaryPanel({ summary }: { summary: Record<string, any> }) {
+/** Formatted summary content, rendered inside the shared result panel. */
+function SummaryBody({ summary }: { summary: Record<string, any> }) {
   const topics = summaryList(summary.topics);
   const decisions = summaryList(summary.decisions);
   const actionItems = summaryList(summary.action_items);
   const risks = summaryList(summary.risks);
   return (
-    <section className="summary-panel surface" aria-labelledby="job-summary-title">
-      <h2 id="job-summary-title" className="summary-heading">
-        Саммари
-      </h2>
+    <div className="summary-body">
       <div className="summary-tldr">{summary.tl_dr || 'Нет краткого содержания.'}</div>
       {topics.length > 0 ? (
         <>
@@ -137,7 +143,7 @@ function SummaryPanel({ summary }: { summary: Record<string, any> }) {
           </ul>
         </>
       ) : null}
-    </section>
+    </div>
   );
 }
 
@@ -210,6 +216,10 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
   const [stageBusy, setStageBusy] = useState<StageKey | null>(null);
   const [format, setFormat] = useState<ExportFormat>('txt');
   const [now, setNow] = useState(() => Date.now());
+  // null while the newest available result is followed automatically;
+  // a manual pick makes the selection sticky for this visit.
+  const [view, setView] = useState<ResultView | null>(null);
+  const [viewPicked, setViewPicked] = useState(false);
 
   const loadJob = useCallback(
     async (silent = false): Promise<void> => {
@@ -237,6 +247,8 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     setError(null);
     setNotice(null);
     setStageBusy(null);
+    setView(null);
+    setViewPicked(false);
     void loadJob();
   }, [jobId]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -270,7 +282,54 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     };
   }, [active, loadJob]);
 
-  const displayText = job === null ? '' : transcriptText(job);
+  const recognitionText = job !== null ? (job.text_plain ?? job.text ?? '').trim() : '';
+  const speakersText = (job?.text_speakers ?? '').trim();
+  const summaryText = (job?.summary_text ?? '').trim();
+  const hasSummary = job !== null && (job.summary !== null || summaryText !== '');
+
+  /** Which stage results exist and which one is the newest. */
+  const resultViews = useMemo((): { views: ResultView[]; latest: ResultView } | null => {
+    if (job === null || job.status !== 'done') {
+      return null;
+    }
+    const views: ResultView[] = ['recognition'];
+    if (speakersText !== '') {
+      views.push('diarization');
+    }
+    if (hasSummary) {
+      views.push('summary');
+    }
+    return {
+      views,
+      latest: hasSummary ? 'summary' : speakersText !== '' ? 'diarization' : 'recognition',
+    };
+  }, [job, speakersText, hasSummary]);
+
+  // Always show the newest result (саммари → диаризация → расшифровка)
+  // until the user picks one explicitly.
+  useEffect(() => {
+    if (resultViews === null) {
+      return;
+    }
+    if (view !== null && resultViews.views.includes(view)) {
+      if (!viewPicked && view !== resultViews.latest) {
+        setView(resultViews.latest);
+      }
+      return;
+    }
+    // Nothing selected yet, or the selected result disappeared (restart).
+    setView(resultViews.latest);
+    if (view !== null) {
+      setViewPicked(false);
+    }
+  }, [resultViews, viewPicked, view]);
+
+  const viewText =
+    view === 'diarization'
+      ? speakersText
+      : view === 'summary'
+        ? summaryText
+        : recognitionText;
   const speakerCount = new Set(
     (job?.segments ?? []).map((segment) => segment.speaker).filter(Boolean),
   ).size;
@@ -298,11 +357,11 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
   };
 
   const handleCopy = async (): Promise<void> => {
-    if (displayText === '') {
+    if (viewText === '') {
       return;
     }
     try {
-      await navigator.clipboard.writeText(displayText);
+      await navigator.clipboard.writeText(viewText);
       setNotice('Текст скопирован в буфер обмена.');
     } catch {
       setError('Не удалось скопировать текст. Выделите его в поле вручную.');
@@ -562,7 +621,12 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
           <Button
             size="small"
             icon={saving ? <Spinner size="tiny" /> : <SaveRegular />}
-            disabled={job === null || job.status !== 'done' || saving || displayText === ''}
+            disabled={
+              job === null ||
+              job.status !== 'done' ||
+              saving ||
+              (job.text.trim() === '' && job.segments.length === 0)
+            }
             onClick={() => {
               void handleSave();
             }}
@@ -572,7 +636,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
           <Button
             size="small"
             icon={<CopyRegular />}
-            disabled={displayText === ''}
+            disabled={viewText === ''}
             onClick={() => {
               void handleCopy();
             }}
@@ -670,36 +734,67 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
         </MessageBar>
       ) : null}
 
-      {job !== null && job.status === 'done' ? (
+      {job !== null &&
+      job.status === 'done' &&
+      resultViews !== null &&
+      view !== null ? (
         <section
           className="transcript-panel job-transcript-panel surface"
-          aria-labelledby="job-transcript-title"
+          aria-labelledby="job-result-title"
         >
           <div className="transcript-head">
             <div>
-              <h2 id="job-transcript-title" className="files-title">
-                Расшифровка
+              <h2 id="job-result-title" className="files-title">
+                {RESULT_LABELS[view]}
               </h2>
-              <p className="job-meta">
-                {job.segments.length > 0 ? `фрагментов: ${job.segments.length}` : 'текст целиком'}
-                {speakerCount > 0 ? ` · спикеров: ${speakerCount}` : ''}
-              </p>
+              {view !== 'summary' ? (
+                <p className="job-meta">
+                  {job.segments.length > 0
+                    ? `фрагментов: ${job.segments.length}`
+                    : 'текст целиком'}
+                  {view === 'diarization' && speakerCount > 0
+                    ? ` · спикеров: ${speakerCount}`
+                    : ''}
+                </p>
+              ) : null}
             </div>
+            {resultViews.views.length > 1 ? (
+              <Dropdown
+                aria-label="Результат разбора"
+                className="job-result-switch"
+                value={RESULT_LABELS[view]}
+                selectedOptions={[view]}
+                onOptionSelect={(_event, data) => {
+                  if (data.optionValue !== undefined) {
+                    setView(data.optionValue as ResultView);
+                    setViewPicked(true);
+                  }
+                }}
+              >
+                {resultViews.views.map((key) => (
+                  <Option key={key} value={key}>
+                    {RESULT_LABELS[key]}
+                  </Option>
+                ))}
+              </Dropdown>
+            ) : null}
           </div>
-          <Textarea
-            className="job-transcript"
-            readOnly
-            resize="none"
-            value={displayText === '' ? 'Речь не распознана.' : displayText}
-            aria-label="Результат распознавания"
-          />
+          {view === 'summary' && job.summary !== null ? (
+            <SummaryBody summary={job.summary} />
+          ) : (
+            <Textarea
+              className="job-transcript"
+              readOnly
+              resize="none"
+              value={viewText === '' ? 'Речь не распознана.' : viewText}
+              aria-label={RESULT_LABELS[view]}
+            />
+          )}
         </section>
       ) : null}
 
-      {job !== null && job.status === 'done' ? (
-        job.summary !== null ? (
-          <SummaryPanel summary={job.summary} />
-        ) : summaryStage?.status === 'error' ? (
+      {job !== null && job.status === 'done' && job.summary === null ? (
+        summaryStage?.status === 'error' ? (
           <section className="summary-panel surface" aria-labelledby="job-summary-state">
             <h2 id="job-summary-state" className="summary-heading">
               Саммари

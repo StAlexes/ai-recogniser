@@ -83,13 +83,19 @@ def test_manager_transcribes_and_persists(tmp_path: Path) -> None:
     assert finished.stages["recognition"]["progress"] == 1.0
     assert finished.stages["diarization"]["status"] == "skipped"
     assert finished.stages["summary"]["status"] == "pending"
+    assert finished.text_plain == "Привет, это тестовая расшифровка."
+    assert finished.text_speakers == ""
     assert finished.detail()["segments"][0]["text"] == "Привет, это"
     assert finished.detail()["result_url"] == f"/api/v1/jobs/{job.id}/result"
+    assert finished.detail()["text_plain"] == finished.text_plain
     result = manager.result_path(job.id)
     assert result is not None
     assert result.read_text(encoding="utf-8").startswith("Привет")
     summary = manager.list()[0]
     assert "text" not in summary
+    assert "text_plain" not in summary
+    assert "text_speakers" not in summary
+    assert "summary_text" not in summary
     assert "result_file" not in summary
     assert "segments" not in summary
     assert summary["segment_count"] == 2
@@ -100,6 +106,7 @@ def test_manager_transcribes_and_persists(tmp_path: Path) -> None:
     assert restored_job is not None
     assert restored_job.status == "done"
     assert restored_job.text == finished.text
+    assert restored_job.text_plain == finished.text_plain
     assert len(restored_job.segments) == 2
     assert restored_job.segments[0]["text"] == "Привет, это"
     assert restored_job.stages["recognition"]["status"] == "done"
@@ -226,8 +233,105 @@ def test_manager_auto_summary(tmp_path: Path) -> None:
     assert finished.status == "done"
     assert finished.stages["summary"]["status"] == "done", finished.stages["summary"]
     assert finished.summary == {"tl_dr": "Короткое содержание.", "topics": ["тест"]}
+    # Stage 3 result: rendered text kept in the job and on disk.
+    assert finished.summary_text.startswith("# Саммари — meeting.wav")
+    assert "Короткое содержание." in finished.summary_text
+    summary_file = paths.results / job.id / "summary.md"
+    assert summary_file.is_file()
+    assert "Короткое содержание." in summary_file.read_text(encoding="utf-8")
     assert finished.text == "Привет, это тестовая расшифровка."
     manager.shutdown()
+
+
+def test_stage_texts_saved_per_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every finished stage keeps its own text: plain, speakers and summary."""
+    paths = paths_for(tmp_path)
+    settings = Settings(diarize_enabled=True)
+    manager = JobManager(paths, lambda: settings, transcriber=fake_transcriber)
+
+    def fake_diarize(_source: Path, _segments: list, **_kwargs: object):
+        return [
+            SpeechSegment(0.0, 6.0, "Привет, это", speaker="Спикер 1"),
+            SpeechSegment(6.0, 12.0, "тестовая расшифровка.", speaker="Спикер 2"),
+        ]
+
+    monkeypatch.setattr(
+        "airec.asr.manager.diarize_transcription", fake_diarize
+    )
+    upload = tmp_path / "meeting.wav"
+    upload.write_bytes(b"RIFF....WAVEfmt ")
+
+    job = manager.submit(upload, "meeting.wav", "gigaam-v3-e2e-ctc")
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        current = manager.get(job.id)
+        assert current is not None
+        if current.stages["diarization"]["status"] in {"done", "error", "skipped"}:
+            break
+        time.sleep(0.02)
+    finished = manager.get(job.id)
+    assert finished is not None
+    assert finished.stages["diarization"]["status"] == "done", finished.stages
+
+    # Stage 1: plain transcript, untouched by diarization.
+    assert finished.text_plain == "Привет, это тестовая расшифровка."
+    job_dir = paths.results / job.id
+    assert (job_dir / "transcript.txt").read_text(encoding="utf-8").startswith("Привет")
+    # Stage 2: speaker-attributed transcript in its own file, and the
+    # downloadable result now points at it.
+    assert finished.text_speakers == (
+        "[00:00] Спикер 1: Привет, это\n[00:06] Спикер 2: тестовая расшифровка."
+    )
+    speakers_file = job_dir / "transcript_speakers.txt"
+    assert speakers_file.is_file()
+    assert "Спикер 1" in speakers_file.read_text(encoding="utf-8")
+    assert finished.result_file == str(speakers_file)
+    assert manager.result_path(job.id) == speakers_file
+    manager.shutdown()
+
+
+def test_legacy_job_gets_stage_texts_backfilled(tmp_path: Path) -> None:
+    """Jobs saved by older releases get their stage texts rebuilt on load."""
+    paths = paths_for(tmp_path)
+    job = Job(
+        id="20260101-000000-legacy1",
+        filename="old.wav",
+        status="done",
+        text="Привет, это тестовая расшифровка.",
+    )
+    job.segments = [
+        {"start_s": 0.0, "end_s": 6.0, "text": "Привет, это", "speaker": "Спикер 1"},
+        {
+            "start_s": 6.0,
+            "end_s": 12.0,
+            "text": "тестовая расшифровка.",
+            "speaker": "Спикер 2",
+        },
+    ]
+    job.summary = {"tl_dr": "Краткое содержание встречи."}
+    directory = paths.results / job.id
+    directory.mkdir(parents=True)
+    (directory / "job.json").write_text(
+        json.dumps(asdict(job), ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    manager = JobManager(paths, lambda: Settings(), transcriber=fake_transcriber)
+    restored = manager.get(job.id)
+    assert restored is not None
+    assert restored.text_plain == job.text
+    assert restored.text_speakers.startswith("[00:00] Спикер 1:")
+    assert "Краткое содержание встречи." in restored.summary_text
+    # The rebuilt texts must survive a restart.
+    manager.shutdown()
+    reopened = JobManager(paths, lambda: Settings(), transcriber=fake_transcriber)
+    again = reopened.get(job.id)
+    assert again is not None
+    assert again.text_speakers == restored.text_speakers
+    assert again.summary_text == restored.summary_text
+    reopened.shutdown()
 
 
 def test_manager_auto_summary_without_llm_keeps_transcript(tmp_path: Path) -> None:
