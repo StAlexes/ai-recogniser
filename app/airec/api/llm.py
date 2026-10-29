@@ -12,7 +12,7 @@ from airec.asr.manager import JobManager
 from airec.core.config import Settings
 from airec.llm.glossary import Glossary
 from airec.llm.providers import LLMError, create_provider
-from airec.llm.runtime import ensure_runtime
+from airec.llm.runtime import ensure_runtime, find_llama_server
 from airec.llm.summary import Summarizer
 
 log = logging.getLogger(__name__)
@@ -142,13 +142,15 @@ def make_summary_runner(app: Any) -> Any:
         if settings.external_llm_enabled and kind == "llamacpp-local":
             kind = "external"
         if kind == "llamacpp-local":
-            # The runtime is a one-time ~24 MB download.  Doing it inside the
-            # summary worker keeps the HTTP request short and gives the stage
-            # a real progress bar instead of a silent 30-second pause.
-            def install_progress(value: float, phase: str) -> None:
-                progress(0.02 + 0.2 * max(0.0, min(value, 1.0)), phase)
+            custom = settings.llm_server_path.strip() or None
+            if find_llama_server(app.state.paths, custom=custom) is None:
+                # The runtime is a one-time ~24 MB download.  Doing it inside
+                # the summary worker keeps the HTTP request short and gives the
+                # stage a real progress bar instead of a silent 30-second pause.
+                def install_progress(value: float, phase: str) -> None:
+                    progress(0.02 + 0.2 * max(0.0, min(value, 1.0)), phase)
 
-            ensure_runtime(app.state.paths, progress=install_progress)
+                ensure_runtime(app.state.paths, progress=install_progress)
 
             def summary_progress(value: float, phase: str) -> None:
                 progress(0.22 + 0.78 * max(0.0, min(value, 1.0)), phase)
