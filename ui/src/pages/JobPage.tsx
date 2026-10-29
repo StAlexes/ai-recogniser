@@ -12,6 +12,7 @@ import {
   Textarea,
 } from '@fluentui/react-components';
 import {
+  ArrowClockwiseRegular,
   ArrowLeftRegular,
   CopyRegular,
   DismissRegular,
@@ -20,6 +21,7 @@ import {
   PlayRegular,
   SaveRegular,
   SparkleRegular,
+  StopRegular,
 } from '@fluentui/react-icons';
 import {
   AuthError,
@@ -27,11 +29,11 @@ import {
   getJob,
   retryJob,
   revealJobFolder,
+  stageAction,
   startJob,
-  summarizeJob,
   token,
 } from '../api';
-import type { JobDetail } from '../api';
+import type { JobDetail, StageAction, StageKey } from '../api';
 import { PageHeader } from '../components/PageHeader';
 import { openResultFolder, saveResultAs } from '../desktop';
 import { formatBytes } from '../format';
@@ -42,7 +44,8 @@ import {
   formatSeconds,
   isActive,
   jobElapsedSeconds,
-  StageProgress,
+  STAGE_LABELS,
+  stageStatusText,
   statusColor,
   statusLabel,
   transcriptText,
@@ -138,12 +141,73 @@ function SummaryPanel({ summary }: { summary: Record<string, any> }) {
   );
 }
 
+function StageControl({
+  name,
+  stage,
+  canStart,
+  busy,
+  onAction,
+}: {
+  name: StageKey;
+  stage: JobDetail['stages'][StageKey];
+  canStart: boolean;
+  busy: boolean;
+  onAction: (action: StageAction) => void;
+}) {
+  const running = stage.status === 'running';
+  return (
+    <div className="job-stage-control" data-status={stage.status}>
+      <div className="job-stage-control-head">
+        <span className="job-stage-control-name">{STAGE_LABELS[name]}</span>
+        <span className="job-stage-control-status">{stageStatusText(stage)}</span>
+      </div>
+      <ProgressBar
+        value={stage.progress}
+        thickness="medium"
+        aria-label={`${STAGE_LABELS[name]}: ${Math.round(stage.progress * 100)}%`}
+      />
+      <span className="job-stage-control-phase" title={stage.phase}>
+        {stage.phase || 'Ожидает'}
+      </span>
+      <div className="job-stage-control-actions">
+        <Button
+          size="small"
+          appearance="subtle"
+          icon={<PlayRegular />}
+          disabled={busy || running || !canStart || stage.status === 'done'}
+          onClick={() => onAction('start')}
+        >
+          Запустить
+        </Button>
+        <Button
+          size="small"
+          appearance="subtle"
+          icon={<StopRegular />}
+          disabled={busy || !running}
+          onClick={() => onAction('stop')}
+        >
+          Стоп
+        </Button>
+        <Button
+          size="small"
+          appearance="subtle"
+          icon={<ArrowClockwiseRegular />}
+          disabled={busy || !canStart}
+          onClick={() => onAction('restart')}
+        >
+          Перезапустить
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
   const [job, setJob] = useState<JobDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [summarizing, setSummarizing] = useState(false);
+  const [stageBusy, setStageBusy] = useState<StageKey | null>(null);
   const [format, setFormat] = useState<ExportFormat>('txt');
   const [now, setNow] = useState(() => Date.now());
 
@@ -172,13 +236,14 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     setJob(null);
     setError(null);
     setNotice(null);
-    setSummarizing(false);
+    setStageBusy(null);
     void loadJob();
   }, [jobId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const active =
     job !== null &&
-    (isActive(job.status) || job.stages?.summary?.status === 'running');
+    (isActive(job.status) ||
+      Object.values(job.stages ?? {}).some((stage) => stage.status === 'running'));
 
   useEffect(() => {
     if (!active) {
@@ -352,16 +417,26 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     }
   };
 
-  const handleSummarize = async (): Promise<void> => {
-    if (job === null || job.status !== 'done' || summarizing) {
+  const handleStageAction = async (
+    stage: StageKey,
+    action: StageAction,
+  ): Promise<void> => {
+    if (job === null || stageBusy !== null) {
       return;
     }
-    setSummarizing(true);
+    setStageBusy(stage);
     setError(null);
     try {
-      await summarizeJob(job.id);
-      setNotice('Саммари готово.');
-      await loadJob(true);
+      const updated = await stageAction(job.id, stage, action);
+      setJob(updated);
+      const label = STAGE_LABELS[stage];
+      if (action === 'start') {
+        setNotice(`Этап «${label}» запущен.`);
+      } else if (action === 'stop') {
+        setNotice(`Этап «${label}» остановлен.`);
+      } else {
+        setNotice(`Этап «${label}» перезапущен.`);
+      }
     } catch (reason: unknown) {
       if (reason instanceof AuthError) {
         onAuthError();
@@ -370,19 +445,17 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
       setError(describeError(reason));
       await loadJob(true);
     } finally {
-      setSummarizing(false);
+      setStageBusy(null);
     }
   };
 
   const summaryStage = job?.stages?.summary;
-  const summaryRunning = summarizing || summaryStage?.status === 'running';
-  const canSummarize =
-    job !== null &&
-    job.status === 'done' &&
-    job.text.trim() !== '' &&
-    job.summary === null &&
-    !summaryRunning &&
-    summaryStage?.status !== 'error';
+  const summaryRunning = summaryStage?.status === 'running';
+  const recognitionDone = job?.stages?.recognition?.status === 'done';
+  const canStartDiarization =
+    job !== null && job.status === 'done' && recognitionDone && job.segments.length > 0;
+  const canStartSummary =
+    job !== null && job.status === 'done' && job.text.trim() !== '';
 
   const subtitle =
     job === null
@@ -506,18 +579,6 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
           >
             Копировать
           </Button>
-          {canSummarize ? (
-            <Button
-              size="small"
-              icon={summaryRunning ? <Spinner size="tiny" /> : <SparkleRegular />}
-              disabled={summaryRunning}
-              onClick={() => {
-                void handleSummarize();
-              }}
-            >
-              {summaryStage?.status === 'error' ? 'Повторить саммари' : 'Саммари'}
-            </Button>
-          ) : null}
           {job !== null && isActive(job.status) ? (
             <Button
               appearance="subtle"
@@ -545,10 +606,36 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
         </div>
 
         {job !== null ? (
-          <div className="detail-stages" aria-label="Этапы обработки">
-            <StageProgress name="recognition" stage={job.stages.recognition} />
-            <StageProgress name="diarization" stage={job.stages.diarization} />
-            <StageProgress name="summary" stage={job.stages.summary} />
+          <div className="job-stage-controls" aria-label="Управление этапами">
+            <StageControl
+              name="recognition"
+              stage={job.stages.recognition}
+              canStart={
+                job.status !== 'done' && (!isActive(job.status) || job.paused === true)
+              }
+              busy={stageBusy !== null}
+              onAction={(action) => {
+                void handleStageAction('recognition', action);
+              }}
+            />
+            <StageControl
+              name="diarization"
+              stage={job.stages.diarization}
+              canStart={canStartDiarization}
+              busy={stageBusy !== null}
+              onAction={(action) => {
+                void handleStageAction('diarization', action);
+              }}
+            />
+            <StageControl
+              name="summary"
+              stage={job.stages.summary}
+              canStart={canStartSummary}
+              busy={stageBusy !== null}
+              onAction={(action) => {
+                void handleStageAction('summary', action);
+              }}
+            />
           </div>
         ) : null}
       </section>
@@ -626,9 +713,9 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                   <Button
                     appearance="subtle"
                     icon={<SparkleRegular />}
-                    disabled={summarizing}
+                    disabled={stageBusy !== null}
                     onClick={() => {
-                      void handleSummarize();
+                      void handleStageAction('summary', 'restart');
                     }}
                   >
                     Повторить

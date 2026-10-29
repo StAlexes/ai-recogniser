@@ -27,13 +27,19 @@ from pathlib import Path
 from typing import Any
 
 from airec.asr.audio import SUPPORTED_EXTENSIONS, find_ffmpeg
+from airec.asr.diarization import DiarizationCancelled, DiarizationError
 from airec.asr.export import (
     EXPORT_CONTENT_TYPES,
     EXPORT_DOWNLOAD_NAMES,
     EXPORT_EXTENSIONS,
     export_txt,
 )
-from airec.asr.service import AsrError, TranscriptionResult, transcribe
+from airec.asr.service import (
+    AsrError,
+    TranscriptionResult,
+    diarize_transcription,
+    transcribe,
+)
 from airec.core.config import Settings
 from airec.core.db import Database
 from airec.core.paths import AppPaths
@@ -194,9 +200,12 @@ class JobManager:
         self._jobs: dict[str, Job] = {}
         self._futures: dict[str, Future[None]] = {}
         self._summary_futures: dict[str, Future[None]] = {}
+        self._stage_futures: dict[tuple[str, str], Future[None]] = {}
         self._stage_started: dict[tuple[str, str], float] = {}
         self._run_tokens: dict[str, int] = {}
         self._cancel_events: dict[str, threading.Event] = {}
+        self._stage_tokens: dict[tuple[str, str], int] = {}
+        self._stage_events: dict[tuple[str, str], threading.Event] = {}
         self._run_seq = 0
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="airec-asr")
@@ -236,6 +245,52 @@ class JobManager:
         event = self._cancel_events.get(job_id)
         return event is not None and event.is_set()
 
+    def _new_stage_token(self, job_id: str, stage: str) -> int:
+        """Create a fresh generation token for an independent stage."""
+        self._run_seq += 1
+        token = self._run_seq
+        self._stage_tokens[(job_id, stage)] = token
+        self._stage_events[(job_id, stage)] = threading.Event()
+        return token
+
+    def _stage_token_current(self, job_id: str, stage: str, token: int) -> bool:
+        if stage == "recognition":
+            return self._token_current(job_id, token)
+        return self._stage_tokens.get((job_id, stage)) == token
+
+    def _stage_cancel_requested(self, job_id: str, stage: str) -> bool:
+        if stage == "recognition":
+            return self._cancel_requested(job_id)
+        event = self._stage_events.get((job_id, stage))
+        return event is not None and event.is_set()
+
+    def _stop_stage_worker(self, job_id: str, stage: str) -> None:
+        """Invalidate a stage token and ask its worker to stop (caller holds lock)."""
+        if stage == "recognition":
+            event = self._cancel_events.get(job_id)
+            if event is not None:
+                event.set()
+            future = self._futures.pop(job_id, None)
+            if future is not None:
+                future.cancel()
+            return
+        self._stage_tokens[(job_id, stage)] = -1
+        event = self._stage_events.get((job_id, stage))
+        if event is not None:
+            event.set()
+        future = self._stage_futures.pop((job_id, stage), None)
+        if future is not None:
+            future.cancel()
+
+    def _source_for_job(self, job: Job) -> Path:
+        """Return the stored source file, copying it into a fresh work folder."""
+        if not job.source_path:
+            raise FileNotFoundError(f"Исходный файл задачи не найден: {job.filename}")
+        source = Path(job.source_path)
+        if not source.is_file():
+            raise FileNotFoundError(f"Исходный файл задачи не найден: {source}")
+        return source
+
     def _job_dir(self, job_id: str) -> Path:
         return self._paths.results / job_id
 
@@ -268,7 +323,8 @@ class JobManager:
         if status is not None:
             current["status"] = status
             if status == STAGE_RUNNING:
-                self._stage_started.setdefault((job.id, stage), time.perf_counter())
+                current["elapsed_s"] = None
+                self._stage_started[(job.id, stage)] = time.perf_counter()
             elif status in {STAGE_DONE, STAGE_ERROR, STAGE_SKIPPED}:
                 started = self._stage_started.pop((job.id, stage), None)
                 if started is not None and current.get("elapsed_s") is None:
@@ -569,6 +625,8 @@ class JobManager:
             event = self._cancel_events.get(job_id)
             if event is not None:
                 event.set()
+            self._stop_stage_worker(job_id, "diarization")
+            self._stop_stage_worker(job_id, "summary")
             future = self._futures.pop(job_id, None)
             was_cancelled = False
             if future is not None:
@@ -639,65 +697,8 @@ class JobManager:
                 raise FileNotFoundError(
                     f"Исходный файл задачи не найден: {source}"
                 )
-
-            # Stop the previous worker cooperatively.  Its token is replaced
-            # below, so even if it is inside a long model call it cannot write
-            # to the retried job's state.
-            old_event = self._cancel_events.get(job_id)
-            if old_event is not None:
-                old_event.set()
-            old_future = self._futures.pop(job_id, None)
-            if old_future is not None:
-                old_future.cancel()
-
-            settings = self._settings()
-            work_dir = (
-                self._paths.temp
-                / "jobs"
-                / f"{job_id}-retry-{uuid.uuid4().hex[:8]}"
-            )
-            work_dir.mkdir(parents=True, exist_ok=True)
-            run_source = work_dir / f"input{source.suffix}"
-            shutil.copy2(source, run_source)
-
-            job.status = "queued"
-            job.progress = 0.0
-            job.phase = "В очереди"
-            job.started_at = None
-            job.finished_at = None
-            job.duration_s = None
-            job.elapsed_s = None
-            job.rtf = None
-            job.text = ""
-            job.error = None
-            job.result_file = None
-            job.summary = None
-            job.paused = False
-            job.segments = []
-            job.stages = default_stages()
-            for key in [key for key in self._stage_started if key[0] == job_id]:
-                self._stage_started.pop(key, None)
-            self._set_stage(
-                job,
-                "diarization",
-                status=STAGE_PENDING if settings.diarize_enabled else STAGE_SKIPPED,
-                phase="Ожидает" if settings.diarize_enabled else "Отключена в настройках",
-            )
-            if settings.summarize_enabled:
-                self._set_stage(
-                    job,
-                    "summary",
-                    status=STAGE_PENDING,
-                    phase="Ожидает распознавания",
-                    progress=0.0,
-                )
-            try:
-                self._persist(job)
-            except OSError:
-                log.exception("cannot persist retried job %s", job.id)
-            self._begin_run(job.id, run_source, work_dir)
-            log.info("job %s retried in place", job_id)
-            return job
+        log.info("job %s retried in place", job_id)
+        return self.restart_recognition(job_id)
 
     # ------------------------------------------------------------------ #
     # Worker
@@ -785,7 +786,9 @@ class JobManager:
                 vad_max_segment_s=settings.vad_max_segment_s,
                 vad_min_silence_ms=settings.vad_min_silence_ms,
                 vad_speech_pad_ms=settings.vad_speech_pad_ms,
-                diarize_enabled=settings.diarize_enabled,
+                # Diarization is an independent stage; the recognition worker
+                # must never block on it so it can be stopped/restarted alone.
+                diarize_enabled=False,
                 diarize_threshold=settings.diarize_threshold,
                 diarize_model=settings.diarize_model,
                 diarize_model_path=settings.diarize_model_path,
@@ -794,6 +797,7 @@ class JobManager:
             segment_payload = [asdict(segment) for segment in result.segments]
             transcript_text = export_txt(segment_payload) or result.text
             transcript_path = self._job_dir(job_id) / "transcript.txt"
+            auto_diarize = False
             auto_summary = False
             stale = False
             with self._lock:
@@ -827,9 +831,16 @@ class JobManager:
                         progress=1.0,
                         finished=True,
                     )
-                    speakers = {s.speaker for s in result.segments if s.speaker}
-                    diarization_phase = str(job.stages["diarization"].get("phase", ""))
-                    if not settings.diarize_enabled:
+                    if settings.diarize_enabled and result.segments:
+                        auto_diarize = True
+                        self._set_stage(
+                            job,
+                            "diarization",
+                            status=STAGE_PENDING,
+                            phase="Ожидает запуска",
+                            progress=0.0,
+                        )
+                    elif not settings.diarize_enabled:
                         self._set_stage(
                             job,
                             "diarization",
@@ -837,56 +848,42 @@ class JobManager:
                             phase="Отключена в настройках",
                             progress=0.0,
                         )
-                    elif diarization_phase.startswith("Ошибка"):
-                        self._set_stage(
-                            job,
-                            "diarization",
-                            status=STAGE_ERROR,
-                            progress=1.0,
-                        )
-                    elif speakers:
-                        self._set_stage(
-                            job,
-                            "diarization",
-                            status=STAGE_DONE,
-                            phase=f"Спикеров: {len(speakers)}",
-                            progress=1.0,
-                            finished=True,
-                        )
                     else:
                         self._set_stage(
                             job,
                             "diarization",
                             status=STAGE_SKIPPED,
-                            phase="Спикеры не найдены",
-                            progress=1.0,
+                            phase="Нет сегментов",
+                            progress=0.0,
                         )
-                    auto_summary = bool(
-                        settings.summarize_enabled and result.text.strip()
-                    )
-                    if auto_summary and self._summary_runner is None:
-                        auto_summary = False
-                        self._set_stage(
-                            job,
-                            "summary",
-                            status=STAGE_ERROR,
-                            phase=(
-                                "LLM не настроен: установите llama-server и "
-                                "GGUF-модель или выберите провайдера в настройках."
-                            ),
-                            progress=1.0,
-                        )
-                    elif auto_summary:
-                        # Mark the stage as running before persisting "done", so
-                        # the UI immediately starts polling and shows progress.
-                        self._set_stage(
-                            job,
-                            "summary",
-                            status=STAGE_RUNNING,
-                            phase="Подготовка текста",
-                            progress=0.02,
-                        )
-                    elif result.text.strip():
+
+                    has_text = bool(result.text.strip())
+                    if settings.summarize_enabled and has_text:
+                        if self._summary_runner is None:
+                            self._set_stage(
+                                job,
+                                "summary",
+                                status=STAGE_ERROR,
+                                phase=(
+                                    "LLM не настроен: установите llama-server и "
+                                    "GGUF-модель или выберите провайдера в настройках."
+                                ),
+                                progress=1.0,
+                            )
+                        else:
+                            auto_summary = True
+                            self._set_stage(
+                                job,
+                                "summary",
+                                status=STAGE_PENDING,
+                                phase=(
+                                    "Ожидает диаризации"
+                                    if auto_diarize
+                                    else "Ожидает запуска"
+                                ),
+                                progress=0.0,
+                            )
+                    elif has_text:
                         self._set_stage(
                             job,
                             "summary",
@@ -913,8 +910,16 @@ class JobManager:
                 notify_job_done(job_id, job.filename)
             except Exception:  # notifications never break the queue
                 log.exception("cannot send done notification for job %s", job_id)
-            if auto_summary:
-                self._start_auto_summary(job_id, token)
+            if auto_diarize:
+                try:
+                    self._start_diarization(job_id, auto=True)
+                except Exception as exc:  # keep transcript; summary can still run
+                    log.exception("cannot queue diarization for %s", job_id)
+                    self.fail_diarization(job_id, f"Диаризация: {exc}")
+                    if auto_summary:
+                        self._start_summary(job_id, auto=True)
+            elif auto_summary:
+                self._start_summary(job_id, auto=True)
             if not settings.keep_extracted_audio:
                 self._cleanup_source(work_dir)
         except JobCancelled:
@@ -1096,26 +1101,416 @@ class JobManager:
         return target
 
     # ------------------------------------------------------------------ #
-    # Summary stage
+    # Independent stages: recognition / diarization / summary
     # ------------------------------------------------------------------ #
-    def _start_auto_summary(self, job_id: str, token: int) -> None:
-        """Queue the automatic summary for a just-finished transcription."""
-        if self._summary_runner is None:
-            self.fail_summary(
-                job_id,
-                "LLM не настроен: установите llama-server и GGUF-модель "
-                "или выберите провайдера в настройках.",
+    def start_stage(self, job_id: str, stage: str) -> Job:
+        """Start one stage without touching the others where possible."""
+        if stage not in STAGE_KEYS:
+            raise ValueError(f"Неизвестный этап: {stage}")
+        with self._lock:
+            job = self._jobs.get(job_id) or self.get(job_id)
+            if job is None:
+                raise KeyError(f"Job {job_id} not found.")
+            if stage == "recognition":
+                if job.status in ACTIVE_STATUSES:
+                    if job.status == "queued" and job.paused:
+                        return self.start(job_id)
+                    raise ValueError("Распознавание уже выполняется.")
+                if job.status == "done":
+                    raise ValueError(
+                        "Распознавание уже выполнено. Используйте перезапуск."
+                    )
+                return self.restart_recognition(job_id)
+            if stage == "diarization":
+                return self._start_diarization(job_id)
+            return self._start_summary(job_id)
+
+    def stop_stage(self, job_id: str, stage: str) -> Job:
+        """Stop one stage; the rest of the job stays intact."""
+        if stage not in STAGE_KEYS:
+            raise ValueError(f"Неизвестный этап: {stage}")
+        if stage == "recognition":
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if job is None:
+                    raise KeyError(f"Job {job_id} not found.")
+                if job.status not in ACTIVE_STATUSES:
+                    raise ValueError("Распознавание сейчас не выполняется.")
+            self.cancel(job_id)
+            with self._lock:
+                return self._jobs[job_id]
+        with self._lock:
+            job = self._jobs.get(job_id) or self.get(job_id)
+            if job is None:
+                raise KeyError(f"Job {job_id} not found.")
+            status = str(job.stages[stage].get("status", ""))
+            if status not in {STAGE_RUNNING, STAGE_PENDING}:
+                raise ValueError("Этот этап сейчас не выполняется.")
+            self._stop_stage_worker(job_id, stage)
+            self._set_stage(
+                job,
+                stage,
+                status=STAGE_SKIPPED,
+                phase="Остановлено пользователем",
+                progress=0.0,
             )
-            return
+            try:
+                self._persist(job)
+            except OSError:
+                log.exception("cannot persist stopped stage %s for %s", stage, job_id)
+            stopped = job
+        # Diarization and summary are independent: stopping the speaker stage
+        # must not leave an auto-summary waiting forever.
+        if stage == "diarization":
+            self._maybe_auto_summary(job_id)
+        return stopped
+
+    def restart_stage(self, job_id: str, stage: str) -> Job:
+        """Stop a stage (if needed) and start it again with a new token."""
+        if stage not in STAGE_KEYS:
+            raise ValueError(f"Неизвестный этап: {stage}")
+        if stage == "recognition":
+            return self.restart_recognition(job_id)
+        with self._lock:
+            job = self._jobs.get(job_id) or self.get(job_id)
+            if job is None:
+                raise KeyError(f"Job {job_id} not found.")
+            self._stop_stage_worker(job_id, stage)
+            # Mark the old generation as stopped before _start_* validates
+            # that the stage is not running.
+            if job.stages[stage]["status"] == STAGE_RUNNING:
+                self._set_stage(
+                    job,
+                    stage,
+                    status=STAGE_SKIPPED,
+                    phase="Перезапуск",
+                    progress=0.0,
+                )
+                try:
+                    self._persist(job)
+                except OSError:
+                    log.exception(
+                        "cannot persist restart of stage %s for %s", stage, job_id
+                    )
+        if stage == "diarization":
+            return self._start_diarization(job_id)
+        return self._start_summary(job_id)
+
+    def restart_recognition(self, job_id: str) -> Job:
+        """Reset and re-run recognition in place, preserving the job id."""
         with self._lock:
             job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError(f"Job {job_id} not found.")
+            source = self._source_for_job(job)
+            self._stop_stage_worker(job_id, "recognition")
+            self._stop_stage_worker(job_id, "diarization")
+            self._stop_stage_worker(job_id, "summary")
+
+            settings = self._settings()
+            work_dir = (
+                self._paths.temp
+                / "jobs"
+                / f"{job_id}-restart-{uuid.uuid4().hex[:8]}"
+            )
+            work_dir.mkdir(parents=True, exist_ok=True)
+            run_source = work_dir / f"input{source.suffix}"
+            shutil.copy2(source, run_source)
+
+            job.status = "queued"
+            job.progress = 0.0
+            job.phase = "В очереди"
+            job.started_at = None
+            job.finished_at = None
+            job.duration_s = None
+            job.elapsed_s = None
+            job.rtf = None
+            job.text = ""
+            job.error = None
+            job.result_file = None
+            job.summary = None
+            job.paused = False
+            job.segments = []
+            job.stages = default_stages()
+            for key in [key for key in self._stage_started if key[0] == job_id]:
+                self._stage_started.pop(key, None)
+            self._set_stage(
+                job,
+                "diarization",
+                status=STAGE_PENDING if settings.diarize_enabled else STAGE_SKIPPED,
+                phase="Ожидает" if settings.diarize_enabled else "Отключена в настройках",
+            )
+            if settings.summarize_enabled:
+                self._set_stage(
+                    job,
+                    "summary",
+                    status=STAGE_PENDING,
+                    phase="Ожидает распознавания",
+                    progress=0.0,
+                )
+            try:
+                self._persist(job)
+            except OSError:
+                log.exception("cannot persist restarted job %s", job.id)
+            self._begin_run(job.id, run_source, work_dir)
+            log.info("job %s recognition restarted", job_id)
+            return job
+
+    # ------------------------------------------------------------------ #
+    # Diarization stage
+    # ------------------------------------------------------------------ #
+    def _start_diarization(self, job_id: str, *, auto: bool = False) -> Job:
+        with self._lock:
+            job = self._jobs.get(job_id) or self.get(job_id)
+            if job is None:
+                raise KeyError(f"Job {job_id} not found.")
+            if job.status != "done":
+                raise ValueError("Диаризация доступна только после распознавания.")
+            if not job.segments:
+                raise ValueError("Нет сегментов для диаризации.")
+            if job.stages["diarization"]["status"] == STAGE_RUNNING:
+                raise ValueError("Диаризация уже выполняется.")
+            source = self._source_for_job(job)
+            self._stop_stage_worker(job_id, "diarization")
+            # Speaker labels change the transcript, so an old summary is stale.
+            summarize_enabled = self._settings().summarize_enabled
+            has_text = bool(job.text.strip())
+            summary_stage = job.stages["summary"]
+            summary_status = str(summary_stage.get("status", ""))
+            summary_phase = str(summary_stage.get("phase", ""))
+            stale_summary = (
+                job.summary is not None
+                or summary_status in {STAGE_RUNNING, STAGE_DONE, STAGE_ERROR}
+                or (summary_status == STAGE_PENDING and summary_phase.startswith("Ожидает"))
+            )
+            self._stop_stage_worker(job_id, "summary")
+            if summarize_enabled and has_text:
+                job.summary = None
+                self._set_stage(
+                    job,
+                    "summary",
+                    status=STAGE_PENDING,
+                    phase="Ожидает диаризации",
+                    progress=0.0,
+                )
+            elif stale_summary:
+                job.summary = None
+                self._set_stage(
+                    job,
+                    "summary",
+                    status=STAGE_SKIPPED,
+                    phase="Отключена в настройках",
+                    progress=0.0,
+                )
+            token = self._new_stage_token(job_id, "diarization")
+            self._set_stage(
+                job,
+                "diarization",
+                status=STAGE_RUNNING,
+                phase="Подготовка",
+                progress=0.02,
+            )
+            try:
+                self._persist(job)
+            except OSError:
+                log.exception("cannot persist diarization start for %s", job_id)
+        work_dir = self._paths.temp / "jobs" / f"{job_id}-diarization-{token}"
+        try:
+            future = self._executor.submit(
+                self._run_diarization, job_id, source, work_dir, token
+            )
+        except RuntimeError as exc:
+            self.fail_diarization(job_id, f"Не удалось запустить диаризацию: {exc}")
+            return job
+        with self._lock:
+            self._stage_futures[(job_id, "diarization")] = future
+        log.info("job %s diarization %s", job_id, "auto-started" if auto else "started")
+        return job
+
+    def _run_diarization(
+        self, job_id: str, source: Path, work_dir: Path, token: int
+    ) -> None:
+        settings = self._settings()
+
+        def check_cancel() -> None:
             if (
-                job is None
-                or job.status != "done"
-                or not self._token_current(job_id, token)
-                or self._cancel_requested(job_id)
+                not self._stage_token_current(job_id, "diarization", token)
+                or self._stage_cancel_requested(job_id, "diarization")
             ):
+                raise DiarizationCancelled()
+
+        def progress(value: float, phase: str) -> None:
+            check_cancel()
+            self._update_stage(
+                job_id,
+                "diarization",
+                status=STAGE_RUNNING,
+                progress=value,
+                phase=phase,
+                token=token,
+            )
+
+        try:
+            job = self.get(job_id)
+            if job is None:
                 return
+            segments = diarize_transcription(
+                source,
+                list(job.segments),
+                cpu_threads=settings.cpu_threads,
+                ffmpeg=self._ffmpeg,
+                work_dir=work_dir,
+                stage_progress=lambda _stage, value, phase: progress(value, phase),
+                cancel=check_cancel,
+                diarize_threshold=settings.diarize_threshold,
+                diarize_model=settings.diarize_model,
+                diarize_model_path=settings.diarize_model_path,
+                models_dir=self._paths.models,
+            )
+            payload = [asdict(segment) for segment in segments]
+            speakers = {segment.speaker for segment in segments if segment.speaker}
+            transcript_path = self._job_dir(job_id) / "transcript.txt"
+            stale = False
+            with self._lock:
+                current = self._jobs.get(job_id)
+                if (
+                    current is None
+                    or current.status != "done"
+                    or not self._stage_token_current(job_id, "diarization", token)
+                ):
+                    stale = True
+                else:
+                    current.segments = payload
+                    current.summary = None
+                    transcript_path.parent.mkdir(parents=True, exist_ok=True)
+                    transcript_path.write_text(
+                        (export_txt(payload) or current.text) + "\n",
+                        encoding="utf-8",
+                        newline="\n",
+                    )
+                    self._set_stage(
+                        current,
+                        "diarization",
+                        status=STAGE_DONE if speakers else STAGE_SKIPPED,
+                        phase=(
+                            f"Спикеров: {len(speakers)}"
+                            if speakers
+                            else "Спикеры не найдены"
+                        ),
+                        progress=1.0,
+                        finished=True,
+                    )
+                    if settings.summarize_enabled and current.text.strip():
+                        self._set_stage(
+                            current,
+                            "summary",
+                            status=STAGE_PENDING,
+                            phase="Ожидает запуска",
+                            progress=0.0,
+                        )
+                    elif str(current.stages["summary"].get("phase", "")).startswith(
+                        "Ожидает"
+                    ):
+                        self._set_stage(
+                            current,
+                            "summary",
+                            status=STAGE_SKIPPED,
+                            phase="Отключена в настройках",
+                            progress=0.0,
+                        )
+                    try:
+                        self._persist(current)
+                    except OSError:
+                        log.exception("cannot persist diarization for %s", job_id)
+            if stale:
+                return
+            self._maybe_auto_summary(job_id)
+        except DiarizationCancelled:
+            log.info("diarization stopped for job %s", job_id)
+        except DiarizationError as exc:
+            log.warning("diarization failed for job %s: %s", job_id, exc)
+            self.fail_diarization(job_id, f"Диаризация: {exc}")
+            self._maybe_auto_summary(job_id)
+        except Exception as exc:
+            log.exception("unexpected diarization failure for job %s", job_id)
+            self.fail_diarization(job_id, f"Диаризация: {exc}")
+            self._maybe_auto_summary(job_id)
+        finally:
+            if not settings.keep_extracted_audio:
+                self._cleanup_source(work_dir)
+
+    def fail_diarization(self, job_id: str, error: str) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id) or self.get(job_id)
+            if job is None:
+                return
+            self._set_stage(
+                job,
+                "diarization",
+                status=STAGE_ERROR,
+                phase=error[:200] or "Ошибка диаризации",
+                progress=1.0,
+            )
+            try:
+                self._persist(job)
+            except OSError:
+                log.exception("cannot persist diarization error for %s", job_id)
+
+    def _maybe_auto_summary(self, job_id: str) -> None:
+        settings = self._settings()
+        with self._lock:
+            job = self._jobs.get(job_id) or self.get(job_id)
+            if job is None or job.status != "done" or not job.text.strip():
+                return
+            if not settings.summarize_enabled:
+                return
+            summary_stage = job.stages["summary"]
+            if summary_stage["status"] in {STAGE_RUNNING, STAGE_DONE}:
+                return
+            # Only continue a summary that was explicitly queued by the
+            # pipeline.  A stage stopped by the user or failed on its own must
+            # not be restarted behind their back.
+            if not str(summary_stage.get("phase", "")).startswith("Ожидает"):
+                return
+        try:
+            self._start_summary(job_id, auto=True)
+        except Exception:
+            log.exception("cannot auto-start summary for %s", job_id)
+
+    # ------------------------------------------------------------------ #
+    # Summary stage
+    # ------------------------------------------------------------------ #
+    def _start_summary(self, job_id: str, *, auto: bool = False) -> Job:
+        with self._lock:
+            job = self._jobs.get(job_id) or self.get(job_id)
+            if job is None:
+                raise KeyError(f"Job {job_id} not found.")
+            if job.status != "done":
+                raise ValueError("Саммаризация доступна только после распознавания.")
+            if not job.text.strip():
+                raise ValueError("Транскрипт пуст.")
+            if job.stages["summary"]["status"] == STAGE_RUNNING:
+                raise ValueError("Саммаризация уже выполняется.")
+            self._stop_stage_worker(job_id, "summary")
+            if self._summary_runner is None:
+                job.summary = None
+                self._set_stage(
+                    job,
+                    "summary",
+                    status=STAGE_ERROR,
+                    phase=(
+                        "LLM не настроен: установите llama-server и GGUF-модель "
+                        "или выберите провайдера в настройках."
+                    ),
+                    progress=1.0,
+                )
+                try:
+                    self._persist(job)
+                except OSError:
+                    log.exception("cannot persist missing LLM state for %s", job_id)
+                return job
+            token = self._new_stage_token(job_id, "summary")
+            job.summary = None
             self._set_stage(
                 job,
                 "summary",
@@ -1126,38 +1521,50 @@ class JobManager:
             try:
                 self._persist(job)
             except OSError:
-                log.exception("cannot persist auto summary start for %s", job_id)
+                log.exception("cannot persist summary start for %s", job_id)
         try:
-            future = self._summary_executor.submit(
-                self._auto_summary, job_id, token
-            )
+            future = self._summary_executor.submit(self._run_summary, job_id, token)
+        except RuntimeError as exc:
+            self.fail_summary(job_id, f"Не удалось запустить саммаризацию: {exc}")
+            return job
+        with self._lock:
             self._summary_futures[job_id] = future
-        except RuntimeError:
-            log.exception("cannot queue automatic summary for %s", job_id)
-            self.fail_summary(job_id, "Не удалось запустить саммаризацию.")
+            self._stage_futures[(job_id, "summary")] = future
+        log.info("job %s summary %s", job_id, "auto-started" if auto else "started")
+        return job
 
-    def _auto_summary(self, job_id: str, token: int) -> None:
+    def _run_summary(self, job_id: str, token: int) -> None:
         runner = self._summary_runner
         if runner is None:
             return
 
         def progress(value: float, phase: str) -> None:
-            if not self._token_current(job_id, token) or self._cancel_requested(job_id):
+            if (
+                not self._stage_token_current(job_id, "summary", token)
+                or self._stage_cancel_requested(job_id, "summary")
+            ):
                 raise JobCancelled()
-            self.update_summary(job_id, value, phase)
+            self._update_stage(
+                job_id,
+                "summary",
+                status=STAGE_RUNNING,
+                progress=value,
+                phase=phase,
+                token=token,
+            )
 
         try:
             summary = runner(job_id, progress)
         except JobCancelled:
             return
         except Exception as exc:  # summary errors must not fail the transcript
-            log.exception("automatic summary failed for job %s", job_id)
+            log.exception("summary failed for job %s", job_id)
             with self._lock:
                 job = self._jobs.get(job_id)
                 if (
                     job is not None
                     and job.status == "done"
-                    and self._token_current(job_id, token)
+                    and self._stage_token_current(job_id, "summary", token)
                 ):
                     self.fail_summary(job_id, f"Саммаризация: {exc}")
             return
@@ -1166,7 +1573,7 @@ class JobManager:
             if (
                 job is not None
                 and job.status == "done"
-                and self._token_current(job_id, token)
+                and self._stage_token_current(job_id, "summary", token)
             ):
                 self.finish_summary(job_id, summary)
 
@@ -1212,7 +1619,7 @@ class JobManager:
             job_id,
             "summary",
             status=STAGE_ERROR,
-            phase=error[:160] or "Ошибка",
+            phase=error[:200] or "Ошибка",
             progress=1.0,
         )
 

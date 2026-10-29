@@ -31,11 +31,12 @@ interface ModelsPageProps {
   onAuthError: () => void;
 }
 
-const KIND_ORDER = ['asr', 'diarization', 'llm-gguf', 'vad'] as const;
+const KIND_ORDER = ['asr', 'diarization', 'runtime', 'llm-gguf', 'vad'] as const;
 
 const KIND_LABELS: Record<string, string> = {
   asr: 'Распознавание речи',
   diarization: 'Диаризация (спикеры)',
+  runtime: 'Среда llama.cpp (llama-server)',
   'llm-gguf': 'Языковые модели для саммари',
   vad: 'Голосовая активность (VAD)',
   ollama: 'Ollama (локальные модели)',
@@ -71,6 +72,9 @@ function downloadPhase(model: ModelItem): { value: number; phase: string; failed
 }
 
 function installedLabel(model: ModelItem): { text: string; color: 'success' | 'informative' | 'subtle' } {
+  if (model.kind === 'runtime' && model.installed) {
+    return { text: 'llama-server установлен', color: 'success' };
+  }
   if (model.local) {
     return { text: 'Установлена в папке данных', color: 'success' };
   }

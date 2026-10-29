@@ -21,11 +21,13 @@ from typing import Any
 
 import httpx
 
+from airec.llm.runtime import find_llama_server
+
 log = logging.getLogger(__name__)
 
 DEFAULT_LLAMA_SERVER_PORT = 11435  # avoid clash with ollama's 11434
-LLAMA_SERVER_STARTUP_TIMEOUT_S = 60.0
-LLAMA_SERVER_REQUEST_TIMEOUT_S = 300.0
+LLAMA_SERVER_STARTUP_TIMEOUT_S = 180.0
+LLAMA_SERVER_REQUEST_TIMEOUT_S = 600.0
 
 
 class LLMError(RuntimeError):
@@ -52,14 +54,22 @@ class LLMProvider(ABC):
 
 
 def _parse_json_strict(text: str) -> dict[str, Any]:
-    """Parse JSON from model output, tolerating markdown code fences."""
+    """Parse JSON from model output, tolerating fences and short preambles."""
     cleaned = text.strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.split("```", 2)[1] if "```" in cleaned[3:] else cleaned
         if cleaned.startswith("json"):
             cleaned = cleaned[4:]
     cleaned = cleaned.strip()
-    return json.loads(cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Small local models sometimes add "Вот результат:" before the JSON.
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(cleaned[start : end + 1])
+        raise
 
 
 class LlamaCppProvider(LLMProvider):
@@ -93,51 +103,57 @@ class LlamaCppProvider(LLMProvider):
     # Lifecycle
     # ------------------------------------------------------------------ #
     def _resolve_binary(self) -> str:
-        if self.binary is not None and self.binary.is_file():
-            return str(self.binary)
-        for candidate in ("llama-server.exe", "llama-server"):
-            found = self.binary / candidate if self.binary else None
-            if found is not None and found.is_file():
-                return str(found)
-        # Fall back to PATH.
-        import shutil
-
-        found = shutil.which("llama-server") or shutil.which("llama-server.exe")
-        if found:
-            return found
+        found = find_llama_server(custom=self.binary)
+        if found is not None:
+            return str(found)
         raise LLMError(
-            "llama-server не найден. Положите llama-server.exe в папку bin "
-            "рядом с приложением или укажите путь в настройках."
+            "llama-server не найден. Скачайте runtime в менеджере моделей "
+            "(«Среда llama.cpp») или укажите путь в настройках."
         )
 
     def _ensure_running(self) -> None:
         with self._lock:
             if self._process is not None and self._process.poll() is None:
                 return
+            model_path = Path(self.model)
+            if not model_path.is_file() or model_path.suffix.lower() != ".gguf":
+                raise LLMError(
+                    "GGUF-модель для саммари не найдена. Скачайте модель в "
+                    "менеджере моделей и выберите её в настройках."
+                )
             binary = self._resolve_binary()
             cmd = [
                 binary,
                 "--model", self.model,
                 "--ctx-size", str(self.ctx_size),
                 "--threads", str(self.threads),
+                # Summaries do not need a long chain of thought.  Disabling it
+                # keeps CPU-only generation several times faster and avoids
+                # models that emit reasoning_content but no final JSON.
+                "--reasoning", "off",
                 "--host", "127.0.0.1",
                 "--port", str(self.port),
             ]
             log.info("starting llama-server: %s", " ".join(cmd))
+            # Never pipe llama-server output: it logs continuously and an
+            # unread pipe would eventually block the server.  Logs are not
+            # needed for normal operation; startup failures are reported by
+            # the exit code and the health probe below.
             self._process = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 creationflags=0x08000000 if os.name == "nt" else 0,  # CREATE_NO_WINDOW
             )
             # Wait for /v1/models to become available.
             deadline = time.monotonic() + LLAMA_SERVER_STARTUP_TIMEOUT_S
-            last_error = ""
             while time.monotonic() < deadline:
                 if self._process.poll() is not None:
-                    _, stderr = self._process.communicate()
-                    last_error = stderr.decode("utf-8", errors="replace")[-2000:]
-                    raise LLMError(f"llama-server завершился при старте: {last_error}")
+                    raise LLMError(
+                        "llama-server завершился при старте "
+                        f"(код {self._process.returncode}). Проверьте, что "
+                        "runtime llama.cpp и GGUF-модель совместимы."
+                    )
                 try:
                     resp = self._client.get("/v1/models", timeout=3.0)
                     if resp.status_code == 200:

@@ -165,6 +165,31 @@ def retry_job(request: Request, job_id: str) -> dict[str, object]:
     return new_job.detail()
 
 
+@router.post("/{job_id}/stages/{stage}/{action}")
+def stage_action(
+    request: Request, job_id: str, stage: str, action: str
+) -> dict[str, object]:
+    """Start, stop or restart one independent processing stage."""
+    manager = _manager(request)
+    try:
+        if action == "start":
+            job = manager.start_stage(job_id, stage)
+        elif action == "stop":
+            job = manager.stop_stage(job_id, stage)
+        elif action == "restart":
+            job = manager.restart_stage(job_id, stage)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Неизвестное действие. Доступно: start, stop, restart.",
+            )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return job.detail()
+
+
 @router.post("/{job_id}/start")
 def start_job(request: Request, job_id: str) -> dict[str, object]:
     """Запустить задачу, добавленную без автозапуска."""

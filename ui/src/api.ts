@@ -29,6 +29,7 @@ export interface Settings {
   external_llm_base_url: string;
   external_llm_api_key: string;
   llm_provider: string;
+  llm_server_path: string;
   llm_ctx_size: number;
   llm_threads: number;
   summarize_enabled: boolean;
@@ -461,6 +462,19 @@ export function startJob(jobId: string): Promise<JobDetail> {
   );
 }
 
+export type StageAction = 'start' | 'stop' | 'restart';
+
+export function stageAction(
+  jobId: string,
+  stage: StageKey,
+  action: StageAction,
+): Promise<JobDetail> {
+  return request<JobDetail>(
+    `/api/v1/jobs/${encodeURIComponent(jobId)}/stages/${stage}/${action}`,
+    { method: 'POST', timeoutMs: 15_000 },
+  );
+}
+
 export function revealJobFolder(jobId: string): Promise<{ id: string; path: string }> {
   return request<{ id: string; path: string }>(
     `/api/v1/jobs/${encodeURIComponent(jobId)}/reveal`,
@@ -552,7 +566,7 @@ export interface ModelItem {
   purpose?: string;
   installed: boolean;
   local?: boolean;
-  location?: 'data' | 'huggingface-cache' | null;
+  location?: 'data' | 'huggingface-cache' | 'runtime' | null;
   download_progress?: {
     value: number;
     phase: string;

@@ -52,11 +52,25 @@ def _toast_xml(job_id: str, filename: str, *, error: bool = False) -> str:
 </toast>"""
 
 
-def show_job_toast(job_id: str, filename: str, *, error: bool = False) -> bool:
-    """Show a Windows toast for a finished job. Never raises."""
+def _queued_toast_xml(filenames: list[str], count: int | None = None) -> str:
+    """Toast shown when files from Explorer are accepted by the queue."""
+    total = len(filenames) if count is None else count
+    first = escape(filenames[0], {'"': "&quot;"}) if filenames else "файл"
+    message = first if total <= 1 else f"{first} и ещё {total - 1}"
+    return f"""<toast>
+  <visual>
+    <binding template="ToastGeneric">
+      <text>Взят в работу</text>
+      <text>{message}</text>
+      <text placement="attribution">AI Recogniser</text>
+    </binding>
+  </visual>
+</toast>"""
+
+
+def _show_toast_xml(xml: str, subject: str) -> bool:
     if os.name != "nt":
         return False
-    xml = _toast_xml(job_id, filename, error=error)
     encoded = base64.b64encode(xml.encode("utf-8")).decode("ascii")
     script = _SCRIPT.replace("{XML_BASE64}", encoded)
     try:
@@ -77,14 +91,30 @@ def show_job_toast(job_id: str, filename: str, *, error: bool = False) -> bool:
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        log.exception("cannot show a Windows toast for job %s", job_id)
+        log.exception("cannot show a Windows toast for %s", subject)
         return False
     if completed.returncode != 0:
         log.warning(
-            "toast failed for job %s: %s",
-            job_id,
+            "toast failed for %s: %s",
+            subject,
             completed.stderr.decode("utf-8", errors="replace")[:400],
         )
         return False
-    log.info("toast shown for job %s", job_id)
+    log.info("toast shown for %s", subject)
     return True
+
+
+def show_job_toast(job_id: str, filename: str, *, error: bool = False) -> bool:
+    """Show a Windows toast for a finished job. Never raises."""
+    return _show_toast_xml(
+        _toast_xml(job_id, filename, error=error), f"job {job_id}"
+    )
+
+
+def show_queued_toast(
+    filenames: list[str], count: int | None = None
+) -> bool:
+    """Tell the user that Explorer files were accepted, without opening the app."""
+    return _show_toast_xml(
+        _queued_toast_xml(filenames, count), "queued files"
+    )

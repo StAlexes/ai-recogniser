@@ -38,6 +38,7 @@ hiddenimports = [
     "airec.asr.service",
     "airec.asr.vad",
     "airec.integrations.windows",
+    "airec.llm.runtime",
     "airec.notify.windows_toast",
     "airec.rag.client",
     "multipart",

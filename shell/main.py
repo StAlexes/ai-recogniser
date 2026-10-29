@@ -34,6 +34,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from airec.core.paths import APP_TITLE, AppPaths, resource_root
+from airec.notify.windows_toast import show_queued_toast
 from airec.version import __version__
 
 try:  # `python -m shell.main`
@@ -974,9 +975,21 @@ def run_gui(paths: AppPaths, args: argparse.Namespace) -> int:
 
     # Добавить файлы из контекстного меню в очередь (если переданы).
     if args.files:
+        def enqueue_from_context_menu() -> None:
+            queued = enqueue_files(core, args.files, core.token)
+            if queued:
+                show_queued_toast(
+                    [Path(item).name for item in args.files], len(queued)
+                )
+            else:
+                LOG.warning("could not enqueue context-menu files on first launch")
+                message_box(
+                    "Не удалось добавить файлы в очередь. "
+                    "Откройте AI Recogniser и добавьте их вручную."
+                )
+
         threading.Thread(
-            target=enqueue_files,
-            args=(core, args.files, core.token),
+            target=enqueue_from_context_menu,
             name="context-menu-enqueue",
             daemon=True,
         ).start()
@@ -993,6 +1006,9 @@ def run_gui(paths: AppPaths, args: argparse.Namespace) -> int:
             height=800,
             min_size=(960, 640),
             background_color="#F3F3F3",
+            # Explorer "Send to" / context-menu launches must not steal focus.
+            # The tray icon still lets the user open the window later.
+            hidden=bool(args.files),
         )
         app = ShellApp(window, core, paths, close_to_tray=settings.close_to_tray)
         window.events.closing += app.on_closing
@@ -1095,8 +1111,8 @@ def enqueue_files_via_running_instance(paths: AppPaths, files: list[str]) -> lis
     """Forward context-menu files to the already running app.
 
     The second process never owns a core handle, so it uses ``session.json``
-    written by the first instance.  On success it asks the window to navigate
-    to the first queued job.
+    written by the first instance.  The main window is never activated: the
+    caller shows a toast for accepted files instead.
     """
     if not files:
         return []
@@ -1112,10 +1128,9 @@ def enqueue_files_via_running_instance(paths: AppPaths, files: list[str]) -> lis
         port=session.port,
         version=session.version,
     )
-    queued = enqueue_files(core, files, session.token)
-    if queued:
-        request_navigation(paths, queued[0])
-    return queued
+    # Explorer launches must not steal focus or navigate the main window.
+    # The user only gets a toast that the files were accepted.
+    return enqueue_files(core, files, session.token)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1201,6 +1216,16 @@ def main(argv: list[str] | None = None) -> int:
                 queued = enqueue_files_via_running_instance(paths, args.files)
                 if queued:
                     LOG.info("forwarded %d file(s) to the running instance", len(queued))
+                    show_queued_toast(
+                        [Path(item).name for item in args.files], len(queued)
+                    )
+                    return 0
+                LOG.warning("could not forward files to the running instance")
+                message_box(
+                    "Не удалось добавить файлы в очередь. "
+                    "Откройте AI Recogniser и добавьте их вручную."
+                )
+                return 1
             if not activate_existing_window():
                 message_box(f"{APP_TITLE} уже запущен.", error=False)
             return 0

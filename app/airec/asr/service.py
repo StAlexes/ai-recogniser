@@ -36,6 +36,7 @@ FALLBACK_WINDOW_SECONDS = 60.0
 
 ProgressCallback = Callable[[float, str], None]
 StageProgressCallback = Callable[[str, float, str], None]
+CancelCallback = Callable[[], None]
 
 
 class AsrError(RuntimeError):
@@ -349,3 +350,79 @@ def transcribe(
         )
     except AudioError as exc:
         raise AsrError(str(exc)) from exc
+
+
+def diarize_transcription(
+    source: Path,
+    segments: list[SpeechSegment] | list[dict[str, Any]],
+    *,
+    cpu_threads: int = 0,
+    ffmpeg: str | None = None,
+    work_dir: Path,
+    stage_progress: StageProgressCallback | None = None,
+    cancel: CancelCallback | None = None,
+    diarize_threshold: float = 0.70,
+    diarize_model: str = "",
+    diarize_model_path: str = "",
+    models_dir: Path | None = None,
+) -> tuple[SpeechSegment, ...]:
+    """Run only the diarization stage for already recognised *segments*.
+
+    The source file is normalised again to 16 kHz mono because the temporary
+    WAV from the recognition worker may already have been cleaned up.  The
+    function is intentionally independent from :func:`transcribe`, so the UI
+    can restart diarization without repeating recognition.
+    """
+    if not segments:
+        return ()
+
+    notify = stage_progress or (lambda _stage, _value, _phase: None)
+
+    def check_cancel() -> None:
+        if cancel is not None:
+            cancel()
+
+    def progress(value: float, phase: str) -> None:
+        check_cancel()
+        notify("diarization", max(0.0, min(value, 1.0)), phase)
+
+    check_cancel()
+    progress(0.02, "Подготовка аудио")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    wav_path, _duration = prepare_wav(
+        source,
+        work_dir / "normalized-16k-mono.wav",
+        ffmpeg=ffmpeg,
+    )
+    check_cancel()
+    progress(0.08, "Чтение аудио")
+    audio = read_pcm16_mono(wav_path, sample_rate=SAMPLE_RATE)
+    segment_dicts = [
+        segment.as_dict() if isinstance(segment, SpeechSegment) else dict(segment)
+        for segment in segments
+    ]
+    repo_id, model_path = _resolve_diarization(
+        diarize_model, diarize_model_path, models_dir
+    )
+    check_cancel()
+    diarized = diarize_segments(
+        segment_dicts,
+        audio,
+        SAMPLE_RATE,
+        cpu_threads=cpu_threads,
+        threshold=diarize_threshold,
+        model_path=model_path,
+        repo_id=repo_id,
+        cancel=check_cancel,
+        progress=progress,
+    )
+    progress(1.0, "Готово")
+    return tuple(
+        SpeechSegment(
+            item["start_s"],
+            item["end_s"],
+            item["text"],
+            speaker=item.get("speaker"),
+        )
+        for item in diarized
+    )

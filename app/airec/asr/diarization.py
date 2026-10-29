@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,10 @@ def _normalize(vector: np.ndarray) -> np.ndarray:
 
 class DiarizationError(RuntimeError):
     """Диаризация недоступна (модель эмбеддингов не загружена)."""
+
+
+class DiarizationCancelled(RuntimeError):
+    """The user stopped the diarization stage."""
 
 
 def load_se(
@@ -118,7 +123,13 @@ def load_se(
         return _se
 
 
-def _embed(se: Any, clips: list[np.ndarray]) -> np.ndarray:
+def _embed(
+    se: Any,
+    clips: list[np.ndarray],
+    *,
+    cancel: Callable[[], None] | None = None,
+    progress: Callable[[float, str], None] | None = None,
+) -> np.ndarray:
     """Embed *clips* (1-D float32 arrays) and return an (N, dim) matrix."""
     usable: list[np.ndarray] = []
     for clip in clips:
@@ -127,13 +138,21 @@ def _embed(se: Any, clips: list[np.ndarray]) -> np.ndarray:
         usable.append(clip.astype(np.float32, copy=False))
 
     embeddings: list[np.ndarray] = []
+    total = max(len(usable), 1)
     for offset in range(0, len(usable), EMBED_BATCH):
+        if cancel is not None:
+            cancel()
         batch = usable[offset : offset + EMBED_BATCH]
         # SeAdapter.embedding accepts a list of waveforms and returns (N, dim).
         result = np.asarray(se.embedding(batch), dtype=np.float32)
         if result.ndim == 1:
             result = result.reshape(1, -1)
         embeddings.append(result)
+        if progress is not None:
+            progress(
+                0.9 * min((offset + len(batch)) / total, 1.0),
+                f"Эмбеддинги спикеров: {offset + len(batch)} из {len(usable)}",
+            )
     return np.vstack(embeddings)
 
 
@@ -146,12 +165,15 @@ def diarize_segments(
     threshold: float = SIMILARITY_THRESHOLD,
     model_path: str | Path | None = None,
     repo_id: str | None = None,
+    cancel: Callable[[], None] | None = None,
+    progress: Callable[[float, str], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Assign speaker labels to *segments* in-place and return them.
 
     *audio* — float32 PCM array at *sample_rate* (16 kHz).  Each segment is
     sliced and embedded with WeSpeaker; embeddings are clustered by cosine
-    similarity to the running cluster centroids.
+    similarity to the running cluster centroids.  *cancel* is polled between
+    expensive steps so a stopped stage does not keep the worker busy.
     """
     if not segments:
         return segments
@@ -159,6 +181,8 @@ def diarize_segments(
     clips: list[np.ndarray] = []
     embedded_indices: list[int] = []
     for index, segment in enumerate(segments):
+        if cancel is not None and index % 32 == 0:
+            cancel()
         start = round(float(segment.get("start_s", 0.0)) * sample_rate)
         end = round(float(segment.get("end_s", segment.get("start_s", 0.0))) * sample_rate)
         end = max(end, start + 1)
@@ -172,9 +196,13 @@ def diarize_segments(
     if not clips:
         return segments
 
+    if progress is not None:
+        progress(0.0, "Загрузка модели спикеров")
     se = load_se(cpu_threads, model_path=model_path, repo_id=repo_id)
     try:
-        embeddings = _embed(se, clips)
+        embeddings = _embed(se, clips, cancel=cancel, progress=progress)
+    except DiarizationCancelled:
+        raise
     except Exception as exc:  # onnx runtime/preprocessor failure
         raise DiarizationError(f"Не удалось вычислить эмбеддинги спикеров: {exc}") from exc
 
@@ -183,7 +211,12 @@ def diarize_segments(
     centroid_embs: list[np.ndarray] = []
     speaker_counts: dict[str, int] = {}
 
-    for segment_index, embedding in zip(embedded_indices, embeddings, strict=True):
+    total_segments = max(len(embedded_indices), 1)
+    for position, (segment_index, embedding) in enumerate(
+        zip(embedded_indices, embeddings, strict=True)
+    ):
+        if cancel is not None and position % 32 == 0:
+            cancel()
         emb = _normalize(embedding.reshape(-1))
 
         best_idx: int | None = None
@@ -209,5 +242,10 @@ def diarize_segments(
             speaker_counts[label] = 1
 
         segments[segment_index]["speaker"] = label
+        if progress is not None and (position % 32 == 0 or position + 1 == total_segments):
+            progress(
+                0.9 + 0.1 * ((position + 1) / total_segments),
+                f"Группировка спикеров: {position + 1} из {len(embedded_indices)}",
+            )
 
     return segments

@@ -44,6 +44,9 @@ class Settings(BaseModel):
     external_llm_base_url: str = "http://127.0.0.1:11434"
     external_llm_api_key: str = ""
     llm_provider: str = "llamacpp-local"
+    # Optional path to llama-server.exe (or the folder containing it).  Empty
+    # means: use the downloaded runtime, bin next to the app, or PATH.
+    llm_server_path: str = ""
     llm_ctx_size: int = Field(default=4096, ge=512, le=131072)
     llm_threads: int = Field(default=0, ge=0, le=256)
     # Run the summary stage automatically after each successful transcription.

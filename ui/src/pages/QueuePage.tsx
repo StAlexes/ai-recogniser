@@ -178,7 +178,6 @@ export function QueuePage({ onAuthError, onOpenJob }: QueuePageProps) {
     setNotice(`Загрузка файлов: ${batch.length}…`);
     const uploadedIds = new Set<string>();
     const jobIds: string[] = [];
-    let firstJobId: string | null = null;
     let firstError: string | null = null;
 
     for (const file of batch) {
@@ -186,9 +185,6 @@ export function QueuePage({ onAuthError, onOpenJob }: QueuePageProps) {
         const job = await uploadJob(file.file);
         uploadedIds.add(file.id);
         jobIds.push(job.id);
-        if (firstJobId === null) {
-          firstJobId = job.id;
-        }
       } catch (reason: unknown) {
         if (reason instanceof AuthError) {
           onAuthError();
@@ -225,15 +221,12 @@ export function QueuePage({ onAuthError, onOpenJob }: QueuePageProps) {
     setUploading(false);
     if (firstError !== null) {
       setError(firstError);
-    } else if (firstJobId !== null) {
+    } else if (jobIds.length > 0) {
       setNotice(
         startAfterUpload
           ? 'Файлы добавлены. Обработка запущена.'
           : 'Файлы добавлены. Обработка начинается автоматически.',
       );
-      await refreshJobs();
-      onOpenJob(firstJobId);
-      return;
     }
     await refreshJobs();
   };

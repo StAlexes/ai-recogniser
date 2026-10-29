@@ -740,6 +740,28 @@ export function SettingsPage({
 
               <div className="settings-row">
                 <div className="settings-row-text">
+                  <span className="settings-label">Путь к llama-server</span>
+                  <span className="settings-hint">
+                    Необязательно. Файл llama-server.exe или папка с ним. Если пусто,
+                    используется runtime, скачанный в менеджере моделей.
+                  </span>
+                </div>
+                <div className="settings-control settings-control-rag">
+                  <Input
+                    className="settings-input-wide"
+                    aria-label="Путь к llama-server"
+                    value={settings.llm_server_path}
+                    disabled={settings.llm_provider !== 'llamacpp-local'}
+                    placeholder="Например, D:\llama.cpp\llama-server.exe"
+                    onChange={(_event, data) => {
+                      update({ llm_server_path: data.value });
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
                   <span className="settings-label">Модель LLM</span>
                   <span className="settings-hint">
                     {settings.llm_provider === 'ollama'
