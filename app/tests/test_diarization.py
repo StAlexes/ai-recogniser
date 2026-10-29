@@ -28,7 +28,6 @@ class FakeSpeakerEmbedding:
 def test_diarize_segments_groups_by_embedding(monkeypatch) -> None:
     fake = FakeSpeakerEmbedding()
     monkeypatch.setattr(diarization, "load_se", lambda *args, **kwargs: fake)
-
     sample_rate = 16_000
     audio = np.concatenate(
         [
@@ -93,3 +92,48 @@ def test_resolve_diarization_prefers_catalog_download(tmp_path: Path) -> None:
 
     assert repo == "Wespeaker/wespeaker-voxceleb-resnet34"
     assert local == model_dir
+
+
+class FakePyannoteSession:
+    """Return spk1 activity in the first half, spk2 in the second.
+
+    The ONNX graph outputs log-softmax values, so an active class uses 0
+    (probability 1) and inactive classes a large negative log-probability.
+    """
+
+    def run(self, _outputs: object, feeds: object) -> list[np.ndarray]:
+        # 20 frames per 10 s window → 0.5 s of audio per frame.
+        frames = 20
+        logits = np.full((1, frames, 7), -10.0, dtype=np.float32)
+        logits[:, :6, 1] = 0.0  # speaker 1: 0-3 s
+        logits[:, 6:, 2] = 0.0  # speaker 2: 3-10 s
+        return [logits]
+
+
+def test_diarize_with_pyannote(monkeypatch) -> None:
+    monkeypatch.setattr(
+        diarization, "load_pyannote", lambda *_args, **_kwargs: FakePyannoteSession()
+    )
+
+    sample_rate = 16_000
+    audio = np.zeros(6 * sample_rate, dtype=np.float32)
+    segments = [
+        {"start_s": 0.5, "end_s": 2.0, "text": "one"},
+        {"start_s": 3.0, "end_s": 5.0, "text": "two"},
+    ]
+
+    result = diarization.diarize_segments(
+        segments, audio, sample_rate, repo_id="onnx-community/pyannote-segmentation-3.0"
+    )
+
+    assert [segment["speaker"] for segment in result] == ["Спикер 1", "Спикер 2"]
+
+
+def test_manifest_includes_pyannote() -> None:
+    manifest = load_manifest(manifest_dir())
+    entry = find_model(manifest, "pyannote-segmentation-3.0")
+
+    assert entry is not None
+    assert entry["repo"] == diarization.PYANNOTE_REPO
+    assert entry["filename"] == "model.onnx"
+    assert entry["size_bytes"] > 0

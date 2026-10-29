@@ -99,6 +99,19 @@
       "purpose": "диаризация"
     },
     {
+      "id": "pyannote-segmentation-3.0",
+      "kind": "diarization",
+      "title": "PyAnnote Segmentation 3.0",
+      "repo": "onnx-community/pyannote-segmentation-3.0",
+      "filename": "model.onnx",
+      "url": "https://huggingface.co/onnx-community/pyannote-segmentation-3.0/resolve/main/onnx/model.onnx",
+      "size_bytes": 5986908,
+      "sha256": "",
+      "license": "MIT",
+      "note": "Рекомендуемая: end-to-end разметка спикеров, до 3 участников, быстрая",
+      "purpose": "диаризация"
+    },
+    {
       "id": "t-lite-it-2.1-8b-q4_k_m",
       "kind": "llm-gguf",
       "title": "T-lite-it-2.1 8B Q4_K_M (T-Bank)",

@@ -39,7 +39,8 @@ AI Recogniser распространяется по лицензии MIT (см. 
 | GigaAM v3 e2e CTC (ai-sage / salute-developers) | MIT | основная ASR-модель, 214 МБ int8, скачивается при первом запуске |
 | GigaAM Multilingual (220M/600M) | MIT | опциональный ASR для KZ/KG/UZ/EN (план) |
 | Silero VAD v5 (ONNX, `istupakov/silero-vad-onnx`) | MIT | нарезка длинных записей; ~2 МБ, скачивается при первом длинном файле |
-| WeSpeaker VoxCeleb (ResNet34 / CAM++ / ECAPA-TDNN512 / ResNet293-LM), ONNX | Apache-2.0 | диаризация: эмбеддинги спикеров + cosine-кластеризация, скачиваются по выбору |
+| PyAnnote Segmentation 3.0 (`onnx-community/pyannote-segmentation-3.0`, ONNX) | MIT | диаризация по умолчанию: end-to-end разметка до 3 спикеров; ~6 МБ, скачивается при первом запуске |
+| WeSpeaker VoxCeleb (ResNet34 / CAM++ / ECAPA-TDNN512 / ResNet293-LM), ONNX | Apache-2.0 | альтернативная диаризация: эмбеддинги спикеров + cosine-кластеризация, скачиваются по выбору |
 | multilingual-e5 | MIT | эмбеддинги базы знаний (план) |
 | Qwen3-4B-Instruct | Apache-2.0 | локальная LLM, лёгкий профиль (план) |
 | T-lite-it-2.1 8B | **проверить до релиза** | локальная LLM для RU (план) |

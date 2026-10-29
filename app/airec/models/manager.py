@@ -92,7 +92,6 @@ class ModelManager:
         return any(
             f.is_file() and f.suffix != ".partial" for f in directory.rglob("*")
         )
-
     # ------------------------------------------------------------------ #
     # Download
     # ------------------------------------------------------------------ #

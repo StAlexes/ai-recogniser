@@ -250,21 +250,30 @@ export function SettingsPage({
   );
   const diarizationHint =
     diarizationValue === 'custom'
-      ? 'Папка с одной моделью WeSpeaker в формате ONNX (файл .onnx).'
-      : selectedDiarizationModel
+      ? 'Папка с моделью в формате ONNX: WeSpeaker (.onnx) или PyAnnote (model.onnx).'
+      : diarizationValue === 'pyannote-segmentation-3.0'
         ? [
-            selectedDiarizationModel.note,
-            selectedDiarizationModel.license,
-            selectedDiarizationModel.size_mb
-              ? `${selectedDiarizationModel.size_mb} МБ`
-              : null,
-            selectedDiarizationModel.installed
-              ? 'скачана'
-              : 'загрузится при первом запуске',
+            selectedDiarizationModel?.note ?? 'End-to-end разметка спикеров, до 3 участников.',
+            selectedDiarizationModel?.license,
+            selectedDiarizationModel?.size_mb ? `${selectedDiarizationModel.size_mb} МБ` : null,
+            selectedDiarizationModel?.installed ? 'скачана' : 'загрузится при первом запуске',
           ]
             .filter(Boolean)
             .join(' · ')
-        : 'Модель загрузится автоматически при первом запуске.';
+        : selectedDiarizationModel
+          ? [
+              selectedDiarizationModel.note,
+              selectedDiarizationModel.license,
+              selectedDiarizationModel.size_mb
+                ? `${selectedDiarizationModel.size_mb} МБ`
+                : null,
+              selectedDiarizationModel.installed
+                ? 'скачана'
+                : 'загрузится при первом запуске',
+            ]
+            .filter(Boolean)
+            .join(' · ')
+          : 'Модель загрузится автоматически при первом запуске.';
 
   const themeLabel =
     THEME_OPTIONS.find((option) => option.value === settings?.theme)?.label ?? 'Системная';
@@ -614,9 +623,15 @@ export function SettingsPage({
 
               <div className="settings-row">
                 <div className="settings-row-text">
-                  <span className="settings-label">Порог сходства</span>
+                  <span className="settings-label">
+                    {diarizationValue === 'pyannote-segmentation-3.0'
+                      ? 'Порог активности речи'
+                      : 'Порог сходства'}
+                  </span>
                   <span className="settings-hint">
-                    От 0.1 до 0.99. Выше — строже группировка по одному спикеру.
+                    {diarizationValue === 'pyannote-segmentation-3.0'
+                      ? 'Для PyAnnote обычно подходит 0.5 — меняйте только если спикеры дробятся или слипаются.'
+                      : 'От 0.1 до 0.99. Выше — строже группировка по одному спикеру.'}
                   </span>
                 </div>
                 <div className="settings-control settings-control-rag-k">

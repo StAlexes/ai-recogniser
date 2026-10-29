@@ -51,7 +51,7 @@ def test_vad_settings_defaults_and_bounds() -> None:
 
 
 def test_diarization_model_default_and_legacy_path() -> None:
-    assert Settings().diarize_model == "wespeaker-voxceleb-resnet34"
+    assert Settings().diarize_model == "pyannote-segmentation-3.0"
 
     legacy = Settings.model_validate({"diarize_model_path": "D:/models/wespeaker"})
 

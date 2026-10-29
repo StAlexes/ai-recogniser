@@ -60,13 +60,14 @@ class Settings(BaseModel):
     vad_min_silence_ms: int = Field(default=300, ge=50, le=5000)
     vad_speech_pad_ms: int = Field(default=100, ge=0, le=1000)
 
-    # Speaker diarization: cluster VAD segments by speaker identity using
-    # WeSpeaker embeddings (optional, disabled by default).  ``diarize_model``
-    # is a manifest id; ``diarize_model_path`` is an optional local ONNX folder
-    # that overrides it (kept for advanced/offline use).
+    # Speaker diarization: label VAD segments with speaker names (optional,
+    # disabled by default).  ``diarize_model`` is a manifest id; the default
+    # pyannote-segmentation-3.0 runs end-to-end speaker segmentation, the
+    # WeSpeaker entries use embeddings + cosine clustering.  ``diarize_model_path``
+    # is an optional local ONNX folder that overrides it (advanced/offline use).
     diarize_enabled: bool = False
     diarize_threshold: float = Field(default=0.70, ge=0.1, le=0.99)
-    diarize_model: str = "wespeaker-voxceleb-resnet34"
+    diarize_model: str = "pyannote-segmentation-3.0"
     diarize_model_path: str = ""
 
     # ragkb runs as a separate, local HTTP service.  It is optional: when it is

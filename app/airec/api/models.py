@@ -44,6 +44,9 @@ def _hf_cached(entry: dict[str, Any]) -> dict[str, Any] | None:
         from huggingface_hub import try_to_load_from_cache
 
         cached = try_to_load_from_cache(repo, filename)
+        if not isinstance(cached, str) and entry.get("kind") == "diarization":
+            # pyannote-segmentation stores weights under onnx/model.onnx.
+            cached = try_to_load_from_cache(repo, f"onnx/{filename}")
     except Exception:  # huggingface_hub is optional at runtime
         return None
     if not isinstance(cached, str):
