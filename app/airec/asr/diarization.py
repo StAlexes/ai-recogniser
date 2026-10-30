@@ -48,6 +48,10 @@ PYANNOTE_REPO = "onnx-community/pyannote-segmentation-3.0"
 PYANNOTE_ONSET = 0.5
 # A speaker region shorter than this is dropped (pyannote default).
 PYANNOTE_MIN_DURATION_S = 0.2
+# A speaker slot with less total speech than this is treated as network noise
+# (a hallucinated sub-second blip) and dropped before labels are numbered —
+# otherwise the blip steals a number from the real voices.
+MIN_SLOT_SPEECH_S = 2.0
 
 # How many segments are embedded in one onnx-asr call.  Larger batches are
 # faster but pad every clip to the longest one, so keep it modest.
@@ -311,12 +315,8 @@ def _pyannote_speaker_regions(
                 f"Анализ спикеров: окно {index + 1} из {len(starts)}",
             )
 
-    # Rename raw speaker channels to consecutive labels in order of first
-    # appearance: the network may pick any of its three slots (e.g. classes
-    # 2 and 3 for two voices), but users expect «Спикер 1», «Спикер 2», ...
-    channel_labels: dict[int, str] = {}
-
-    regions: list[tuple[str, float, float]] = []
+    # Region boundaries per raw speaker slot (sample indices).
+    slot_regions: dict[int, list[tuple[int, int]]] = {}
     min_duration = int(min_duration_s * sample_rate)
     for spk in range(num_speakers):
         active = counts[spk] > 0
@@ -326,7 +326,6 @@ def _pyannote_speaker_regions(
         mask = active & (averaged >= onset)
         if not mask.any():
             continue
-        label = channel_labels.setdefault(spk, f"Спикер {len(channel_labels) + 1}")
         edges = np.diff(mask.astype(np.int8))
         region_starts = np.flatnonzero(edges == 1) + 1
         region_ends = np.flatnonzero(edges == -1) + 1
@@ -336,9 +335,35 @@ def _pyannote_speaker_regions(
             region_ends = np.concatenate((region_ends, [total]))
         for region_start, region_end in zip(region_starts, region_ends, strict=False):
             if region_end - region_start >= min_duration:
-                regions.append(
-                    (label, region_start / sample_rate, region_end / sample_rate)
+                slot_regions.setdefault(spk, []).append(
+                    (int(region_start), int(region_end))
                 )
+
+    if not slot_regions:
+        return []
+
+    # Drop slots whose total speech is negligible: the network sometimes
+    # hallucinates a sub-second blip in one of its three slots, which would
+    # otherwise steal a number from the real voices (the first voice then
+    # gets labelled «Спикер 2»).
+    slot_regions = {
+        spk: regs
+        for spk, regs in slot_regions.items()
+        if sum(end - start for start, end in regs) / sample_rate >= MIN_SLOT_SPEECH_S
+    }
+
+    # Rename raw speaker slots to consecutive labels in order of first
+    # temporal appearance: the network may pick any of its three slots (e.g.
+    # classes 2 and 3 for two voices), but users expect the first person to
+    # speak to be «Спикер 1», the next «Спикер 2», ...
+    ordered = sorted(slot_regions.items(), key=lambda item: item[1][0][0])
+    regions: list[tuple[str, float, float]] = []
+    for number, (_spk, regs) in enumerate(ordered, start=1):
+        label = f"Спикер {number}"
+        regions.extend(
+            (label, region_start / sample_rate, region_end / sample_rate)
+            for region_start, region_end in regs
+        )
     regions.sort(key=lambda item: item[1])
     return regions
 
@@ -473,8 +498,12 @@ def _diarize_with_pyannote(
     if len(segments) > 1:
         log.info("speaker turns: %d segments after split", len(segments))
 
-    # Longest overlap wins; ties prefer the earlier region.
+    # Longest overlap wins; ties prefer the earlier region.  Segments that
+    # overlap nothing (short interjections in the pauses between regions)
+    # continue the previous segment's speaker instead of jumping to the very
+    # first region — a real speaker turn needs a new region to appear.
     total = max(len(segments), 1)
+    previous_label: str | None = None
     for position, segment in enumerate(segments):
         if cancel is not None and position % 32 == 0:
             cancel()
@@ -487,18 +516,82 @@ def _diarize_with_pyannote(
             if overlap > best_overlap:
                 best_overlap = overlap
                 best_label = label
-        segment["speaker"] = best_label or regions[0][0]
+        segment["speaker"] = (
+            segment.get("speaker") or best_label or previous_label or regions[0][0]
+        )
+        previous_label = segment["speaker"]
         if progress is not None and (position % 32 == 0 or position + 1 == total):
             progress(
                 0.55 + 0.45 * ((position + 1) / total),
                 f"Разметка сегментов: {position + 1} из {len(segments)}",
             )
+
+    # Fragments of the same speaker separated by short VAD pauses (a lone
+    # «— Да.», a split utterance) read as separate turns — join them back.
+    before_merge = len(segments)
+    segments = _merge_same_speaker_segments(segments)
+    if len(segments) < before_merge:
+        log.info(
+            "speaker merge: %d -> %d segments", before_merge, len(segments)
+        )
     return segments
 
 
 # A turn shorter than this is not split off: too short pieces are useless and
 # usually mean a token-time jitter right at the boundary.
 MIN_TURN_S = 0.6
+
+# Pyannote region edges jitter by up to a couple of frames (~200 ms), so a
+# word whose midpoint lands in a gap between regions snaps to the nearest
+# region within this distance instead of losing its speaker.
+TURN_TOLERANCE_S = 0.2
+
+# Consecutive segments of the same speaker separated by a pause shorter than
+# this are merged: Silero VAD cuts at ~300 ms pauses, so a short «— Да.»
+# interjection or a pause-broken utterance would otherwise stay a fragment.
+MERGE_GAP_S = 0.5
+# Never merge past the recognition stage's segment cap.
+MAX_MERGED_SEGMENT_S = 30.0
+
+
+def _merge_same_speaker_segments(
+    segments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge consecutive segments of the same speaker separated by a short pause.
+
+    Silero VAD cuts utterances at short pauses (~300 ms) and pads the edges,
+    so a speaker's continuous speech arrives as fragments — a lone «— Да.»
+    between two parts of one utterance, for instance.  Adjacent segments with
+    the same speaker label and a gap below :data:`MERGE_GAP_S` are joined
+    (texts are concatenated with a space) until the merged piece reaches
+    :data:`MAX_MERGED_SEGMENT_S`.  Runs after :func:`_split_at_speaker_turns`,
+    so token fields are already stripped from the pieces.
+    """
+    if len(segments) < 2:
+        return segments
+
+    merged: list[dict[str, Any]] = []
+    for segment in segments:
+        start = float(segment.get("start_s", 0.0))
+        end = max(float(segment.get("end_s", start)), start)
+        speaker = segment.get("speaker")
+        previous = merged[-1] if merged else None
+        if (
+            previous is not None
+            and speaker
+            and previous.get("speaker") == speaker
+            and start - float(previous.get("end_s", start)) < MERGE_GAP_S
+            and end - float(previous.get("start_s", start)) <= MAX_MERGED_SEGMENT_S
+        ):
+            previous["text"] = (
+                f"{str(previous.get('text') or '').strip()} "
+                f"{str(segment.get('text') or '').strip()}".strip()
+            )
+            previous["end_s"] = end
+            continue
+        merged.append(segment)
+    return merged
+
 
 # Same decoding rule as onnx-asr's ``DECODE_SPACE_PATTERN``: a token that is a
 # lone space is dropped, spaces attached to a word boundary are kept as one.
@@ -564,11 +657,21 @@ def _split_at_speaker_turns(
 
         def label_at(moment: float, default: str) -> str:
             # Point-in-region check: a moment inside a region belongs to that
-            # speaker; tokens in a gap between regions stay unlabelled.
+            # speaker; tokens in a gap between regions snap to the nearest
+            # region edge within a small tolerance — pyannote boundaries
+            # jitter, and words right at a speaker turn must keep their
+            # speaker instead of being folded into the previous one.
             for label, region_start, region_end in regions:
                 if region_start <= moment < region_end:
                     return label
-            return default
+            best_label = default
+            best_distance = TURN_TOLERANCE_S
+            for label, region_start, region_end in regions:
+                distance = min(abs(moment - region_start), abs(moment - region_end))
+                if distance < best_distance:
+                    best_label = label
+                    best_distance = distance
+            return best_label
 
         # One vote per token ("" = no region covers it), grouped into words.
         labels = [

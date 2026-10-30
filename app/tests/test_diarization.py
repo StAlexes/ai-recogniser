@@ -191,6 +191,156 @@ def test_pyannote_keeps_segment_without_tokens(monkeypatch) -> None:
     assert result[0]["text"] == "целиком"
 
 
+class SlotPyannoteSession:
+    """Fake pyannote session with per-slot frame ranges (0.5 s per frame).
+
+    The ONNX graph outputs log-softmax values, so an active class uses 0
+    (probability 1) and inactive classes a large negative log-probability.
+    """
+
+    def __init__(self, slots: dict[int, tuple[int, int]]) -> None:
+        self._slots = slots
+
+    def run(self, _outputs: object, _feeds: object) -> list[np.ndarray]:
+        frames = 20
+        logits = np.full((1, frames, 7), -10.0, dtype=np.float32)
+        for slot, (first, last) in self._slots.items():
+            logits[:, first:last, slot] = 0.0
+        return [logits]
+
+
+def test_pyannote_drops_noise_slot(monkeypatch) -> None:
+    """A hallucinated short blip must not steal a speaker number."""
+    monkeypatch.setattr(
+        diarization,
+        "load_pyannote",
+        lambda *_args, **_kwargs: SlotPyannoteSession({1: (0, 2), 2: (0, 10), 3: (12, 20)}),
+    )
+
+    sample_rate = 16_000
+    audio = np.zeros(10 * sample_rate, dtype=np.float32)
+    segments = [
+        {"start_s": 0.5, "end_s": 2.0, "text": "one"},
+        {"start_s": 6.5, "end_s": 8.0, "text": "two"},
+    ]
+
+    result = diarization.diarize_segments(
+        segments, audio, sample_rate, repo_id="onnx-community/pyannote-segmentation-3.0"
+    )
+
+    # Slot 1 holds only 1 s of speech (< MIN_SLOT_SPEECH_S) and is dropped;
+    # slot 2 is the first real voice and slot 3 the second one.
+    assert [segment["speaker"] for segment in result] == ["Спикер 1", "Спикер 2"]
+    assert "Спикер 3" not in [segment["speaker"] for segment in result]
+
+
+def test_pyannote_numbers_by_first_appearance(monkeypatch) -> None:
+    """The first voice to speak becomes «Спикер 1», whichever slot it uses."""
+    monkeypatch.setattr(
+        diarization,
+        "load_pyannote",
+        lambda *_args, **_kwargs: SlotPyannoteSession({3: (0, 10), 2: (12, 20)}),
+    )
+
+    sample_rate = 16_000
+    audio = np.zeros(10 * sample_rate, dtype=np.float32)
+    segments = [
+        {"start_s": 0.5, "end_s": 2.0, "text": "one"},
+        {"start_s": 6.5, "end_s": 8.0, "text": "two"},
+    ]
+
+    result = diarization.diarize_segments(
+        segments, audio, sample_rate, repo_id="onnx-community/pyannote-segmentation-3.0"
+    )
+
+    # Slot 3 speaks first, so it must be «Спикер 1» despite its slot number.
+    assert [segment["speaker"] for segment in result] == ["Спикер 1", "Спикер 2"]
+
+
+def test_pyannote_fallback_continues_previous_speaker(monkeypatch) -> None:
+    """A segment outside every region keeps the previous segment's speaker."""
+    monkeypatch.setattr(
+        diarization,
+        "load_pyannote",
+        lambda *_args, **_kwargs: SlotPyannoteSession({2: (0, 6), 3: (12, 16)}),
+    )
+
+    sample_rate = 16_000
+    audio = np.zeros(10 * sample_rate, dtype=np.float32)
+    segments = [
+        {"start_s": 0.5, "end_s": 2.0, "text": "one"},
+        {"start_s": 3.5, "end_s": 4.5, "text": "gap before"},
+        {"start_s": 6.5, "end_s": 7.5, "text": "two"},
+        {"start_s": 8.5, "end_s": 9.5, "text": "gap after"},
+    ]
+
+    result = diarization.diarize_segments(
+        segments, audio, sample_rate, repo_id="onnx-community/pyannote-segmentation-3.0"
+    )
+
+    assert [segment["speaker"] for segment in result] == [
+        "Спикер 1",
+        "Спикер 1",
+        "Спикер 2",
+        "Спикер 2",
+    ]
+
+
+def test_merge_same_speaker_segments() -> None:
+    """Fragments of one speaker separated by a short pause are joined."""
+    merge = diarization._merge_same_speaker_segments
+    segments = [
+        {"start_s": 0.0, "end_s": 10.0, "speaker": "Спикер 1", "text": "раз"},
+        {"start_s": 10.3, "end_s": 12.0, "speaker": "Спикер 1", "text": "два"},
+        {"start_s": 12.4, "end_s": 14.0, "speaker": "Спикер 1", "text": "три"},
+        {"start_s": 14.9, "end_s": 16.0, "speaker": "Спикер 2", "text": "четыре"},
+        {"start_s": 16.1, "end_s": 18.0, "speaker": "Спикер 2", "text": "пять"},
+        {"start_s": 18.7, "end_s": 20.0, "speaker": "Спикер 2", "text": "шесть"},
+    ]
+
+    result = merge(segments)
+
+    # 10.3 s and 12.4 s gaps are < MERGE_GAP_S: the three «Спикер 1» pieces
+    # join, as do the two «Спикер 2» pieces; the 18.7 s gap (0.7 s) stays.
+    assert len(result) == 3
+    assert (result[0]["start_s"], result[0]["end_s"]) == (0.0, 14.0)
+    assert result[0]["text"] == "раз два три"
+    assert (result[1]["start_s"], result[1]["end_s"]) == (14.9, 18.0)
+    assert result[1]["text"] == "четыре пять"
+    assert (result[2]["start_s"], result[2]["end_s"]) == (18.7, 20.0)
+    assert result[2]["text"] == "шесть"
+    # The input list must not be modified in place.
+    assert len(segments) == 6
+    assert segments[1]["text"] == "два"
+
+
+def test_merge_same_speaker_segments_respects_cap() -> None:
+    """Merging stops once the joined segment reaches MAX_MERGED_SEGMENT_S."""
+    merge = diarization._merge_same_speaker_segments
+    segments = [
+        {"start_s": 0.0, "end_s": 30.0, "speaker": "Спикер 1", "text": "a"},
+        {"start_s": 30.1, "end_s": 40.0, "speaker": "Спикер 1", "text": "b"},
+    ]
+
+    result = merge(segments)
+
+    assert len(result) == 2
+    assert [s["text"] for s in result] == ["a", "b"]
+
+
+def test_merge_same_speaker_segments_requires_label() -> None:
+    """Segments without a speaker label are never merged."""
+    merge = diarization._merge_same_speaker_segments
+    segments = [
+        {"start_s": 0.0, "end_s": 1.0, "speaker": None, "text": "a"},
+        {"start_s": 1.1, "end_s": 2.0, "speaker": None, "text": "b"},
+    ]
+
+    result = merge(segments)
+
+    assert len(result) == 2
+
+
 def test_manifest_includes_pyannote() -> None:
     manifest = load_manifest(manifest_dir())
     entry = find_model(manifest, "pyannote-segmentation-3.0")
