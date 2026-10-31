@@ -26,12 +26,20 @@ from __future__ import annotations
 import logging
 import re
 import threading
+from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from airec.asr.diarization_profiles import (
+    DiarizationProfiles,
+    GigaamLink,
+    PyannoteGroup,
+    WeSpeakerGroup,
+)
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +56,10 @@ PYANNOTE_REPO = "onnx-community/pyannote-segmentation-3.0"
 PYANNOTE_ONSET = 0.5
 # A speaker region shorter than this is dropped (pyannote default).
 PYANNOTE_MIN_DURATION_S = 0.2
+# Sliding segmentation window (seconds) and the step between windows — the
+# defaults mirror onnx-asr: 10 s window with a 5 s step (50% overlap).
+PYANNOTE_WINDOW_DURATION_S = 10.0
+PYANNOTE_WINDOW_STEP_S = 5.0
 # A speaker slot with less total speech than this is treated as network noise
 # (a hallucinated sub-second blip) and dropped before labels are numbered —
 # otherwise the blip steals a number from the real voices.
@@ -229,45 +241,146 @@ def load_pyannote(
         return _pyannote
 
 
+def _hysteresis_mask(
+    averaged: np.ndarray, onset: float, offset: float, *, chunk: int = 2_500_000
+) -> np.ndarray:
+    """Binarise a per-frame speaker-probability curve with an onset/offset pair.
+
+    Кадр переключается в активное состояние, когда вероятность достигает
+    *onset*, и остаётся активным, пока вероятность не опустится до *offset*
+    (гистерезис исключает мерцание метки на паузах).  Кривая обрабатывается
+    блоками, чтобы не держать дополнительные копии длинного массива: состояние
+    (кадр последнего включения/выключения) переносится между блоками.
+    """
+    total = averaged.shape[0]
+    mask = np.empty(total, dtype=bool)
+    last_enter = -1
+    last_kill = -1
+    for begin in range(0, total, chunk):
+        end = min(begin + chunk, total)
+        slice_probs = averaged[begin:end]
+        above_onset = slice_probs >= onset
+        above_offset = slice_probs > offset
+        indices = np.arange(begin, end, dtype=np.int64)
+        enter = np.maximum.accumulate(
+            np.where(above_onset, indices, last_enter), axis=0
+        )
+        kill = np.maximum.accumulate(
+            np.where(~above_offset, indices, last_kill), axis=0
+        )
+        mask[begin:end] = (enter > kill) & above_offset
+        last_enter = int(enter[-1])
+        last_kill = int(kill[-1])
+    return mask
+
+
+def _regions_from_mask(
+    mask: np.ndarray,
+    total: int,
+    *,
+    min_duration_off: int,
+    pad_onset: int,
+    pad_offset: int,
+    min_duration_on: int,
+) -> list[tuple[int, int]]:
+    """Turn a binarised speaker curve into (start, end) sample regions.
+
+    Порядок постобработки повторяет pyannote-конвейер: сперва заполняются
+    паузы короче *min_duration_off* (склейка речевых вздохов), затем регионы
+    расширяются на *pad_onset*/*pad_offset* (защита согласных), и только после
+    этого отбрасываются регионы короче *min_duration_on*.
+    """
+    if not mask.any():
+        return []
+    edges = np.diff(mask.astype(np.int8))
+    region_starts = (np.flatnonzero(edges == 1) + 1).tolist()
+    region_ends = (np.flatnonzero(edges == -1) + 1).tolist()
+    if mask[0]:
+        region_starts.insert(0, 0)
+    if mask[-1]:
+        region_ends.append(total)
+    regions = [(int(s), int(e)) for s, e in zip(region_starts, region_ends, strict=False)]
+
+    # Fill pauses shorter than min_duration_off between neighbouring regions
+    # of the same speaker slot.
+    if min_duration_off > 0:
+        filled: list[tuple[int, int]] = []
+        for start, end in regions:
+            if filled and start - filled[-1][1] < min_duration_off:
+                filled[-1] = (filled[-1][0], end)
+            else:
+                filled.append((start, end))
+        regions = filled
+
+    # Padded regions keep their neighbours: a start may only grow leftwards
+    # up to the previous region's end, an end only up to the next start.
+    if pad_onset > 0 or pad_offset > 0:
+        padded: list[tuple[int, int]] = []
+        for start, end in regions:
+            new_start = max(start - pad_onset, padded[-1][1] if padded else 0)
+            new_end = end + pad_offset
+            padded.append((new_start, new_end))
+        regions = [
+            (s, min(e, next_s))
+            for (s, e), (_n, next_s) in zip(
+                padded, [*padded[1:], (total, total)], strict=True
+            )
+        ]
+    return [(s, e) for s, e in regions if e - s >= min_duration_on]
+
+
 def _pyannote_speaker_regions(
     session: Any,
     audio: np.ndarray,
     sample_rate: int,
     *,
     onset: float = PYANNOTE_ONSET,
-    min_duration_s: float = PYANNOTE_MIN_DURATION_S,
+    offset: float | None = None,
+    min_duration_on_s: float = PYANNOTE_MIN_DURATION_S,
+    min_duration_off_s: float = 0.0,
+    pad_onset_s: float = 0.0,
+    pad_offset_s: float = 0.0,
+    window_duration_s: float = PYANNOTE_WINDOW_DURATION_S,
+    window_step_s: float = PYANNOTE_WINDOW_STEP_S,
     cancel: Callable[[], None] | None = None,
     progress: Callable[[float, str], None] | None = None,
 ) -> list[tuple[str, float, float]]:
     """Run pyannote segmentation and return per-speaker speech regions.
 
     Implements the same windowing/decoding math as onnx-asr's ``PyAnnoteVad``
-    (10 s window, 5 s overlap, per-speaker probability fusion), but keeps all
-    speaker channels instead of collapsing them into one speech channel, and
-    yields ``(speaker, start_s, end_s)`` regions.
+    (configurable sliding window with period *window_step_s*, per-speaker
+    probability fusion), but keeps all speaker channels instead of collapsing
+    them into one speech channel, and yields ``(speaker, start_s, end_s)``
+    regions.  Бинаризация использует гистерезис onset/offset (когда *offset*
+    задан), заполняет паузы короче *min_duration_off_s*, расширяет регионы на
+    *pad_onset_s*/*pad_offset_s* и отбрасывает регионы короче *min_duration_on_s*.
 
     The ONNX graph outputs 7 frames per class: {no-speech}, {spk1}, {spk2},
     {spk3}, {spk1+spk2}, {spk1+spk3}, {spk2+spk3}; multi-speaker classes add
     their probability to each participating speaker.
     """
-    window_size = 10 * sample_rate
-    overlap = 5 * sample_rate
+    window_size = max(1, round(window_duration_s * sample_rate))
+    advance = max(1, round(window_step_s * sample_rate))
+    if offset is None:
+        offset = onset
 
     total = len(audio)
     if total == 0:
         return []
 
     starts: list[int] = []
-    offset = 0
-    while offset + window_size <= total:
-        starts.append(offset)
-        offset += window_size - overlap
-    if not starts or total - starts[-1] > 0:
-        if total <= window_size:
-            starts = [0]
-        else:
+    offset_index = 0
+    while offset_index + window_size <= total:
+        starts.append(offset_index)
+        offset_index += advance
+    if starts:
+        if starts[-1] + window_size < total:
             # Pad the tail window like onnx-asr does.
             starts.append(total - window_size)
+    elif total <= window_size:
+        starts = [0]
+    else:
+        starts = [total - window_size]
 
     num_speakers = 3
     probs = [np.zeros(total, dtype=np.float32) for _ in range(num_speakers)]
@@ -317,27 +430,29 @@ def _pyannote_speaker_regions(
 
     # Region boundaries per raw speaker slot (sample indices).
     slot_regions: dict[int, list[tuple[int, int]]] = {}
-    min_duration = int(min_duration_s * sample_rate)
+    filter_off = int(min_duration_off_s * sample_rate)
+    pad_on = int(pad_onset_s * sample_rate)
+    pad_off = int(pad_offset_s * sample_rate)
+    filter_on = int(min_duration_on_s * sample_rate)
     for spk in range(num_speakers):
         active = counts[spk] > 0
         averaged = np.divide(
             probs[spk], counts[spk], out=np.zeros_like(probs[spk]), where=active
         )
-        mask = active & (averaged >= onset)
-        if not mask.any():
-            continue
-        edges = np.diff(mask.astype(np.int8))
-        region_starts = np.flatnonzero(edges == 1) + 1
-        region_ends = np.flatnonzero(edges == -1) + 1
-        if mask[0]:
-            region_starts = np.concatenate(([0], region_starts))
-        if mask[-1]:
-            region_ends = np.concatenate((region_ends, [total]))
-        for region_start, region_end in zip(region_starts, region_ends, strict=False):
-            if region_end - region_start >= min_duration:
-                slot_regions.setdefault(spk, []).append(
-                    (int(region_start), int(region_end))
-                )
+        if offset != onset:
+            mask = _hysteresis_mask(averaged, onset, offset) & active
+        else:
+            mask = active & (averaged >= onset)
+        slot_regions_for_spk = _regions_from_mask(
+            mask,
+            total,
+            min_duration_off=filter_off,
+            pad_onset=pad_on,
+            pad_offset=pad_off,
+            min_duration_on=filter_on,
+        )
+        if slot_regions_for_spk:
+            slot_regions[spk] = slot_regions_for_spk
 
     if not slot_regions:
         return []
@@ -410,6 +525,8 @@ def diarize_segments(
     threshold: float = SIMILARITY_THRESHOLD,
     model_path: str | Path | None = None,
     repo_id: str | None = None,
+    profile_id: str | None = None,
+    profiles: DiarizationProfiles | None = None,
     cancel: Callable[[], None] | None = None,
     progress: Callable[[float, str], None] | None = None,
 ) -> list[dict[str, Any]]:
@@ -417,39 +534,33 @@ def diarize_segments(
 
     *audio* — float32 PCM array at *sample_rate* (16 kHz).
 
-    A *repo_id* pointing at the pyannote segmentation model (default in the
-    manifest) selects the end-to-end engine: the network decides per frame
-    which of up to three speakers is talking and segments get the label of the
-    speaker they overlap most.  Any other *repo_id* (WeSpeaker models) selects
-    the embedding engine: each segment is embedded and clustered by cosine
-    similarity to the running cluster centroids.  *cancel* is polled between
-    expensive steps so a stopped stage does not keep the worker busy.
+    Движок выбирается реестром по текстовому ID: ключом служит *repo_id*
+    (например, ``pyannote-segmentation-3.0``) либо путь к локальной модели.
+    Ключи с ``pyannote`` выбирают энд-тю-энд сегментацию (сеть сама решает,
+    какой из трёх слотов говорит), остальные — эмбеддинги WeSpeaker с
+    косинусной кластеризацией.
+
+    *profiles* — набор групп гиперпараметров (None -> встроенные дефолты);
+    *profile_id* — активная группа внутри набора (например, ``interview``).
+    Новые группы без перезапуска подхватываются на уровне менеджера, который
+    перечитывает YAML-файл при каждом запуске стадии.  *cancel* pollится
+    между дорогими шагами, чтобы остановленная стадия не крутила worker.
     """
     if not segments:
         return segments
 
-    engine_repo = repo_id or ""
-    use_pyannote = "pyannote" in engine_repo.lower()
-
-    if use_pyannote:
-        return _diarize_with_pyannote(
-            segments,
-            audio,
-            sample_rate,
-            cpu_threads=cpu_threads,
-            model_path=model_path,
-            repo_id=engine_repo,
-            cancel=cancel,
-            progress=progress,
-        )
-    return _diarize_with_embeddings(
+    engine_class = REGISTRY.engine_class_for(
+        repo_id or (str(model_path) if model_path else "")
+    )
+    engine = engine_class(profiles=profiles, profile_id=profile_id)
+    return engine.run_diarization(
         segments,
         audio,
         sample_rate,
         cpu_threads=cpu_threads,
-        threshold=threshold,
         model_path=model_path,
-        repo_id=engine_repo or None,
+        repo_id=repo_id,
+        threshold=threshold,
         cancel=cancel,
         progress=progress,
     )
@@ -463,10 +574,17 @@ def _diarize_with_pyannote(
     cpu_threads: int,
     model_path: str | Path | None,
     repo_id: str,
+    group: PyannoteGroup | None = None,
+    link: GigaamLink | None = None,
     cancel: Callable[[], None] | None,
     progress: Callable[[float, str], None] | None,
 ) -> list[dict[str, Any]]:
-    """Label segments with the pyannote segmentation engine (up to 3 speakers)."""
+    """Label segments with the pyannote segmentation engine (up to 3 speakers).
+
+    *group* — активная группа гиперпараметров (None -> встроенные дефолты);
+    *link* — настройки связки с GigaAM (компенсация задержки CTC и допуск
+    границ слов при голосовании).
+    """
     if progress is not None:
         progress(0.0, "Загрузка модели спикеров")
     session = load_pyannote(cpu_threads, model_path=model_path, repo_id=repo_id)
@@ -477,6 +595,16 @@ def _diarize_with_pyannote(
             session,
             audio.astype(np.float32, copy=False),
             sample_rate,
+            onset=group.onset if group else PYANNOTE_ONSET,
+            offset=group.offset if group else None,
+            min_duration_on_s=group.min_duration_on if group else PYANNOTE_MIN_DURATION_S,
+            min_duration_off_s=group.min_duration_off if group else 0.0,
+            pad_onset_s=group.pad_onset if group else 0.0,
+            pad_offset_s=group.pad_offset if group else 0.0,
+            window_duration_s=(
+                group.window_duration if group else PYANNOTE_WINDOW_DURATION_S
+            ),
+            window_step_s=group.window_step if group else PYANNOTE_WINDOW_STEP_S,
             cancel=cancel,
             progress=progress,
         )
@@ -494,7 +622,16 @@ def _diarize_with_pyannote(
     # pauses, and a speaker change is often seamless.  Segments with token
     # timestamps are cut at speaker turns; each piece keeps the tokens that
     # fall inside its own time range, so the text is split correctly too.
-    segments = _split_at_speaker_turns(segments, regions)
+    vote_delay_s = (link.ctc_delay_compensation_ms / 1000.0) if link else 0.0
+    boundary_margin_s = (
+        link.word_boundary_margin_ms / 1000.0 if link else TURN_TOLERANCE_S
+    )
+    segments = _split_at_speaker_turns(
+        segments,
+        regions,
+        vote_delay_s=vote_delay_s,
+        boundary_margin_s=boundary_margin_s,
+    )
     if len(segments) > 1:
         log.info("speaker turns: %d segments after split", len(segments))
 
@@ -628,6 +765,9 @@ def _token_starts_word(index: int, tokens: list[str]) -> bool:
 def _split_at_speaker_turns(
     segments: list[dict[str, Any]],
     regions: list[tuple[str, float, float]],
+    *,
+    vote_delay_s: float = 0.0,
+    boundary_margin_s: float = TURN_TOLERANCE_S,
 ) -> list[dict[str, Any]]:
     """Cut segments that span several speakers into per-speaker pieces.
 
@@ -638,6 +778,11 @@ def _split_at_speaker_turns(
     token straddling the boundary can neither tear a word apart nor spawn a
     useless fragment.  Every remaining change of speaker starts a new piece
     with its own decoded text.  Segments without tokens are unchanged.
+
+    *vote_delay_s* — компенсация задержки CTC-пика GigaAM: точка голосования
+    слова сдвигается вперёд на это значение (пик регистрируется позже фонемы).
+    *boundary_margin_s* — токен, попавший в зазор между регионами спикеров,
+    привязывается к ближайшему краю, если тот не дальше допуска.
     """
     if not regions:
         return segments
@@ -665,7 +810,7 @@ def _split_at_speaker_turns(
                 if region_start <= moment < region_end:
                     return label
             best_label = default
-            best_distance = TURN_TOLERANCE_S
+            best_distance = boundary_margin_s
             for label, region_start, region_end in regions:
                 distance = min(abs(moment - region_start), abs(moment - region_end))
                 if distance < best_distance:
@@ -674,8 +819,14 @@ def _split_at_speaker_turns(
             return best_label
 
         # One vote per token ("" = no region covers it), grouped into words.
+        # The vote point is the token midpoint shifted forward by the CTC
+        # peak delay (the acoustic model registers a phoneme after it is
+        # spoken), clamped so it never leaves the segment.
         labels = [
-            label_at(_token_midpoint(times, index, end), "")
+            label_at(
+                min(_token_midpoint(times, index, end) + vote_delay_s, end),
+                "",
+            )
             for index in range(len(tokens))
         ]
         words: list[list[int]] = []
@@ -793,12 +944,22 @@ def _diarize_with_embeddings(
     threshold: float,
     model_path: str | Path | None,
     repo_id: str | None,
+    group: WeSpeakerGroup | None = None,
     cancel: Callable[[], None] | None,
     progress: Callable[[float, str], None] | None,
 ) -> list[dict[str, Any]]:
-    """Label segments with WeSpeaker embeddings + cosine clustering."""
+    """Label segments with WeSpeaker embeddings + cosine clustering.
+
+    *group* — активная группа гиперпараметров: косинусный порог, способ
+    сравнения с кластером (``centroid`` — с усреднённым центроидом,
+    ``average`` — со средним попарного сходства с членами) и минимальный
+    размер кластера (мелкие кластеры приклеиваются к ближайшему крупному).
+    """
     if not segments:
         return segments
+    effective_threshold = group.threshold if group else threshold
+    method = group.method if group else "centroid"
+    min_cluster_size = group.min_cluster_size if group else 1
 
     clips: list[np.ndarray] = []
     embedded_indices: list[int] = []
@@ -828,41 +989,51 @@ def _diarize_with_embeddings(
     except Exception as exc:  # onnx runtime/preprocessor failure
         raise DiarizationError(f"Не удалось вычислить эмбеддинги спикеров: {exc}") from exc
 
-    # Centroids of discovered speaker clusters (unit vectors).
-    centroid_labels: list[str] = []
-    centroid_embs: list[np.ndarray] = []
-    speaker_counts: dict[str, int] = {}
+    # Unit vectors, one per embedded segment.
+    unit_embeddings = [_normalize(embedding.reshape(-1)) for embedding in embeddings]
+
+    # Cluster state: label -> (running centroid, member embeddings/counts).
+    cluster_labels: list[str] = []
+    cluster_centroids: list[np.ndarray] = []
+    cluster_members: list[list[np.ndarray]] = []
+    assignment: dict[int, str] = {}
 
     total_segments = max(len(embedded_indices), 1)
-    for position, (segment_index, embedding) in enumerate(
-        zip(embedded_indices, embeddings, strict=True)
+    for position, (segment_index, emb) in enumerate(
+        zip(embedded_indices, unit_embeddings, strict=True)
     ):
         if cancel is not None and position % 32 == 0:
             cancel()
-        emb = _normalize(embedding.reshape(-1))
-
         best_idx: int | None = None
         best_sim = -1.0
-        for i, centroid in enumerate(centroid_embs):
-            sim = _cosine_similarity(emb, centroid)
+        for i, centroid in enumerate(cluster_centroids):
+            if method == "average" and len(cluster_members[i]) > 0:
+                sim = float(
+                    np.mean(
+                        [ _cosine_similarity(emb, member) for member in cluster_members[i] ]
+                    )
+                )
+            else:
+                sim = _cosine_similarity(emb, centroid)
             if sim > best_sim:
                 best_sim = sim
                 best_idx = i
 
-        if best_idx is not None and best_sim >= threshold:
-            label = centroid_labels[best_idx]
+        if best_idx is not None and best_sim >= effective_threshold:
+            label = cluster_labels[best_idx]
             # Update centroid with running average of unit vectors.
-            count = speaker_counts[label]
-            centroid_embs[best_idx] = _normalize(
-                (centroid_embs[best_idx] * count + emb) / (count + 1)
+            count = len(cluster_members[best_idx])
+            cluster_centroids[best_idx] = _normalize(
+                (cluster_centroids[best_idx] * count + emb) / (count + 1)
             )
-            speaker_counts[label] = count + 1
+            cluster_members[best_idx].append(emb)
         else:
-            label = f"Спикер {len(centroid_labels) + 1}"
-            centroid_labels.append(label)
-            centroid_embs.append(emb.copy())
-            speaker_counts[label] = 1
+            label = f"Спикер {len(cluster_labels) + 1}"
+            cluster_labels.append(label)
+            cluster_centroids.append(emb.copy())
+            cluster_members.append([emb])
 
+        assignment[segment_index] = label
         segments[segment_index]["speaker"] = label
         if progress is not None and (position % 32 == 0 or position + 1 == total_segments):
             progress(
@@ -870,4 +1041,224 @@ def _diarize_with_embeddings(
                 f"Группировка спикеров: {position + 1} из {len(embedded_indices)}",
             )
 
+    # Attach clusters that stayed under min_cluster_size to the nearest
+    # surviving cluster (singletons and glitches must not become speakers).
+    if min_cluster_size > 1:
+        sizes = {label: len(cluster_members[index]) for index, label in enumerate(cluster_labels)}
+        large = [
+            (cluster_labels[index], cluster_centroids[index])
+            for index, label in enumerate(cluster_labels)
+            if sizes[label] >= min_cluster_size
+        ]
+        small = [label for label, size in sizes.items() if size < min_cluster_size]
+        if small and large:
+            for segment_index, label in list(assignment.items()):
+                if label in small:
+                    emb = unit_embeddings[embedded_indices.index(segment_index)]
+                    best_label, best_centroid = large[0]
+                    best_sim = _cosine_similarity(emb, best_centroid)
+                    for target_label, centroid in large[1:]:
+                        sim = _cosine_similarity(emb, centroid)
+                        if sim > best_sim:
+                            best_sim, best_label = sim, target_label
+                    assignment[segment_index] = best_label
+                    segments[segment_index]["speaker"] = best_label
+            _renumber_speakers(segments)
+
     return segments
+
+
+def _renumber_speakers(segments: list[dict[str, Any]]) -> None:
+    """Renumber labels in order of first temporal appearance, closing gaps.
+
+    После приклеивания мелких кластеров нумерация может получить дыры
+    («Спикер 1», «Спикер 3»); перенумерация делает её плотной и по-прежнему
+    отсчитывает спикеров от первого голоса, который появился в записи.
+    """
+    first_appearance: dict[str, None] = {}
+    for segment in segments:
+        label = segment.get("speaker")
+        if label and label not in first_appearance:
+            first_appearance[label] = None
+    mapping = {
+        old: f"Спикер {number}"
+        for number, old in enumerate(first_appearance, start=1)
+    }
+    for segment in segments:
+        old = segment.get("speaker")
+        if old in mapping:
+            segment["speaker"] = mapping[old]
+
+
+# ============================================================================
+# Движки и реестр: Strategy/Registry поверх реализаций выше.
+# ============================================================================
+
+
+class BaseDiarizationEngine(ABC):
+    """Abstract diarization engine: turns VAD segments into speaker labels.
+
+    Конкретные движки (:class:`PyannoteSegmentationEngine`,
+    :class:`WeSpeakerResNetEngine`) оборачивают свои реализации и подставляют
+    активную группу гиперпараметров из :class:`DiarizationProfiles`.
+    """
+
+    #: Текстовый ID движка; его подстроки ищутся в ключе модели (repo_id или
+    #: путь к локальной ONNX-папке).
+    id: str = ""
+    label: str = ""
+
+    def __init__(
+        self,
+        profiles: DiarizationProfiles | None = None,
+        profile_id: str | None = None,
+    ) -> None:
+        self._profiles = profiles
+        self._profile_id = profile_id
+        self._profile_cache: Any = None
+
+    @abstractmethod
+    def run_diarization(
+        self,
+        segments: list[dict[str, Any]],
+        audio: np.ndarray,
+        sample_rate: int,
+        *,
+        cpu_threads: int,
+        model_path: str | Path | None,
+        repo_id: str | None,
+        threshold: float,
+        cancel: Callable[[], None] | None,
+        progress: Callable[[float, str], None] | None,
+    ) -> list[dict[str, Any]]:
+        """Lable *segments* in-place and return them."""
+
+    def _log_missing_profile(self, exc: KeyError) -> None:
+        log.warning(
+            "diarization profile %r not found; falling back to the first one",
+            exc.args[0] if exc.args else self._profile_id,
+        )
+
+
+class PyannoteSegmentationEngine(BaseDiarizationEngine):
+    """Энд-тю-энд сегментация PyAnnote (PowerSet-бинаризация, до 3 спикеров)."""
+
+    id = "pyannote-segmentation-3.0"
+    label = "PyAnnote Segmentation 3.0"
+
+    def _resolve_group(self) -> PyannoteGroup | None:
+        if not self._profiles:
+            return None
+        if self._profile_cache is None:
+            try:
+                self._profile_cache: PyannoteGroup | None = self._profiles.pyannote_group(
+                    self._profile_id
+                )
+            except KeyError as exc:
+                self._log_missing_profile(exc)
+                self._profile_cache = self._profiles.pyannote[0]
+        return self._profile_cache
+
+    def run_diarization(
+        self,
+        segments: list[dict[str, Any]],
+        audio: np.ndarray,
+        sample_rate: int,
+        *,
+        cpu_threads: int,
+        model_path: str | Path | None,
+        repo_id: str | None,
+        threshold: float,
+        cancel: Callable[[], None] | None,
+        progress: Callable[[float, str], None] | None,
+    ) -> list[dict[str, Any]]:
+        return _diarize_with_pyannote(
+            segments,
+            audio,
+            sample_rate,
+            cpu_threads=cpu_threads,
+            model_path=model_path,
+            repo_id=repo_id or PYANNOTE_REPO,
+            group=self._resolve_group(),
+            link=self._profiles.gigaam if self._profiles else None,
+            cancel=cancel,
+            progress=progress,
+        )
+
+
+class WeSpeakerResNetEngine(BaseDiarizationEngine):
+    """Эмбеддинги WeSpeaker ResNet34 + косинусная кластеризация."""
+
+    id = "wespeaker"
+    label = "WeSpeaker ResNet34"
+
+    def _resolve_group(self) -> WeSpeakerGroup | None:
+        if not self._profiles:
+            return None
+        if self._profile_cache is None:
+            try:
+                self._profile_cache: WeSpeakerGroup | None = self._profiles.wespeaker_group(
+                    self._profile_id
+                )
+            except KeyError as exc:
+                self._log_missing_profile(exc)
+                self._profile_cache = self._profiles.wespeaker[0]
+        return self._profile_cache
+
+    def run_diarization(
+        self,
+        segments: list[dict[str, Any]],
+        audio: np.ndarray,
+        sample_rate: int,
+        *,
+        cpu_threads: int,
+        model_path: str | Path | None,
+        repo_id: str | None,
+        threshold: float,
+        cancel: Callable[[], None] | None,
+        progress: Callable[[float, str], None] | None,
+    ) -> list[dict[str, Any]]:
+        return _diarize_with_embeddings(
+            segments,
+            audio,
+            sample_rate,
+            cpu_threads=cpu_threads,
+            threshold=threshold,
+            model_path=model_path,
+            repo_id=repo_id,
+            group=self._resolve_group(),
+            cancel=cancel,
+            progress=progress,
+        )
+
+
+class DiarizationRegistry:
+    """Реестр движков: выбор по текстовому ID или ключу модели.
+
+    Подстрока ID движка ищется в ключе модели (repo_id с манифеста либо путь
+    к локальной папке ONNX).  Ни один ключ не подошёл -> WeSpeaker (прежнее
+    поведение для «custom»-моделей без подсказок в пути).
+    """
+
+    def __init__(self) -> None:
+        self._engine_classes: dict[str, type[BaseDiarizationEngine]] = {}
+
+    def register(self, engine_class: type[BaseDiarizationEngine]) -> None:
+        self._engine_classes[engine_class.id] = engine_class
+
+    def engine_class_for(self, model_key: str) -> type[BaseDiarizationEngine]:
+        key = (model_key or "").lower()
+        for engine_id, engine_class in self._engine_classes.items():
+            if engine_id in key:
+                return engine_class
+        if "pyannote" in key:
+            return self._engine_classes[PyannoteSegmentationEngine.id]
+        return self._engine_classes[WeSpeakerResNetEngine.id]
+
+    def known_engines(self) -> list[tuple[str, str]]:
+        return [(engine.id, engine.label) for engine in self._engine_classes.values()]
+
+
+REGISTRY = DiarizationRegistry()
+REGISTRY.register(PyannoteSegmentationEngine)
+REGISTRY.register(WeSpeakerResNetEngine)

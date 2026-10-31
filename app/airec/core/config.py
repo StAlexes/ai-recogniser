@@ -69,6 +69,10 @@ class Settings(BaseModel):
     diarize_threshold: float = Field(default=0.70, ge=0.1, le=0.99)
     diarize_model: str = "pyannote-segmentation-3.0"
     diarize_model_path: str = ""
+    # Группа гиперпараметров диаризации («Совещание», «Интервью», «Конференция»):
+    # ID группы из диаризационного YAML-конфига; каждое задание может
+    # переопределить её своим значением (колонка jobs.diarize_profile).
+    diarize_profile: str = "meeting"
 
     # ragkb runs as a separate, local HTTP service.  It is optional: when it is
     # unavailable, transcription and the rest of the core keep working.

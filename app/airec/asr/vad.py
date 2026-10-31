@@ -127,12 +127,18 @@ def segment_and_recognize(
     min_silence_ms: float = DEFAULT_MIN_SILENCE_MS,
     speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS,
     threshold: float = DEFAULT_THRESHOLD,
+    min_speech_duration_ms: int = 250,
 ) -> Iterator[SpeechSegment]:
     """Yield recognised speech regions of *wav_path* with token timestamps.
 
     ``onnx-asr`` reads the WAV, runs Silero VAD and recognises each segment in
     small batches.  Segments are capped at ``max_segment_s`` and split at pauses
     of at least ``min_silence_ms``.  Empty segments are skipped.
+
+    ``threshold`` — порог вероятности речи, ``min_speech_duration_ms`` —
+    минимальная длительность речевого куска (значение выше 200 мс отсекает
+    короткие русские «да/ага/так»); both come from the calibrated VAD block of
+    the diarization profiles file when it is present.
 
     Token timestamps are relative to the segment start (onnx-asr behaviour),
     so they are shifted to absolute time here: diarization uses them to cut a
@@ -142,7 +148,7 @@ def segment_and_recognize(
     adapter = model.with_vad(
         vad,
         threshold=threshold,
-        min_speech_duration_ms=250,
+        min_speech_duration_ms=min_speech_duration_ms,
         max_speech_duration_s=max_segment_s,
         min_silence_duration_ms=min_silence_ms,
         speech_pad_ms=speech_pad_ms,

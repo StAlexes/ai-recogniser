@@ -41,6 +41,7 @@ export interface Settings {
   diarize_threshold: number;
   diarize_model: string;
   diarize_model_path: string;
+  diarize_profile: string;
   recognize_immediately: boolean;
   rag_enabled: boolean;
   rag_url: string;
@@ -80,6 +81,8 @@ export interface JobSummary {
   error: string | null;
   paused?: boolean;
   stages: JobStages;
+  /** Переопределение группы гиперпараметров диаризации ("" = глобальный). */
+  diarize_profile?: string;
 }
 
 export interface JobSegment {
@@ -412,6 +415,35 @@ export function getSystemProfile(): Promise<SystemProfile> {
   });
 }
 
+export interface DiarizationProfileGroup {
+  id: string;
+  label: string;
+  [key: string]: unknown;
+}
+
+export interface DiarizationProfilesResponse {
+  pyannote: DiarizationProfileGroup[];
+  wespeaker: DiarizationProfileGroup[];
+  vad: Record<string, unknown>;
+  gigaam: Record<string, unknown>;
+}
+
+/** Свежее чтение групп гиперпараметров диаризации (YAML-файл в данных). */
+export function getDiarizationProfiles(): Promise<DiarizationProfilesResponse> {
+  return request<DiarizationProfilesResponse>('/api/v1/diarization-profiles');
+}
+
+/** Сохранить переопределение группы диаризации на задании ("" = глобальный). */
+export function setJobDiarizeProfile(
+  jobId: string,
+  diarizeProfile: string,
+): Promise<JobDetail> {
+  return request<JobDetail>(
+    `/api/v1/jobs/${encodeURIComponent(jobId)}/diarize-profile`,
+    { method: 'PUT', body: { diarize_profile: diarizeProfile }, timeoutMs: 15_000 },
+  );
+}
+
 export function getRagStatus(): Promise<RagStatus> {
   return request<RagStatus>('/api/v1/rag/status', { timeoutMs: 8_000 });
 }
@@ -471,10 +503,15 @@ export function stageAction(
   jobId: string,
   stage: StageKey,
   action: StageAction,
+  options?: { diarizeProfile?: string | null },
 ): Promise<JobDetail> {
+  const body =
+    options && options.diarizeProfile !== undefined
+      ? { diarize_profile: options.diarizeProfile }
+      : undefined;
   return request<JobDetail>(
     `/api/v1/jobs/${encodeURIComponent(jobId)}/stages/${stage}/${action}`,
-    { method: 'POST', timeoutMs: 15_000 },
+    { method: 'POST', body, timeoutMs: 15_000 },
   );
 }
 
@@ -508,7 +545,10 @@ export function summarizeJob(jobId: string): Promise<any> {
 }
 
 /** Upload one file to the local core and return the queued job. */
-export async function uploadJob(file: File): Promise<JobDetail> {
+export async function uploadJob(
+  file: File,
+  diarizeProfile?: string,
+): Promise<JobDetail> {
   const timeoutMs = 600_000;
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -519,6 +559,9 @@ export async function uploadJob(file: File): Promise<JobDetail> {
   }
   const form = new FormData();
   form.append('file', file, file.name);
+  if (diarizeProfile) {
+    form.append('diarize_profile', diarizeProfile);
+  }
 
   let response: Response;
   try {

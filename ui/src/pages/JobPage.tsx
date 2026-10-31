@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import type { ReactNode } from 'react';
 import {
   Badge,
   Button,
@@ -10,8 +11,7 @@ import {
   ProgressBar,
   Spinner,
   Textarea,
-} from '@fluentui/react-components';
-import {
+} from '@fluentui/react-components';import {
   ArrowClockwiseRegular,
   ArrowLeftRegular,
   CopyRegular,
@@ -26,14 +26,22 @@ import {
 import {
   AuthError,
   cancelJob,
+  getDiarizationProfiles,
   getJob,
+  getSettings,
   retryJob,
   revealJobFolder,
+  setJobDiarizeProfile,
   stageAction,
   startJob,
   token,
 } from '../api';
-import type { JobDetail, StageAction, StageKey } from '../api';
+import type {
+  DiarizationProfilesResponse,
+  JobDetail,
+  StageAction,
+  StageKey,
+} from '../api';
 import { PageHeader } from '../components/PageHeader';
 import { openResultFolder, saveResultAs } from '../desktop';
 import { formatBytes } from '../format';
@@ -153,12 +161,14 @@ function StageControl({
   canStart,
   busy,
   onAction,
+  children,
 }: {
   name: StageKey;
   stage: JobDetail['stages'][StageKey];
   canStart: boolean;
   busy: boolean;
   onAction: (action: StageAction) => void;
+  children?: ReactNode;
 }) {
   const running = stage.status === 'running';
   return (
@@ -175,6 +185,7 @@ function StageControl({
       <span className="job-stage-control-phase" title={stage.phase}>
         {stage.phase || 'Ожидает'}
       </span>
+      {children}
       <div className="job-stage-control-actions">
         <Button
           size="small"
@@ -216,6 +227,12 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
   const [stageBusy, setStageBusy] = useState<StageKey | null>(null);
   const [format, setFormat] = useState<ExportFormat>('txt');
   const [now, setNow] = useState(() => Date.now());
+  // Группы гиперпараметров из YAML-конфига и глобальные настройки; селект
+  // ниже показывает локальный выбор профиля для этой задачи.
+  const [profiles, setProfiles] = useState<DiarizationProfilesResponse | null>(null);
+  const [globalProfile, setGlobalProfile] = useState('meeting');
+  const [globalModel, setGlobalModel] = useState('pyannote-segmentation-3.0');
+  const [profileDraft, setProfileDraft] = useState<string | null>(null);
   // null while the newest available result is followed automatically;
   // a manual pick makes the selection sticky for this visit.
   const [view, setView] = useState<ResultView | null>(null);
@@ -249,8 +266,35 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     setStageBusy(null);
     setView(null);
     setViewPicked(false);
+    setProfileDraft(null);
     void loadJob();
   }, [jobId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Список групп и глобальные настройки грузим один раз на страницу задачи;
+  // правки YAML подхватятся при следующем открытии страницы.
+  useEffect(() => {
+    let cancelled = false;
+    const load = async (): Promise<void> => {
+      const [profilesResult, settingsResult] = await Promise.allSettled([
+        getDiarizationProfiles(),
+        getSettings(),
+      ]);
+      if (cancelled) {
+        return;
+      }
+      if (settingsResult.status === 'fulfilled') {
+        setGlobalProfile(settingsResult.value.diarize_profile || 'meeting');
+        setGlobalModel(settingsResult.value.diarize_model);
+      }
+      if (profilesResult.status === 'fulfilled') {
+        setProfiles(profilesResult.value);
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId]);
 
   const active =
     job !== null &&
@@ -486,7 +530,15 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     setStageBusy(stage);
     setError(null);
     try {
-      const updated = await stageAction(job.id, stage, action);
+      // Перезапуск диаризации уносит с собой выбранный на странице профиль:
+      // "по настройкам" сбрасывает переопределение, группа — сохраняет его.
+      const options =
+        stage === 'diarization' &&
+        action !== 'stop' &&
+        job.diarize_profile !== undefined
+          ? { diarizeProfile: job.diarize_profile }
+          : undefined;
+      const updated = await stageAction(job.id, stage, action, options);
       setJob(updated);
       const label = STAGE_LABELS[stage];
       if (action === 'start') {
@@ -515,6 +567,57 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     job !== null && job.status === 'done' && recognitionDone && job.segments.length > 0;
   const canStartSummary =
     job !== null && job.status === 'done' && job.text.trim() !== '';
+
+  const engine = globalModel === 'pyannote-segmentation-3.0' ? 'pyannote' : 'wespeaker';
+  const availableProfiles = profiles?.[engine] ?? [];
+  const effectiveProfile = profileDraft ?? job?.diarize_profile ?? '';
+  const profileOptions: Array<{ value: string; label: string }> = [
+    {
+      value: '',
+      label:
+        job?.diarize_profile !== undefined && job.diarize_profile !== ''
+          ? 'По настройкам'
+          : 'По настройкам (текущая)',
+    },
+    ...availableProfiles.map((group) => ({ value: group.id, label: group.label })),
+  ];
+  const globalGroupLabel =
+    availableProfiles.find((group) => group.id === globalProfile)?.label ?? globalProfile;
+  const profileValue = effectiveProfile === '' ? '' : effectiveProfile;
+  if (
+    effectiveProfile !== '' &&
+    availableProfiles.length > 0 &&
+    !availableProfiles.some((group) => group.id === effectiveProfile)
+  ) {
+    profileOptions.push({ value: effectiveProfile, label: effectiveProfile });
+  }
+  const profileLabel =
+    profileOptions.find((option) => option.value === profileValue)?.label ??
+    globalGroupLabel;
+
+  const handleProfileSelect = async (value: string | undefined): Promise<void> => {
+    if (job === null || value === undefined) {
+      return;
+    }
+    const previous = profileDraft ?? job.diarize_profile ?? '';
+    setProfileDraft(value);
+    try {
+      const updated = await setJobDiarizeProfile(job.id, value);
+      setJob(updated);
+      setNotice(
+        value === ''
+          ? 'Профиль «По настройкам»: при запуске диаризации будет применена глобальная группа.'
+          : 'Группа параметров сохранена для этой задачи.',
+      );
+    } catch (reason: unknown) {
+      setProfileDraft(previous);
+      if (reason instanceof AuthError) {
+        onAuthError();
+        return;
+      }
+      setError(describeError(reason));
+    }
+  };
 
   const subtitle =
     job === null
@@ -690,7 +793,30 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
               onAction={(action) => {
                 void handleStageAction('diarization', action);
               }}
-            />
+            >
+              <div className="job-stage-profile">
+                <Dropdown
+                  aria-label="Группа параметров диаризации для этой задачи"
+                  value={profileLabel}
+                  selectedOptions={[profileValue]}
+                  disabled={stageBusy !== null || profileOptions.length <= 1}
+                  onOptionSelect={(_event, data) => {
+                    void handleProfileSelect(data.optionValue);
+                  }}
+                >
+                  {profileOptions.map((option) => (
+                    <Option key={option.value} value={option.value}>
+                      {option.label}
+                    </Option>
+                  ))}
+                </Dropdown>
+                {effectiveProfile === '' ? (
+                  <span className="job-stage-profile-hint">
+                    Глобальная группа: {globalGroupLabel}
+                  </span>
+                ) : null}
+              </div>
+            </StageControl>
             <StageControl
               name="summary"
               stage={job.stages.summary}

@@ -17,7 +17,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # All Job dataclass fields that are persisted, in column order.
 JOB_COLUMNS = (
@@ -46,6 +46,9 @@ JOB_COLUMNS = (
     "summary",
     "paused",
     "stages",
+    # Per-job override of the diarization hyperparameter group ("" = use the
+    # global setting) — added in schema v5.
+    "diarize_profile",
 )
 
 # Columns that may be missing in databases created by older releases.
@@ -62,6 +65,8 @@ JOB_COLUMN_MIGRATIONS: dict[str, str] = {
     "text_plain": "TEXT",
     "text_speakers": "TEXT",
     "summary_text": "TEXT",
+    # Per-job diarization profile override ("" = use the global setting).
+    "diarize_profile": "TEXT NOT NULL DEFAULT ''",
 }
 
 CREATE_JOBS_TABLE = """
@@ -91,7 +96,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     summary TEXT,
     paused INTEGER NOT NULL DEFAULT 0,
     segment_count INTEGER NOT NULL DEFAULT 0,
-    stages TEXT
+    stages TEXT,
+    diarize_profile TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -193,7 +199,8 @@ class Database:
                     summary=excluded.summary,
                     paused=excluded.paused,
                     segment_count=excluded.segment_count,
-                    stages=excluded.stages
+                    stages=excluded.stages,
+                    diarize_profile=excluded.diarize_profile
                 """,
                 values,
             )

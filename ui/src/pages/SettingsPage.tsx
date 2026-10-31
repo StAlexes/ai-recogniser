@@ -19,12 +19,14 @@ import {
 import {
   ApiError,
   AuthError,
+  getDiarizationProfiles,
   getHealth,
   getModels,
   getSettings,
   putSettings,
 } from '../api';
 import type {
+  DiarizationProfilesResponse,
   HealthResponse,
   ModelItem,
   Settings,
@@ -69,6 +71,9 @@ export function SettingsPage({
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [asrModels, setAsrModels] = useState<ModelItem[]>([]);
   const [allModels, setAllModels] = useState<ModelItem[]>([]);
+  const [diarizeProfiles, setDiarizeProfiles] = useState<DiarizationProfilesResponse | null>(
+    null,
+  );
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveResult, setSaveResult] = useState<SaveResult | null>(null);
@@ -85,11 +90,13 @@ export function SettingsPage({
       setLoading(true);
       setLoadError(null);
 
-      const [settingsResult, healthResult, modelsResult] = await Promise.allSettled([
-        getSettings(),
-        getHealth(),
-        getModels(),
-      ]);
+      const [settingsResult, healthResult, modelsResult, profilesResult] =
+        await Promise.allSettled([
+          getSettings(),
+          getHealth(),
+          getModels(),
+          getDiarizationProfiles(),
+        ]);
 
       if (cancelled) {
         return;
@@ -120,6 +127,12 @@ export function SettingsPage({
         setAsrModels(modelsResult.value.items.filter((model) => model.kind === 'asr'));
         setAllModels(modelsResult.value.items);
       } else if (modelsResult.reason instanceof AuthError) {
+        onAuthError();
+      }
+
+      if (profilesResult.status === 'fulfilled') {
+        setDiarizeProfiles(profilesResult.value);
+      } else if (profilesResult.reason instanceof AuthError) {
         onAuthError();
       }
 
@@ -281,6 +294,21 @@ export function SettingsPage({
   const cachedModelCount = allModels.filter(
     (model) => !model.local && model.location === 'huggingface-cache',
   ).length;
+
+  // Группы гиперпараметров зависят от активного движка: pyannote — своя
+  // тройка (Совещание/Интервью/Конференция), у остальных — wespeaker.
+  const profileEngine =
+    diarizationValue === 'pyannote-segmentation-3.0' ? 'pyannote' : 'wespeaker';
+  const profileGroups = diarizeProfiles?.[profileEngine] ?? [];
+  const profileValue = settings?.diarize_profile ?? 'meeting';
+  if (
+    profileGroups.length > 0 &&
+    !profileGroups.some((group) => group.id === profileValue)
+  ) {
+    profileGroups.unshift({ id: profileValue, label: profileValue });
+  }
+  const profileLabel =
+    profileGroups.find((group) => group.id === profileValue)?.label ?? profileValue;
 
   return (
     <>
@@ -708,6 +736,38 @@ export function SettingsPage({
                   </div>
                 </div>
               ) : null}
+
+              <div className="settings-row">
+                <div className="settings-row-text">
+                  <span className="settings-label">Группа параметров</span>
+                  <span className="settings-hint">
+                    Калибровка под тип записи: совещание, интервью или
+                    конференция. Значения хранятся в файле
+                    diarization_profiles.yaml в папке данных — правки
+                    применяются без перезапуска.
+                  </span>
+                </div>
+                <div className="settings-control settings-control-model">
+                  <Dropdown
+                    aria-label="Группа параметров диаризации"
+                    value={profileLabel}
+                    selectedOptions={[profileValue]}
+                    disabled={!settings.diarize_enabled || profileGroups.length === 0}
+                    onOptionSelect={(_event, data) => {
+                      if (data.optionValue === undefined) {
+                        return;
+                      }
+                      update({ diarize_profile: data.optionValue });
+                    }}
+                  >
+                    {profileGroups.map((group) => (
+                      <Option key={group.id} value={group.id}>
+                        {group.label}
+                      </Option>
+                    ))}
+                  </Dropdown>
+                </div>
+              </div>
             </div>
           </section>
 

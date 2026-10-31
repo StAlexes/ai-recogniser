@@ -817,6 +817,21 @@ textarea {
   gap: 2px;
 }
 
+.job-stage-profile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.job-stage-profile-hint {
+  overflow: hidden;
+  color: var(--colorNeutralForeground3, var(--text-3));
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .job-progress {
   margin: 5px 0 1px;
 }

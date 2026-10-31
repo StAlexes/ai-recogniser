@@ -12,10 +12,12 @@ from typing import Any
 
 from airec.asr.audio import AudioError, prepare_wav, read_pcm16_mono
 from airec.asr.diarization import DiarizationError, diarize_segments
+from airec.asr.diarization_profiles import DiarizationProfiles
 from airec.asr.vad import (
     DEFAULT_MAX_SEGMENT_S,
     DEFAULT_MIN_SILENCE_MS,
     DEFAULT_SPEECH_PAD_MS,
+    DEFAULT_THRESHOLD,
     SAMPLE_RATE,
     SHORT_AUDIO_SECONDS,
     SpeechSegment,
@@ -209,10 +211,14 @@ def transcribe(
     vad_max_segment_s: float = DEFAULT_MAX_SEGMENT_S,
     vad_min_silence_ms: float = DEFAULT_MIN_SILENCE_MS,
     vad_speech_pad_ms: float = DEFAULT_SPEECH_PAD_MS,
+    vad_threshold: float = DEFAULT_THRESHOLD,
+    vad_min_speech_duration_ms: int = 250,
     diarize_enabled: bool = False,
     diarize_threshold: float = 0.70,
     diarize_model: str = "",
     diarize_model_path: str = "",
+    diarize_profile: str = "",
+    profiles: DiarizationProfiles | None = None,
     models_dir: Path | None = None,
 ) -> TranscriptionResult:
     """Convert *source* if needed and recognise it on the CPU.
@@ -263,6 +269,8 @@ def transcribe(
                     max_segment_s=vad_max_segment_s,
                     min_silence_ms=vad_min_silence_ms,
                     speech_pad_ms=vad_speech_pad_ms,
+                    threshold=vad_threshold,
+                    min_speech_duration_ms=vad_min_speech_duration_ms,
                 ):
                     collected.append(segment)
                     if duration and duration > 0:
@@ -348,6 +356,8 @@ def transcribe(
                     threshold=diarize_threshold,
                     model_path=model_path,
                     repo_id=repo_id,
+                    profile_id=diarize_profile or None,
+                    profiles=profiles,
                 )
                 segments = tuple(
                     SpeechSegment(
@@ -402,6 +412,8 @@ def diarize_transcription(
     diarize_threshold: float = 0.70,
     diarize_model: str = "",
     diarize_model_path: str = "",
+    diarize_profile: str = "",
+    profiles: DiarizationProfiles | None = None,
     models_dir: Path | None = None,
 ) -> tuple[SpeechSegment, ...]:
     """Run only the diarization stage for already recognised *segments*.
@@ -410,6 +422,9 @@ def diarize_transcription(
     WAV from the recognition worker may already have been cleaned up.  The
     function is intentionally independent from :func:`transcribe`, so the UI
     can restart diarization without repeating recognition.
+
+    *profiles*/*diarize_profile* — набор групп гиперпараметров и активная
+    группа (см. :mod:`airec.asr.diarization_profiles`).
     """
     if not segments:
         return ()
@@ -451,6 +466,8 @@ def diarize_transcription(
         threshold=diarize_threshold,
         model_path=model_path,
         repo_id=repo_id,
+        profile_id=diarize_profile or None,
+        profiles=profiles,
         cancel=check_cancel,
         progress=progress,
     )

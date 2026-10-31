@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
@@ -30,6 +30,18 @@ class SaveResultRequest(BaseModel):
     format: str | None = None
 
 
+class StageActionRequest(BaseModel):
+    """Optional body for stage start/restart (currently diarization only)."""
+
+    diarize_profile: str | None = None
+
+
+class DiarizeProfileRequest(BaseModel):
+    """Body of PUT /jobs/{id}/diarize_profile ("" = use the global profile)."""
+
+    diarize_profile: str = ""
+
+
 def _manager(request: Request) -> JobManager:
     return request.app.state.jobs
 
@@ -42,7 +54,9 @@ def list_jobs(request: Request) -> dict[str, object]:
 
 @router.post("", status_code=202)
 async def create_job(
-    request: Request, file: Annotated[UploadFile, File()]
+    request: Request,
+    file: Annotated[UploadFile, File()],
+    diarize_profile: Annotated[str, Form()] = "",
 ) -> dict[str, object]:
     filename = Path(file.filename or "").name
     suffix = Path(filename).suffix.lower()
@@ -89,7 +103,7 @@ async def create_job(
 
     settings = request.app.state.settings
     try:
-        job = manager.submit(temporary, filename, settings.asr_model)
+        job = manager.submit(temporary, filename, settings.asr_model, diarize_profile)
     except JobValidationError as exc:
         temporary.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -167,17 +181,24 @@ def retry_job(request: Request, job_id: str) -> dict[str, object]:
 
 @router.post("/{job_id}/stages/{stage}/{action}")
 def stage_action(
-    request: Request, job_id: str, stage: str, action: str
+    request: Request,
+    job_id: str,
+    stage: str,
+    action: str,
+    body: StageActionRequest | None = None,
 ) -> dict[str, object]:
     """Start, stop or restart one independent processing stage."""
     manager = _manager(request)
+    profile = body.diarize_profile if body is not None else None
     try:
         if action == "start":
-            job = manager.start_stage(job_id, stage)
+            job = manager.start_stage(
+                job_id, stage, diarize_profile=profile
+            )
         elif action == "stop":
             job = manager.stop_stage(job_id, stage)
         elif action == "restart":
-            job = manager.restart_stage(job_id, stage)
+            job = manager.restart_stage(job_id, stage, diarize_profile=profile)
         else:
             raise HTTPException(
                 status_code=400,
@@ -200,6 +221,23 @@ def start_job(request: Request, job_id: str) -> dict[str, object]:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return job.detail()
+
+
+@router.put("/{job_id}/diarize-profile")
+def set_diarize_profile(
+    request: Request, job_id: str, body: DiarizeProfileRequest
+) -> dict[str, object]:
+    """Сохранить переопределение группы гиперпараметров диаризации.
+
+    Пустая строка возвращает задание к глобальному профилю из настроек.
+    Выбор применяется при следующем запуске/перезапуске диаризации.
+    """
+    manager = _manager(request)
+    try:
+        job = manager.set_diarize_profile(job_id, body.diarize_profile)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return job.detail()
 
 

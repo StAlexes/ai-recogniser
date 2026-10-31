@@ -29,6 +29,11 @@ from typing import Any
 from airec.asr import ffmpeg_runtime
 from airec.asr.audio import SUPPORTED_EXTENSIONS, AudioError
 from airec.asr.diarization import DiarizationCancelled, DiarizationError
+from airec.asr.diarization_profiles import (
+    DiarizationProfiles,
+    load_diarization_profiles,
+    profiles_file_exists,
+)
 from airec.asr.export import (
     EXPORT_CONTENT_TYPES,
     EXPORT_DOWNLOAD_NAMES,
@@ -42,6 +47,7 @@ from airec.asr.service import (
     diarize_transcription,
     transcribe,
 )
+from airec.asr.vad import DEFAULT_THRESHOLD
 from airec.core.config import Settings
 from airec.core.db import Database
 from airec.core.paths import AppPaths
@@ -143,6 +149,9 @@ class Job:
     summary_text: str = ""
     paused: bool = False
     stages: dict[str, dict[str, Any]] = field(default_factory=default_stages)
+    # Переопределение группы гиперпараметров диаризации на задании ("": брать
+    # глобальный профиль из настроек).
+    diarize_profile: str = ""
 
     def __post_init__(self) -> None:
         """Keep stage data complete for jobs restored from older releases."""
@@ -236,6 +245,40 @@ class JobManager:
     def set_summary_runner(self, runner: SummaryRunner | None) -> None:
         """Attach the LLM-backed summary implementation after app startup."""
         self._summary_runner = runner
+
+    def _load_profiles(self) -> DiarizationProfiles:
+        """Свежее чтение внешнего YAML/JSON-файла групп перед стадией.
+
+        Файл перечитывается на каждом запуске стадии, поэтому правки
+        гиперпараметров применяются без перезапуска программы; кэш загрузчика
+        сам отслеживает mtime, так что чтение дешёвое.
+        """
+        return load_diarization_profiles(self._paths.data)
+
+    def _effective_vad_overrides(
+        self, settings: Settings
+    ) -> tuple[float, int, float, int]:
+        """(threshold, min_speech_ms, min_silence_ms, speech_pad_ms) для стадии.
+
+        Калиброванная секция ``vad`` из внешнего файла перекрывает старые
+        ``Settings.vad_min_silence_ms``/``vad_speech_pad_ms`` (и добавляет
+        threshold/min_speech, которых в настройках не было); когда файла нет,
+        действуют прежние значения из настроек и встроенные дефолты.
+        """
+        if profiles_file_exists(self._paths.data):
+            vad = self._load_profiles().vad
+            return (
+                vad.threshold,
+                vad.min_speech_duration_ms,
+                float(vad.min_silence_duration_ms),
+                float(vad.speech_pad_ms),
+            )
+        return (
+            DEFAULT_THRESHOLD,
+            250,
+            settings.vad_min_silence_ms,
+            settings.vad_speech_pad_ms,
+        )
 
     def _resolve_ffmpeg(
         self,
@@ -592,7 +635,9 @@ class JobManager:
     # ------------------------------------------------------------------ #
     # Submission
     # ------------------------------------------------------------------ #
-    def submit(self, uploaded: Path, original_name: str, model_id: str) -> Job:
+    def submit(
+        self, uploaded: Path, original_name: str, model_id: str, diarize_profile: str = ""
+    ) -> Job:
         filename = _safe_name(original_name)
         suffix = Path(filename).suffix.lower()
         if suffix not in SUPPORTED_EXTENSIONS:
@@ -628,6 +673,7 @@ class JobManager:
             size_bytes=size,
             audio_format=suffix.lstrip("."),
             source_path=str(source_copy),
+            diarize_profile=diarize_profile or "",
         )
         settings = self._settings()
         self._set_stage(
@@ -865,6 +911,9 @@ class JobManager:
 
         try:
             ffmpeg = self._resolve_ffmpeg(source, progress=progress, cancel=check_cancel)
+            vad_threshold, vad_min_speech_ms, vad_min_silence_ms, vad_speech_pad_ms = (
+                self._effective_vad_overrides(settings)
+            )
             result = self._transcriber(
                 source,
                 model_id=job.model,
@@ -875,8 +924,10 @@ class JobManager:
                 stage_progress=stage_progress,
                 vad_enabled=settings.vad_enabled,
                 vad_max_segment_s=settings.vad_max_segment_s,
-                vad_min_silence_ms=settings.vad_min_silence_ms,
-                vad_speech_pad_ms=settings.vad_speech_pad_ms,
+                vad_min_silence_ms=vad_min_silence_ms,
+                vad_speech_pad_ms=vad_speech_pad_ms,
+                vad_threshold=vad_threshold,
+                vad_min_speech_duration_ms=vad_min_speech_ms,
                 # Diarization is an independent stage; the recognition worker
                 # must never block on it so it can be stopped/restarted alone.
                 diarize_enabled=False,
@@ -1210,14 +1261,39 @@ class JobManager:
     # ------------------------------------------------------------------ #
     # Independent stages: recognition / diarization / summary
     # ------------------------------------------------------------------ #
-    def start_stage(self, job_id: str, stage: str) -> Job:
-        """Start one stage without touching the others where possible."""
+    def set_diarize_profile(self, job_id: str, profile: str) -> Job:
+        """Сохранить переопределение группы гиперпараметров на задании.
+
+        Пустая строка возвращает задание к глобальному профилю из настроек.
+        Выбор применяется при следующем запуске/перезапуске диаризации.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id) or self.get(job_id)
+            if job is None:
+                raise KeyError(f"Job {job_id} not found.")
+            job.diarize_profile = (profile or "").strip()
+            try:
+                self._persist(job)
+            except OSError:
+                log.exception("cannot persist diarize_profile for %s", job_id)
+            return job
+
+    def start_stage(
+        self, job_id: str, stage: str, *, diarize_profile: str | None = None
+    ) -> Job:
+        """Start one stage without touching the others where possible.
+
+        *diarize_profile* — переопределение группы гиперпараметров на задании
+        (учитывается только для стадии диаризации).
+        """
         if stage not in STAGE_KEYS:
             raise ValueError(f"Неизвестный этап: {stage}")
         with self._lock:
             job = self._jobs.get(job_id) or self.get(job_id)
             if job is None:
                 raise KeyError(f"Job {job_id} not found.")
+            if diarize_profile is not None and stage == "diarization":
+                job.diarize_profile = diarize_profile
             if stage == "recognition":
                 if job.status in ACTIVE_STATUSES:
                     if job.status == "queued" and job.paused:
@@ -1272,8 +1348,14 @@ class JobManager:
             self._maybe_auto_summary(job_id)
         return stopped
 
-    def restart_stage(self, job_id: str, stage: str) -> Job:
-        """Stop a stage (if needed) and start it again with a new token."""
+    def restart_stage(
+        self, job_id: str, stage: str, *, diarize_profile: str | None = None
+    ) -> Job:
+        """Stop a stage (if needed) and start it again with a new token.
+
+        *diarize_profile* — новое переопределение группы гиперпараметров на
+        задании (только для стадии диаризации; ``None`` — оставить прежнее).
+        """
         if stage not in STAGE_KEYS:
             raise ValueError(f"Неизвестный этап: {stage}")
         if stage == "recognition":
@@ -1282,6 +1364,8 @@ class JobManager:
             job = self._jobs.get(job_id) or self.get(job_id)
             if job is None:
                 raise KeyError(f"Job {job_id} not found.")
+            if diarize_profile is not None and stage == "diarization":
+                job.diarize_profile = diarize_profile
             self._stop_stage_worker(job_id, stage)
             # Mark the old generation as stopped before _start_* validates
             # that the stage is not running.
@@ -1470,6 +1554,10 @@ class JobManager:
             job = self.get(job_id)
             if job is None:
                 return
+            # Группа гиперпараметров: переопределение на задании приоритетнее
+            # глобального профиля из настроек; файл перечитывается свежим.
+            profiles = self._load_profiles()
+            profile_id = job.diarize_profile or settings.diarize_profile
             segments = diarize_transcription(
                 source,
                 list(job.segments),
@@ -1481,6 +1569,8 @@ class JobManager:
                 diarize_threshold=settings.diarize_threshold,
                 diarize_model=settings.diarize_model,
                 diarize_model_path=settings.diarize_model_path,
+                diarize_profile=profile_id,
+                profiles=profiles,
                 models_dir=self._paths.models,
             )
             payload = [asdict(segment) for segment in segments]

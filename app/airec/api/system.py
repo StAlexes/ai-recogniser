@@ -1,4 +1,4 @@
-"""System endpoints: health, version, hardware profile."""
+"""System endpoints: health, version, hardware profile, diarization profiles."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import time
 from fastapi import APIRouter, Request
 
 from airec import __version__
+from airec.asr.diarization_profiles import load_diarization_profiles
 from airec.bench.profile import load_profile, refresh_profile
 from airec.core.paths import AppPaths
 
@@ -40,3 +41,20 @@ def profile(request: Request, refresh: bool = False) -> dict[str, object]:
         return refresh_profile(path)
     cached = load_profile(path)
     return cached if cached is not None else refresh_profile(path)
+
+
+@router.get("/diarization-profiles")
+def diarization_profiles(request: Request) -> dict[str, object]:
+    """Активные группы гиперпараметров диаризации (свежее чтение YAML-файла).
+
+    Возвращает список групп для обоих движков + калибровки VAD/GigaAM: UI
+    строит по нему выпадающие списки в настройках и на странице задачи.  Файл
+    перечитывается при каждом обращении, поэтому правки видны сразу.
+    """
+    profiles = load_diarization_profiles(request.app.state.paths.data)
+    return {
+        "pyannote": [group.model_dump() for group in profiles.pyannote],
+        "wespeaker": [group.model_dump() for group in profiles.wespeaker],
+        "vad": profiles.vad.model_dump(),
+        "gigaam": profiles.gigaam.model_dump(),
+    }
