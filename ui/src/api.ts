@@ -33,6 +33,7 @@ export interface Settings {
   llm_ctx_size: number;
   llm_threads: number;
   summarize_enabled: boolean;
+  summary_prompt: string;
   vad_enabled: boolean;
   vad_max_segment_s: number;
   vad_min_silence_ms: number;

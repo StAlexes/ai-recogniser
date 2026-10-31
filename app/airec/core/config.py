@@ -53,6 +53,11 @@ class Settings(BaseModel):
     # Disabled by default because it requires a local LLM runtime + GGUF model.
     summarize_enabled: bool = False
 
+    # Дополнительная инструкция пользователя для саммаризации.  Пусто —
+    # встроенный промпт.  Пользовательский текст дополняет инструкцию: JSON-схема
+    # результата и требование «ответ строго JSON» всегда остаются встроенными.
+    summary_prompt: str = ""
+
     # Long recordings are split into speech segments with Silero VAD.  The
     # segment cap is deliberately far below GigaAM's positional limit (~200 s).
     vad_enabled: bool = True

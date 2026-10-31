@@ -29,6 +29,55 @@ DEFAULT_LLAMA_SERVER_PORT = 11435  # avoid clash with ollama's 11434
 LLAMA_SERVER_STARTUP_TIMEOUT_S = 180.0
 LLAMA_SERVER_REQUEST_TIMEOUT_S = 600.0
 
+# Canonical JSON schema of the summary result.  It is always appended to the
+# prompt by the app and is never under the user's control, so the parsed
+# result keeps its shape (the UI and exports depend on these keys).
+SUMMARY_SCHEMA = """{
+  "tl_dr": "строка, 3-5 предложений",
+  "topics": ["тема 1", "тема 2"],
+  "decisions": [{"formulation": "строка", "timecode": "MM:SS"}],
+  "action_items": [
+    {"owner": "строка", "deadline": "строка", "formulation": "строка", "timecode": "MM:SS"}
+  ],
+  "questions_open": ["вопрос 1"],
+  "risks": ["риск 1"],
+  "quotes": [{"quote": "цитата", "timecode": "MM:SS", "speaker": "Спикер N"}]
+}"""
+
+DEFAULT_SUMMARY_SYSTEM = (
+    "Ты — ассистент по саммари встреч. Пиши на русском языке. "
+    "Не выдумывай фактов, которых нет в тексте. "
+    "Ответ строго в формате JSON без markdown-блоков."
+)
+
+DEFAULT_SUMMARY_TASK = (
+    "Проанализируй транскрибированную речь ниже и составь структурированное "
+    "саммари. Каждое решение и каждую задачу привяжи к таймкоду (начало фрагмента), "
+    "где оно упомянуто. Если информации недостаточно, оставь поле пустым."
+)
+
+
+def _summary_messages(
+    text: str, *, instructions: str = ""
+) -> list[dict[str, str]]:
+    """Build chat messages for a summary request.
+
+    *instructions* — необязательная инструкция пользователя (настройка
+    ``summary_prompt``); она заменяет стандартную задачу, но JSON-схема и
+    требование «ответ строго JSON» всегда добавляются приложением.
+    """
+    task = instructions.strip() or DEFAULT_SUMMARY_TASK
+    user = (
+        f"{task}\n\n"
+        "Текст:\n---\n" + text + "\n---\n\n"
+        "Верни JSON строго со схемой ниже, без лишних ключей и markdown:\n"
+        f"{SUMMARY_SCHEMA}\n"
+    )
+    return [
+        {"role": "system", "content": DEFAULT_SUMMARY_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+
 
 class LLMError(RuntimeError):
     """LLM provider error."""
@@ -38,8 +87,14 @@ class LLMProvider(ABC):
     """LLM provider interface."""
 
     @abstractmethod
-    def summarize(self, text: str, *, language: str = "ru") -> dict[str, Any]:
-        """Produce structured summary of *text*."""
+    def summarize(
+        self, text: str, *, language: str = "ru", instructions: str = ""
+    ) -> dict[str, Any]:
+        """Produce structured summary of *text*.
+
+        *instructions* — необязательная инструкция пользователя (кастомный
+        промпт из настроек); схема JSON-результата остаётся встроенной.
+        """
         ...
 
     @abstractmethod
@@ -209,33 +264,11 @@ class LlamaCppProvider(LLMProvider):
         data = resp.json()
         return data["choices"][0]["message"]["content"]
 
-    def summarize(self, text: str, *, language: str = "ru") -> dict[str, Any]:
-        system = (
-            "Ты — ассистент по саммари встреч. Пиши на русском языке. "
-            "Не выдумывай фактов, которых нет в тексте. "
-            "Ответ строго в формате JSON без markdown-блоков."
-        )
-        user = (
-            "Проанализируй транскрибированную речь ниже и составь структурированное "
-            "саммари. Каждое решение и каждую задачу привяжи к таймкоду (начало фрагмента), "
-            "где оно упомянуто. Если информации недостаточно, оставь поле пустым.\n\n"
-            "Текст:\n---\n" + text + "\n---\n\n"
-            "Верни JSON со схемой:\n"
-            "{\n"
-            '  "tl_dr": "строка, 3-5 предложений",\n'
-            '  "topics": ["тема 1", "тема 2"],\n'
-            '  "decisions": [{"formulation": "строка", "timecode": "MM:SS"}],\n'
-            '  "action_items": [{"owner": "строка", "deadline": "строка", "formulation": "строка", "timecode": "MM:SS"}],\n'
-            '  "questions_open": ["вопрос 1"],\n'
-            '  "risks": ["риск 1"],\n'
-            '  "quotes": [{"quote": "цитата", "timecode": "MM:SS", "speaker": "Спикер N"}]\n'
-            "}\n"
-        )
+    def summarize(
+        self, text: str, *, language: str = "ru", instructions: str = ""
+    ) -> dict[str, Any]:
         content = self._chat(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            _summary_messages(text, instructions=instructions),
             temperature=0.2,
         )
         return _parse_json_strict(content)
@@ -306,32 +339,11 @@ class ExternalProvider(LLMProvider):
         data = resp.json()
         return data["choices"][0]["message"]["content"]
 
-    def summarize(self, text: str, *, language: str = "ru") -> dict[str, Any]:
-        system = (
-            "Ты — ассистент по саммари встреч. Пиши на русском языке. "
-            "Не выдумывай фактов, которых нет в тексте. "
-            "Ответ строго в формате JSON без markdown-блоков."
-        )
-        user = (
-            "Проанализируй транскрибированную речь ниже и составь структурированное "
-            "саммари. Каждое решение и каждую задачу привяжи к таймкоду.\n\n"
-            "Текст:\n---\n" + text + "\n---\n\n"
-            "Верни JSON со схемой:\n"
-            "{\n"
-            '  "tl_dr": "строка",\n'
-            '  "topics": [],\n'
-            '  "decisions": [{"formulation": "", "timecode": ""}],\n'
-            '  "action_items": [{"owner": "", "deadline": "", "formulation": "", "timecode": ""}],\n'
-            '  "questions_open": [],\n'
-            '  "risks": [],\n'
-            '  "quotes": [{"quote": "", "timecode": "", "speaker": ""}]\n'
-            "}\n"
-        )
+    def summarize(
+        self, text: str, *, language: str = "ru", instructions: str = ""
+    ) -> dict[str, Any]:
         content = self._chat(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            _summary_messages(text, instructions=instructions),
             temperature=0.2,
         )
         return _parse_json_strict(content)

@@ -9,6 +9,7 @@ import {
   MessageBarBody,
   Option,
   Switch,
+  Textarea,
 } from '@fluentui/react-components';
 import {
   ArrowClockwiseRegular,
@@ -238,6 +239,11 @@ export function SettingsPage({
   const isExternalLlm = settings?.llm_provider === 'external';
   const usesHttpLlm =
     settings?.llm_provider === 'external' || settings?.llm_provider === 'ollama';
+
+  // Первопричина 404 в логах: провайдер ollama, а в llm_model — имя GGUF-файла
+  // (T-lite/Qwen3 из каталога моделей).  Предупреждаем прямо в настройках.
+  const llmModelMismatch =
+    usesHttpLlm && currentLlm.toLowerCase().endsWith('.gguf');
 
   // Diarization models come from the manifest (kind: "diarization").  The
   // "custom" entry keeps the old local-folder workflow for advanced users.
@@ -843,6 +849,17 @@ export function SettingsPage({
                       ? 'Модели, уже установленные в Ollama.'
                       : 'GGUF-модель для llama-server или модель внешнего API.'}
                   </span>
+                  {llmModelMismatch ? (
+                    <MessageBar intent="warning" className="settings-warning">
+                      <MessageBarBody>
+                        В Ollama нет модели с именем GGUF-файла: «{currentLlm}» — запросы
+                        вернут ошибку 404. GGUF-модели (в том числе T-lite от Т-Банка)
+                        работают с провайдером «llama.cpp (локально)». Для Ollama выберите
+                        модель из списка (например gemma3:4b) или установите T-lite командой
+                        `ollama run t-tech/T-lite-it-2.1`.
+                      </MessageBarBody>
+                    </MessageBar>
+                  ) : null}
                 </div>
                 <div className="settings-control settings-control-model">
                   <Dropdown
@@ -878,6 +895,33 @@ export function SettingsPage({
                     checked={settings.summarize_enabled}
                     onChange={(_event, data) => {
                       update({ summarize_enabled: data.checked });
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row settings-row-summary-prompt">
+                <div className="settings-row-text">
+                  <span className="settings-label">Промпт саммаризации</span>
+                  <span className="settings-hint">
+                    Дополнительная инструкция для модели: что вынести в саммари,
+                    стиль, объём, как выбирать задачи. JSON-схема результата
+                    всегда добавляется приложением, поэтому её указывать не
+                    нужно. Пусто — встроенная инструкция.
+                  </span>
+                </div>
+                <div className="settings-control settings-control-rag">
+                  <Textarea
+                    className="settings-textarea-prompt"
+                    aria-label="Промпт саммаризации"
+                    value={settings.summary_prompt}
+                    disabled={!settings.summarize_enabled}
+                    placeholder="Например: составляй саммари от лица руководителя встречи, отдельно выноси риски со сроками и всех упомянутых клиентов."
+                    resize="vertical"
+                    rows={4}
+                    maxLength={4000}
+                    onChange={(_event, data) => {
+                      update({ summary_prompt: data.value });
                     }}
                   />
                 </div>

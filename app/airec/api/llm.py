@@ -105,6 +105,27 @@ def _provider(target: Any, settings: Settings) -> Any:
     return provider
 
 
+def _warn_provider_model_mismatch(settings: Settings) -> None:
+    """Log a hint when ollama/external gets a local GGUF filename.
+
+    Первопричина 404 «model not found» в логах: пользователь выбирает
+    провайдера ollama, а в ``llm_model`` остаётся имя скачанного GGUF-файла
+    (например ``T-lite-it-2.1-Q4_K_M.gguf``).  Ollama ждёт имя установленной
+    модели (``ollama list``), а GGUF-файлы — это провайдер llamacpp-local.
+    """
+    kind = settings.llm_provider
+    if kind in {"ollama", "openai-compatible", "external"}:
+        model = (settings.llm_model or "").strip()
+        if model.lower().endswith(".gguf"):
+            log.warning(
+                "провайдер %s получил имя GGUF-файла %r: ollama ждёт имя модели "
+                "из `ollama list`, а GGUF-файлы предназначены для провайдера "
+                "llamacpp-local (менеджер моделей)",
+                kind,
+                model,
+            )
+
+
 def _summarize_text(
     target: Any,
     text: str,
@@ -121,8 +142,9 @@ def _summarize_text(
             "GGUF-модель для саммари не найдена. Скачайте модель в менеджере "
             "моделей и выберите её в настройках."
         )
+    _warn_provider_model_mismatch(settings)
     provider = _provider(app, settings)
-    summarizer = Summarizer(provider)
+    summarizer = Summarizer(provider, instructions=settings.summary_prompt)
     glossary = getattr(app.state, "llm_glossary", None)
     if not isinstance(glossary, Glossary):
         glossary = Glossary.from_dicts([])
@@ -229,6 +251,27 @@ def ask_job(request: Request, job_id: str, question: str) -> dict[str, Any]:
         return {"job_id": job_id, "question": question, "answer": answer}
     except LLMError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/summarize-preview")
+def summarize_preview(request: Request) -> dict[str, Any]:
+    """Инструкция, которая уйдёт в модель при следующем саммари.
+
+    Возвращает собранный промпт (системный + пользовательский) для проверки
+    кастомного промпта из настроек без запуска LLM.
+    """
+    settings = request.app.state.settings
+    from airec.llm.providers import _summary_messages
+
+    messages = _summary_messages(
+        "…текст задачи…", instructions=settings.summary_prompt
+    )
+    return {
+        "custom_prompt": settings.summary_prompt,
+        "uses_custom_prompt": bool(settings.summary_prompt.strip()),
+        "messages": messages,
+        "schema_is_fixed": True,
+    }
 
 
 @router.post("/glossary")

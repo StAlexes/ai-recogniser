@@ -1517,6 +1517,20 @@ textarea {
   min-width: 0;
 }
 
+.settings-row-summary-prompt {
+  align-items: flex-start;
+}
+
+.settings-textarea-prompt {
+  width: 100%;
+  min-width: 0;
+}
+
+.settings-textarea-prompt textarea {
+  min-height: 88px;
+  font-family: inherit;
+}
+
 .settings-control > .fui-Dropdown {
   width: 100%;
   min-width: 0;
