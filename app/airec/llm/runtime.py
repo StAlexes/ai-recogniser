@@ -12,6 +12,7 @@ import hashlib
 import logging
 import os
 import shutil
+import time
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -85,6 +86,16 @@ def _candidate_dirs(paths: AppPaths | None = None) -> list[Path]:
     return unique
 
 
+def _has_vulkan_support(exe: Path) -> bool:
+    """True, если рядом с exe лежит ggml-vulkan.dll (признак Vulkan-сборки).
+
+    CPU-сборка llama-server молча игнорирует ``--n-gpu-layers``; без этой
+    проверки провайдер мог бы запустить CPU-бинарник как «GPU» и никогда
+    не скачать настоящую Vulkan-среду.
+    """
+    return (exe.parent / "ggml-vulkan.dll").is_file()
+
+
 def find_llama_server(
     paths: AppPaths | None = None,
     custom: str | Path | None = None,
@@ -93,29 +104,41 @@ def find_llama_server(
 ) -> Path | None:
     """Return the first usable ``llama-server`` executable, or ``None``.
 
-    *device* выбирает, какую сборку искать первой: при ``vulkan`` —
-    Vulkan-папку runtime, при ``cpu`` — обычную.  Пользовательский путь
-    (*custom*) и PATH имеют приоритет над обеими.
+    *device* выбирает сборку.  При ``cpu`` ищем CPU-папку runtime и
+    стандартные папки bin.  При ``vulkan`` — только Vulkan-папку runtime:
+    никакой подмены CPU-сборкой.  Кастомный путь (*custom*) и PATH имеют
+    приоритет, но при ``vulkan`` тоже проверяются на ggml-vulkan.dll.
     """
+    vulkan = device == "vulkan"
+
+    def usable(exe: Path) -> bool:
+        return exe.is_file() and (not vulkan or _has_vulkan_support(exe))
+
     if custom:
         candidate = Path(custom).expanduser()
-        if candidate.is_file():
+        if usable(candidate):
             return candidate
         if candidate.is_dir():
             for name in EXECUTABLE_NAMES:
                 found = candidate / name
-                if found.is_file():
+                if usable(found):
                     return found
     resolved = paths or AppPaths.resolve()
-    preferred = runtime_dir(resolved, device=device)
-    others = [d for d in _candidate_dirs(resolved) if d != preferred]
-    for directory in [preferred, *others]:
+    if vulkan:
+        directories = [runtime_dir(resolved, device="vulkan")]
+    else:
+        preferred = runtime_dir(resolved)
+        others = [d for d in _candidate_dirs(resolved) if d != preferred]
+        directories = [preferred, *others]
+    for directory in directories:
         for name in EXECUTABLE_NAMES:
             found = directory / name
-            if found.is_file():
+            if usable(found):
                 return found
     found = shutil.which("llama-server") or shutil.which("llama-server.exe")
-    return Path(found) if found else None
+    if found and usable(Path(found)):
+        return Path(found)
+    return None
 
 
 def runtime_installed(paths: AppPaths | None = None, *, device: str = "cpu") -> bool:
@@ -199,42 +222,62 @@ def _download(
     client: httpx.Client | None = None,
 ) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
-    existing = target.stat().st_size if target.is_file() else 0
-    headers = {"Range": f"bytes={existing}-"} if existing else {}
     notify = progress or (lambda _value, _phase: None)
     owned = client is None
     http = client or httpx.Client(
         follow_redirects=True,
         timeout=httpx.Timeout(120.0, connect=30.0),
     )
+    # Прокси и Wi-Fi нередко рвут TLS (WinError 10054).  Каждая попытка
+    # продолжается с уже скачанного места (Range-запрос).
+    last_error: Exception | None = None
     try:
-        with http.stream("GET", url, headers=headers) as response:
-            if response.status_code not in {200, 206}:
-                raise RuntimeInstallError(
-                    f"Не удалось скачать llama-server: HTTP {response.status_code}"
-                )
-            if response.status_code == 200 and existing:
-                existing = 0
-                target.unlink(missing_ok=True)
-            total_header = response.headers.get("content-length")
-            total = existing + int(total_header) if total_header and total_header.isdigit() else 0
-            downloaded = existing
-            mode = "ab" if existing and response.status_code == 206 else "wb"
-            with target.open(mode) as handle:
-                for chunk in response.iter_bytes(CHUNK_BYTES):
-                    if not chunk:
-                        continue
-                    handle.write(chunk)
-                    downloaded += len(chunk)
-                    if total > 0:
-                        notify(
-                            min(downloaded / total * 0.8, 0.8),
-                            "Скачивание llama-server",
+        for attempt in range(1, 6):
+            if attempt > 1:
+                time.sleep(2 * attempt)
+            existing = target.stat().st_size if target.is_file() else 0
+            headers = {"Range": f"bytes={existing}-"} if existing else {}
+            try:
+                with http.stream("GET", url, headers=headers) as response:
+                    if response.status_code not in {200, 206}:
+                        raise RuntimeInstallError(
+                            f"Не удалось скачать llama-server: HTTP {response.status_code}"
                         )
-            notify(0.82, "Проверка llama-server")
+                    if response.status_code == 200 and existing:
+                        existing = 0
+                        target.unlink(missing_ok=True)
+                    total_header = response.headers.get("content-length")
+                    total = (
+                        existing + int(total_header)
+                        if total_header and total_header.isdigit()
+                        else 0
+                    )
+                    downloaded = existing
+                    mode = "ab" if existing and response.status_code == 206 else "wb"
+                    with target.open(mode) as handle:
+                        for chunk in response.iter_bytes(CHUNK_BYTES):
+                            if not chunk:
+                                continue
+                            handle.write(chunk)
+                            downloaded += len(chunk)
+                            if total > 0:
+                                notify(
+                                    min(downloaded / total * 0.8, 0.8),
+                                    "Скачивание llama-server",
+                                )
+                    notify(0.82, "Проверка llama-server")
+                    return
+            except (httpx.HTTPError, OSError) as exc:
+                last_error = exc
+                log.warning(
+                    "llama-server download attempt %d failed: %s", attempt, exc
+                )
     finally:
         if owned:
             http.close()
+    raise RuntimeInstallError(
+        f"Скачивание llama-server не удалось после 5 попыток: {last_error}"
+    )
 
 
 def ensure_runtime(

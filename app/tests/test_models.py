@@ -30,12 +30,15 @@ def paths_for(tmp_path: Path) -> AppPaths:
     return paths
 
 
-def runtime_zip() -> bytes:
+def runtime_zip(*, vulkan: bool = False) -> bytes:
+    """Fake llama.cpp archive; the Vulkan variant carries ggml-vulkan.dll."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("llama-b11946/llama-server.exe", b"exe")
         archive.writestr("llama-b11946/llama.dll", b"dll")
         archive.writestr("llama-b11946/LICENSE", b"MIT")
+        if vulkan:
+            archive.writestr("llama-b11946/ggml-vulkan.dll", b"vulkan")
     return buffer.getvalue()
 
 
@@ -330,7 +333,7 @@ def test_ensure_runtime_vulkan_installs_into_separate_dir(
 ) -> None:
     """Vulkan-runtime ставится в свою папку и не трогает CPU-runtime."""
     paths = paths_for(tmp_path)
-    payload = runtime_zip()
+    payload = runtime_zip(vulkan=True)
     entry = {
         "id": runtime.RUNTIME_ID_VULKAN,
         "kind": "runtime",
@@ -372,7 +375,9 @@ def test_find_llama_server_prefers_device_dir(tmp_path: Path) -> None:
     cpu_dir.mkdir(parents=True, exist_ok=True)
     vulkan_dir.mkdir(parents=True, exist_ok=True)
     (cpu_dir / "llama-server.exe").write_bytes(b"cpu")
+    (cpu_dir / "llama.dll").write_bytes(b"dll")
     (vulkan_dir / "llama-server.exe").write_bytes(b"vulkan")
+    (vulkan_dir / "ggml-vulkan.dll").write_bytes(b"vulkan")
 
     assert "llama-server-vulkan" in str(
         runtime.find_llama_server(paths, device="vulkan")
@@ -380,3 +385,44 @@ def test_find_llama_server_prefers_device_dir(tmp_path: Path) -> None:
     assert "llama-server-vulkan" not in str(
         runtime.find_llama_server(paths, device="cpu")
     )
+
+
+def test_find_llama_server_vulkan_never_returns_cpu_binary(tmp_path: Path) -> None:
+    """Строгий поиск: без ggml-vulkan.dll сервер не считается Vulkan-сборкой.
+
+    Регрессия 0.4.5: при device=vulkan находилась CPU-сборка, Vulkan-runtime
+    не скачивался, а llama-server молча работал на CPU с флагом
+    --n-gpu-layers.
+    """
+    paths = paths_for(tmp_path)
+    cpu_dir = runtime.runtime_dir(paths, device="cpu")
+    cpu_dir.mkdir(parents=True, exist_ok=True)
+    (cpu_dir / "llama-server.exe").write_bytes(b"cpu")
+
+    # device=vulkan: CPU-бинарник без ggml-vulkan.dll не подходит.
+    assert runtime.find_llama_server(paths, device="vulkan") is None
+    # device=cpu: обычный поиск по-прежнему находит его.
+    assert runtime.find_llama_server(paths, device="cpu") is not None
+
+    # Устанавливаем Vulkan-runtime — теперь он находится и приоритетен.
+    vulkan_dir = runtime.runtime_dir(paths, device="vulkan")
+    vulkan_dir.mkdir(parents=True, exist_ok=True)
+    (vulkan_dir / "llama-server.exe").write_bytes(b"vulkan")
+    (vulkan_dir / "ggml-vulkan.dll").write_bytes(b"vulkan")
+    found = runtime.find_llama_server(paths, device="vulkan")
+    assert found is not None and "llama-server-vulkan" in str(found)
+
+
+def test_find_llama_server_vulkan_rejects_custom_cpu_path(tmp_path: Path) -> None:
+    """Кастомный путь без ggml-vulkan.dll не проходит при device=vulkan."""
+    paths = paths_for(tmp_path)
+    custom_dir = tmp_path / "custom"
+    custom_dir.mkdir()
+    (custom_dir / "llama-server.exe").write_bytes(b"cpu-only")
+
+    assert runtime.find_llama_server(paths, custom=custom_dir, device="cpu") is not None
+    assert runtime.find_llama_server(paths, custom=custom_dir, device="vulkan") is None
+
+    (custom_dir / "ggml-vulkan.dll").write_bytes(b"vulkan")
+    found = runtime.find_llama_server(paths, custom=custom_dir, device="vulkan")
+    assert found is not None and found.parent == custom_dir

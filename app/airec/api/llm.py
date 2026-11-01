@@ -234,11 +234,12 @@ def list_devices(request: Request) -> dict[str, Any]:
     """
     settings = request.app.state.settings
     custom = settings.llm_server_path.strip() or None
-    server = find_llama_server(request.app.state.paths, custom=custom, device="vulkan")
+    paths = request.app.state.paths
+    server = find_llama_server(paths, custom=custom, device="vulkan")
     if server is None:
-        # Подойдёт и CPU-сборка из того же релиза: список устройств даёт
-        # ggml-vulkan, но в CPU-архиве его нет — тогда просто пусто.
-        server = find_llama_server(request.app.state.paths, custom=custom, device="cpu")
+        # CPU-сборка тоже вызывается: в её --list-devices нет строк Vulkan,
+        # парсер вернёт пустой список — честный ответ «адаптеров не видно».
+        server = find_llama_server(paths, custom=custom, device="cpu")
     devices: list[dict[str, Any]] = []
     if server is not None:
         try:

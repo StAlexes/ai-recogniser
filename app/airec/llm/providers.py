@@ -412,15 +412,18 @@ class LlamaCppProvider(LLMProvider):
         found = find_llama_server(custom=self.binary, device=self.device)
         if found is not None:
             return str(found)
+        if self.device == "vulkan":
+            # Строгий поиск: сюда попадаем, только если Vulkan-сборки нет
+            # вообще (в т.ч. в кастомном пути).  CPU-сборка подменой не
+            # стала бы: она молча игнорирует --n-gpu-layers.
+            raise LLMError(
+                "Vulkan-среда llama.cpp не установлена. Она скачается "
+                "автоматически при первом запуске саммари с устройством GPU "
+                "— либо скачайте «llama.cpp Vulkan / GPU» в менеджере моделей."
+            )
         raise LLMError(
             "llama-server не найден. Скачайте runtime в менеджере моделей "
             "(«Среда llama.cpp») или укажите путь в настройках."
-            + (
-                " Для устройства GPU нужна Vulkan-сборка — она скачается при "
-                "первом запуске саммари."
-                if self.device == "vulkan"
-                else ""
-            )
         )
 
     def _start_server(self) -> None:
