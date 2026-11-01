@@ -248,7 +248,7 @@ def test_ensure_runtime_downloads_and_verifies(
         "size_bytes": len(payload),
         "sha256": hashlib.sha256(payload).hexdigest().upper(),
     }
-    monkeypatch.setattr(runtime, "_runtime_entry", lambda: entry)
+    monkeypatch.setattr(runtime, "_runtime_entry", lambda *, device="cpu": entry)
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers.get("range") is None
@@ -282,7 +282,7 @@ def test_ensure_runtime_rejects_bad_sha(
         "size_bytes": len(payload),
         "sha256": "00" * 32,
     }
-    monkeypatch.setattr(runtime, "_runtime_entry", lambda: entry)
+    monkeypatch.setattr(runtime, "_runtime_entry", lambda *, device="cpu": entry)
 
     client = httpx.Client(
         transport=httpx.MockTransport(
@@ -311,7 +311,7 @@ def test_ensure_runtime_reuses_complete_partial(
         "size_bytes": len(payload),
         "sha256": hashlib.sha256(payload).hexdigest().upper(),
     }
-    monkeypatch.setattr(runtime, "_runtime_entry", lambda: entry)
+    monkeypatch.setattr(runtime, "_runtime_entry", lambda *, device="cpu": entry)
     partial = paths.temp / "runtime.zip.partial"
     partial.write_bytes(payload)
 
@@ -323,3 +323,60 @@ def test_ensure_runtime_reuses_complete_partial(
 
     assert found.name == "llama-server.exe"
     assert not partial.exists()
+
+
+def test_ensure_runtime_vulkan_installs_into_separate_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vulkan-runtime ставится в свою папку и не трогает CPU-runtime."""
+    paths = paths_for(tmp_path)
+    payload = runtime_zip()
+    entry = {
+        "id": runtime.RUNTIME_ID_VULKAN,
+        "kind": "runtime",
+        "url": "https://example.test/vulkan.zip",
+        "filename": "vulkan.zip",
+        "size_bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest().upper(),
+    }
+    seen_devices: list[str] = []
+
+    def fake_entry(*, device: str = "cpu") -> dict[str, object]:
+        seen_devices.append(device)
+        return entry if device == "vulkan" else {}
+
+    monkeypatch.setattr(runtime, "_runtime_entry", fake_entry)
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                content=payload,
+                headers={"content-length": str(len(payload))},
+            )
+        )
+    )
+    found = runtime.ensure_runtime(paths, client=client, device="vulkan")
+
+    assert seen_devices == ["vulkan"]
+    assert found == runtime.runtime_dir(paths, device="vulkan") / "llama-server.exe"
+    assert found.is_file()
+    # CPU-runtime не устанавливался.
+    assert runtime.find_llama_server(paths, device="cpu") is None
+
+
+def test_find_llama_server_prefers_device_dir(tmp_path: Path) -> None:
+    paths = paths_for(tmp_path)
+    cpu_dir = runtime.runtime_dir(paths, device="cpu")
+    vulkan_dir = runtime.runtime_dir(paths, device="vulkan")
+    cpu_dir.mkdir(parents=True, exist_ok=True)
+    vulkan_dir.mkdir(parents=True, exist_ok=True)
+    (cpu_dir / "llama-server.exe").write_bytes(b"cpu")
+    (vulkan_dir / "llama-server.exe").write_bytes(b"vulkan")
+
+    assert "llama-server-vulkan" in str(
+        runtime.find_llama_server(paths, device="vulkan")
+    )
+    assert "llama-server-vulkan" not in str(
+        runtime.find_llama_server(paths, device="cpu")
+    )

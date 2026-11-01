@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +74,7 @@ def _provider(target: Any, settings: Settings) -> Any:
         if kind == "llamacpp-local"
         else settings.llm_model
     )
+    device = settings.llm_device if kind == "llamacpp-local" else "cpu"
     signature = (
         kind,
         local_model,
@@ -80,6 +83,9 @@ def _provider(target: Any, settings: Settings) -> Any:
         settings.llm_server_path,
         settings.llm_ctx_size,
         settings.llm_threads,
+        device,
+        settings.llm_gpu_device,
+        settings.llm_gpu_layers,
     )
     cached = getattr(app.state, PROVIDER_STATE_KEY, None)
     if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == signature:
@@ -100,6 +106,9 @@ def _provider(target: Any, settings: Settings) -> Any:
         ctx_size=settings.llm_ctx_size,
         threads=settings.llm_threads,
         binary=_provider_binary(app, settings) if kind == "llamacpp-local" else None,
+        device=device,
+        gpu_device=settings.llm_gpu_device,
+        gpu_layers=settings.llm_gpu_layers,
     )
     setattr(app.state, PROVIDER_STATE_KEY, (signature, provider))
     return provider
@@ -165,14 +174,15 @@ def make_summary_runner(app: Any) -> Any:
             kind = "external"
         if kind == "llamacpp-local":
             custom = settings.llm_server_path.strip() or None
-            if find_llama_server(app.state.paths, custom=custom) is None:
-                # The runtime is a one-time ~24 MB download.  Doing it inside
+            device = settings.llm_device
+            if find_llama_server(app.state.paths, custom=custom, device=device) is None:
+                # The runtime is a one-time download.  Doing it inside
                 # the summary worker keeps the HTTP request short and gives the
                 # stage a real progress bar instead of a silent 30-second pause.
                 def install_progress(value: float, phase: str) -> None:
                     progress(0.02 + 0.2 * max(0.0, min(value, 1.0)), phase)
 
-                ensure_runtime(app.state.paths, progress=install_progress)
+                ensure_runtime(app.state.paths, progress=install_progress, device=device)
 
             def summary_progress(value: float, phase: str) -> None:
                 progress(0.22 + 0.78 * max(0.0, min(value, 1.0)), phase)
@@ -212,6 +222,54 @@ def list_providers(request: Request) -> dict[str, Any]:
             except Exception:  # pragma: no cover - best effort cleanup
                 log.debug("cannot close probe provider", exc_info=True)
     return {"active": kind, "health": health}
+
+
+@router.get("/devices")
+def list_devices(request: Request) -> dict[str, Any]:
+    """Vulkan-адаптеры машины для GPU-саммари.
+
+    Опрашивает установленный llama-server (``--list-devices``).  Если runtime
+    ещё не установлен или Vulkan недоступен, возвращается пустой список —
+    UI в таком случае показывает только вариант «Авто».
+    """
+    settings = request.app.state.settings
+    custom = settings.llm_server_path.strip() or None
+    server = find_llama_server(request.app.state.paths, custom=custom, device="vulkan")
+    if server is None:
+        # Подойдёт и CPU-сборка из того же релиза: список устройств даёт
+        # ggml-vulkan, но в CPU-архиве его нет — тогда просто пусто.
+        server = find_llama_server(request.app.state.paths, custom=custom, device="cpu")
+    devices: list[dict[str, Any]] = []
+    if server is not None:
+        try:
+            completed = subprocess.run(
+                [str(server), "--list-devices"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                creationflags=0x08000000 if os.name == "nt" else 0,
+                check=False,
+            )
+            for line in (completed.stdout or "").splitlines():
+                # Формат: "  Vulkan0: AMD Radeon 780M Graphics (16286 MiB, 15472 MiB free)"
+                if ":" not in line or not line.strip().lower().startswith("vulkan"):
+                    continue
+                head, _, rest = line.partition(":")
+                name = rest.strip()
+                memory = ""
+                if "(" in name and name.endswith(")"):
+                    name, _, memory = name.partition("(")
+                    memory = memory.rstrip(")").strip()
+                devices.append(
+                    {
+                        "id": head.strip(),
+                        "name": name.strip(),
+                        "memory": memory,
+                    }
+                )
+        except (OSError, subprocess.SubprocessError):
+            log.debug("cannot list llama-server devices", exc_info=True)
+    return {"devices": devices}
 
 
 @router.post("/summarize/{job_id}", status_code=202)

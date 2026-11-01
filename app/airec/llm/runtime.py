@@ -33,6 +33,17 @@ DEFAULT_URL = (
 DEFAULT_SHA256 = "8A702BB07C873B133C56EB3ACD92A48D7C5C9AD339C6435EDDC5185E46E1A043"
 DEFAULT_SIZE_BYTES = 24_376_086
 
+# Vulkan-сборка работает и на дискретных GPU, и на iGPU (AMD Radeon 780M,
+# Intel Arc/Iris Xe) через единый драйвер — отдельные CUDA-сборки не нужны.
+RUNTIME_ID_VULKAN = "llama-server-vulkan-x64"
+RUNTIME_FILENAME_VULKAN = "llama-server-vulkan-x64.zip"
+DEFAULT_URL_VULKAN = (
+    "https://github.com/ggml-org/llama.cpp/releases/download/b11946/"
+    "llama-b11946-bin-win-vulkan-x64.zip"
+)
+DEFAULT_SHA256_VULKAN = "B65B2837C584CA2D37033B8A947513FC02649199077A17455F416921AA6EB8F5"
+DEFAULT_SIZE_BYTES_VULKAN = 37_303_240
+
 EXECUTABLE_NAMES = ("llama-server.exe", "llama-server")
 ProgressCallback = Callable[[float, str], None]
 CHUNK_BYTES = 1024 * 1024
@@ -42,9 +53,15 @@ class RuntimeInstallError(RuntimeError):
     """Runtime download/install error."""
 
 
-def runtime_dir(paths: AppPaths) -> Path:
-    """Writable directory for the downloaded llama.cpp runtime."""
-    return paths.data / "runtime" / "llama-server"
+def runtime_dir(paths: AppPaths, *, device: str = "cpu") -> Path:
+    """Writable directory for the downloaded llama.cpp runtime.
+
+    CPU- и Vulkan-сборки живут в разных папках: обе могут быть установлены
+    одновременно, переключение устройства в настройках не требует повторного
+    скачивания.
+    """
+    subdir = "llama-server-vulkan" if device == "vulkan" else "llama-server"
+    return paths.data / "runtime" / subdir
 
 
 def _candidate_dirs(paths: AppPaths | None = None) -> list[Path]:
@@ -69,9 +86,17 @@ def _candidate_dirs(paths: AppPaths | None = None) -> list[Path]:
 
 
 def find_llama_server(
-    paths: AppPaths | None = None, custom: str | Path | None = None
+    paths: AppPaths | None = None,
+    custom: str | Path | None = None,
+    *,
+    device: str = "cpu",
 ) -> Path | None:
-    """Return the first usable ``llama-server`` executable, or ``None``."""
+    """Return the first usable ``llama-server`` executable, or ``None``.
+
+    *device* выбирает, какую сборку искать первой: при ``vulkan`` —
+    Vulkan-папку runtime, при ``cpu`` — обычную.  Пользовательский путь
+    (*custom*) и PATH имеют приоритет над обеими.
+    """
     if custom:
         candidate = Path(custom).expanduser()
         if candidate.is_file():
@@ -81,7 +106,10 @@ def find_llama_server(
                 found = candidate / name
                 if found.is_file():
                     return found
-    for directory in _candidate_dirs(paths):
+    resolved = paths or AppPaths.resolve()
+    preferred = runtime_dir(resolved, device=device)
+    others = [d for d in _candidate_dirs(resolved) if d != preferred]
+    for directory in [preferred, *others]:
         for name in EXECUTABLE_NAMES:
             found = directory / name
             if found.is_file():
@@ -90,21 +118,32 @@ def find_llama_server(
     return Path(found) if found else None
 
 
-def runtime_installed(paths: AppPaths | None = None) -> bool:
-    return find_llama_server(paths) is not None
+def runtime_installed(paths: AppPaths | None = None, *, device: str = "cpu") -> bool:
+    return find_llama_server(paths, device=device) is not None
 
 
-def _runtime_entry() -> dict[str, Any]:
+def _runtime_entry(*, device: str = "cpu") -> dict[str, Any]:
+    runtime_id = RUNTIME_ID_VULKAN if device == "vulkan" else RUNTIME_ID
     try:
         manifest = load_manifest(manifest_dir())
-        entry = find_model(manifest, RUNTIME_ID)
+        entry = find_model(manifest, runtime_id)
         if entry is not None:
             return entry
         for candidate in manifest.get("models", []):
-            if candidate.get("kind") == "runtime":
+            if candidate.get("kind") == "runtime" and (
+                candidate.get("id") == runtime_id or device == "cpu"
+            ):
                 return candidate
     except (OSError, ValueError):
         log.debug("cannot read runtime entry from manifest", exc_info=True)
+    if device == "vulkan":
+        return {
+            "id": RUNTIME_ID_VULKAN,
+            "filename": RUNTIME_FILENAME_VULKAN,
+            "url": DEFAULT_URL_VULKAN,
+            "sha256": DEFAULT_SHA256_VULKAN,
+            "size_bytes": DEFAULT_SIZE_BYTES_VULKAN,
+        }
     return {}
 
 
@@ -116,9 +155,11 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest().upper()
 
 
-def install_runtime_zip(zip_path: Path, paths: AppPaths) -> Path:
-    """Extract a llama.cpp Windows CPU archive into the runtime directory."""
-    target = runtime_dir(paths)
+def install_runtime_zip(
+    zip_path: Path, paths: AppPaths, *, device: str = "cpu"
+) -> Path:
+    """Extract a llama.cpp Windows archive into the runtime directory."""
+    target = runtime_dir(paths, device=device)
     staging = target.with_name(target.name + ".tmp")
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True, exist_ok=True)
@@ -143,10 +184,10 @@ def install_runtime_zip(zip_path: Path, paths: AppPaths) -> Path:
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    found = find_llama_server(paths)
+    found = find_llama_server(paths, device=device)
     if found is None:
         raise RuntimeInstallError("llama-server установлен, но не найден после распаковки.")
-    log.info("llama-server installed: %s", found)
+    log.info("llama-server (%s) installed: %s", device, found)
     return found
 
 
@@ -202,16 +243,30 @@ def ensure_runtime(
     progress: ProgressCallback | None = None,
     client: httpx.Client | None = None,
     force: bool = False,
+    device: str = "cpu",
 ) -> Path:
-    """Return an installed llama-server, downloading it on first use."""
-    found = find_llama_server(paths)
+    """Return an installed llama-server, downloading it on first use.
+
+    *device* — ``cpu`` или ``vulkan``: Vulkan-сборка нужна для GPU-ускорения
+    саммари и скачивается отдельно при первом запуске с устройством ``vulkan``.
+    """
+    found = find_llama_server(paths, device=device)
     if found is not None and not force:
         return found
 
-    entry = _runtime_entry()
+    entry = _runtime_entry(device=device)
+    if device == "vulkan" and not entry.get("url"):
+        raise RuntimeInstallError(
+            "Vulkan-сборка llama.cpp недоступна в манифесте моделей."
+        )
     url = str(entry.get("url") or DEFAULT_URL)
     expected_sha = str(entry.get("sha256") or DEFAULT_SHA256).upper()
-    expected_size = int(entry.get("size_bytes") or DEFAULT_SIZE_BYTES)
+    expected_size = int(entry.get("size_bytes") or 0)
+    fallback_size = (
+        DEFAULT_SIZE_BYTES_VULKAN if device == "vulkan" else DEFAULT_SIZE_BYTES
+    )
+    if not expected_size:
+        expected_size = fallback_size
     filename = str(entry.get("filename") or RUNTIME_FILENAME)
     partial = paths.temp / f"{filename}.partial"
     notify = progress or (lambda _value, _phase: None)
@@ -244,7 +299,7 @@ def ensure_runtime(
                 "Скачайте runtime заново."
             )
     notify(0.94, "Установка llama-server")
-    found = install_runtime_zip(partial, paths)
+    found = install_runtime_zip(partial, paths, device=device)
     partial.unlink(missing_ok=True)
     notify(1.0, "llama-server готов")
     return found

@@ -336,6 +336,42 @@ def _parse_json_strict(text: str) -> dict[str, Any]:
         raise
 
 
+def _server_cmd(
+    *,
+    binary: str,
+    model: str,
+    ctx_size: int,
+    threads: int,
+    port: int,
+    device: str = "cpu",
+    gpu_device: str = "",
+    gpu_layers: int = 99,
+) -> list[str]:
+    """Build the llama-server command line (pure function, testable).
+
+    При ``device="vulkan"`` модель выгружается на GPU (``--n-gpu-layers``);
+    ``gpu_device`` выбирает конкретный адаптер (iGPU/dGPU), пусто —
+    llama-server сам выбирает быстрейший.
+    """
+    cmd = [
+        binary,
+        "--model", model,
+        "--ctx-size", str(ctx_size),
+        "--threads", str(threads),
+        # Summaries do not need a long chain of thought.  Disabling it
+        # keeps CPU-only generation several times faster and avoids
+        # models that emit reasoning_content but no final JSON.
+        "--reasoning", "off",
+        "--host", "127.0.0.1",
+        "--port", str(port),
+    ]
+    if device == "vulkan":
+        cmd += ["--n-gpu-layers", str(max(0, min(int(gpu_layers), 99)))]
+        if gpu_device.strip():
+            cmd += ["--device", gpu_device.strip()]
+    return cmd
+
+
 class LlamaCppProvider(LLMProvider):
     """Local ``llama-server`` provider.
 
@@ -352,12 +388,18 @@ class LlamaCppProvider(LLMProvider):
         threads: int = 0,
         port: int = DEFAULT_LLAMA_SERVER_PORT,
         binary: str | Path | None = None,
+        device: str = "cpu",
+        gpu_device: str = "",
+        gpu_layers: int = 99,
     ) -> None:
         self.model = str(model)
         self.ctx_size = ctx_size
         self.threads = threads or os.cpu_count() or 4
         self.port = port
         self.binary = Path(binary) if binary else None
+        self.device = "vulkan" if device == "vulkan" else "cpu"
+        self.gpu_device = gpu_device.strip()
+        self.gpu_layers = max(0, min(int(gpu_layers), 99))
         self._process: subprocess.Popen[bytes] | None = None
         self._base_url = f"http://127.0.0.1:{port}"
         self._client = httpx.Client(base_url=self._base_url, timeout=LLAMA_SERVER_REQUEST_TIMEOUT_S)
@@ -367,13 +409,62 @@ class LlamaCppProvider(LLMProvider):
     # Lifecycle
     # ------------------------------------------------------------------ #
     def _resolve_binary(self) -> str:
-        found = find_llama_server(custom=self.binary)
+        found = find_llama_server(custom=self.binary, device=self.device)
         if found is not None:
             return str(found)
         raise LLMError(
             "llama-server не найден. Скачайте runtime в менеджере моделей "
             "(«Среда llama.cpp») или укажите путь в настройках."
+            + (
+                " Для устройства GPU нужна Vulkan-сборка — она скачается при "
+                "первом запуске саммари."
+                if self.device == "vulkan"
+                else ""
+            )
         )
+
+    def _start_server(self) -> None:
+        """Spawn llama-server and wait for its health endpoint."""
+        binary = self._resolve_binary()
+        cmd = _server_cmd(
+            binary=binary,
+            model=self.model,
+            ctx_size=self.ctx_size,
+            threads=self.threads,
+            port=self.port,
+            device=self.device,
+            gpu_device=self.gpu_device,
+            gpu_layers=self.gpu_layers,
+        )
+        log.info("starting llama-server (%s): %s", self.device, " ".join(cmd))
+        # Never pipe llama-server output: it logs continuously and an
+        # unread pipe would eventually block the server.  Logs are not
+        # needed for normal operation; startup failures are reported by
+        # the exit code and the health probe below.
+        self._process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=0x08000000 if os.name == "nt" else 0,  # CREATE_NO_WINDOW
+        )
+        # Wait for /v1/models to become available.
+        deadline = time.monotonic() + LLAMA_SERVER_STARTUP_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if self._process.poll() is not None:
+                raise LLMError(
+                    "llama-server завершился при старте "
+                    f"(код {self._process.returncode}). Проверьте, что "
+                    "runtime llama.cpp и GGUF-модель совместимы."
+                )
+            try:
+                resp = self._client.get("/v1/models", timeout=3.0)
+                if resp.status_code == 200:
+                    log.info("llama-server ready on port %s (%s)", self.port, self.device)
+                    return
+            except (httpx.ConnectError, httpx.TimeoutException):
+                pass
+            time.sleep(0.5)
+        raise LLMError(f"llama-server не стал доступен за {LLAMA_SERVER_STARTUP_TIMEOUT_S} с")
 
     def _ensure_running(self) -> None:
         with self._lock:
@@ -385,48 +476,31 @@ class LlamaCppProvider(LLMProvider):
                     "GGUF-модель для саммари не найдена. Скачайте модель в "
                     "менеджере моделей и выберите её в настройках."
                 )
-            binary = self._resolve_binary()
-            cmd = [
-                binary,
-                "--model", self.model,
-                "--ctx-size", str(self.ctx_size),
-                "--threads", str(self.threads),
-                # Summaries do not need a long chain of thought.  Disabling it
-                # keeps CPU-only generation several times faster and avoids
-                # models that emit reasoning_content but no final JSON.
-                "--reasoning", "off",
-                "--host", "127.0.0.1",
-                "--port", str(self.port),
-            ]
-            log.info("starting llama-server: %s", " ".join(cmd))
-            # Never pipe llama-server output: it logs continuously and an
-            # unread pipe would eventually block the server.  Logs are not
-            # needed for normal operation; startup failures are reported by
-            # the exit code and the health probe below.
-            self._process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=0x08000000 if os.name == "nt" else 0,  # CREATE_NO_WINDOW
-            )
-            # Wait for /v1/models to become available.
-            deadline = time.monotonic() + LLAMA_SERVER_STARTUP_TIMEOUT_S
-            while time.monotonic() < deadline:
-                if self._process.poll() is not None:
-                    raise LLMError(
-                        "llama-server завершился при старте "
-                        f"(код {self._process.returncode}). Проверьте, что "
-                        "runtime llama.cpp и GGUF-модель совместимы."
-                    )
+            # Помним исходный выбор: после неудачного отката настройки
+            # провайдера должны остаться как задал пользователь.
+            original_device, original_gpu = self.device, self.gpu_device
+            try:
+                self._start_server()
+                return
+            except LLMError as exc:
+                if self.device != "vulkan":
+                    raise
+                # GPU-старт может не удаться на машине без драйверов Vulkan
+                # или с несовместимым адаптером.  Один откат на CPU спасает
+                # саммари: лучше медленнее, чем никак.
+                log.warning(
+                    "llama-server не запустился с Vulkan (%s); повтор на CPU", exc
+                )
+                self.device = "cpu"
+                self.gpu_device = ""
                 try:
-                    resp = self._client.get("/v1/models", timeout=3.0)
-                    if resp.status_code == 200:
-                        log.info("llama-server ready on port %s", self.port)
-                        return
-                except (httpx.ConnectError, httpx.TimeoutException):
-                    pass
-                time.sleep(0.5)
-            raise LLMError(f"llama-server не стал доступен за {LLAMA_SERVER_STARTUP_TIMEOUT_S} с")
+                    self._start_server()
+                    log.info("llama-server работает на CPU после отката с Vulkan")
+                except LLMError as cpu_exc:
+                    self.device, self.gpu_device = original_device, original_gpu
+                    raise LLMError(
+                        f"{exc} Откат на CPU тоже не удался: {cpu_exc}"
+                    ) from cpu_exc
 
     def close(self) -> None:
         with self._lock:
@@ -690,10 +764,22 @@ def create_provider(
     threads: int = 0,
     port: int = DEFAULT_LLAMA_SERVER_PORT,
     binary: str | Path | None = None,
+    device: str = "cpu",
+    gpu_device: str = "",
+    gpu_layers: int = 99,
 ) -> LLMProvider:
     """Factory for LLM providers."""
     if kind == "llamacpp-local":
-        return LlamaCppProvider(model=model, ctx_size=ctx_size, threads=threads, port=port, binary=binary)
+        return LlamaCppProvider(
+            model=model,
+            ctx_size=ctx_size,
+            threads=threads,
+            port=port,
+            binary=binary,
+            device=device,
+            gpu_device=gpu_device,
+            gpu_layers=gpu_layers,
+        )
     if kind in {"ollama", "openai-compatible", "external"}:
         return ExternalProvider(base_url=base_url, model=model, api_key=api_key)
     raise LLMError(f"Неизвестный провайдер LLM: {kind}")

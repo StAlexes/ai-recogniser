@@ -20,6 +20,26 @@ def test_settings_roundtrip(tmp_path: Path) -> None:
     assert loaded.max_parallel_jobs == 2
 
 
+def test_llm_device_settings_roundtrip_and_defaults(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    settings = Settings(
+        llm_device="vulkan", llm_gpu_device="Vulkan0", llm_gpu_layers=32
+    )
+    save_settings(path, settings)
+    loaded = load_settings(path)
+
+    assert loaded.llm_device == "vulkan"
+    assert loaded.llm_gpu_device == "Vulkan0"
+    assert loaded.llm_gpu_layers == 32
+
+    defaults = Settings()
+    assert defaults.llm_device == "cpu"
+    assert defaults.llm_gpu_device == ""
+    assert defaults.llm_gpu_layers == 99
+    with pytest.raises(ValidationError):
+        Settings(llm_gpu_layers=100)
+
+
 def test_broken_settings_fall_back_to_defaults(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     path.write_text("{not json", encoding="utf-8")

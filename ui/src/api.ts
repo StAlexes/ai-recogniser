@@ -32,6 +32,12 @@ export interface Settings {
   llm_server_path: string;
   llm_ctx_size: number;
   llm_threads: number;
+  /** Устройство вычислений llama-server: cpu | vulkan. */
+  llm_device: string;
+  /** Конкретный Vulkan-адаптер ("" = авто). */
+  llm_gpu_device: string;
+  /** Слои GGUF на GPU (0–99, 99 = все). */
+  llm_gpu_layers: number;
   summarize_enabled: boolean;
   summary_prompt: string;
   vad_enabled: boolean;
@@ -409,6 +415,19 @@ export function putSettings(settings: Settings): Promise<Settings> {
 
 export function getModels(): Promise<ModelsResponse> {
   return request<ModelsResponse>('/api/v1/models');
+}
+
+export interface LlmDevice {
+  /** Идентификатор для llama-server --device (например Vulkan0). */
+  id: string;
+  name: string;
+  memory: string;
+}
+
+export function getLlmDevices(): Promise<{ devices: LlmDevice[] }> {
+  return request<{ devices: LlmDevice[] }>('/api/v1/llm/devices', {
+    timeoutMs: 20_000,
+  });
 }
 
 export function getSystemProfile(): Promise<SystemProfile> {

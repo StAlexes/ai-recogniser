@@ -24,6 +24,7 @@ import {
   AuthError,
   getDiarizationProfiles,
   getHealth,
+  getLlmDevices,
   getModels,
   getSettings,
   putSettings,
@@ -31,6 +32,7 @@ import {
 import type {
   DiarizationProfilesResponse,
   HealthResponse,
+  LlmDevice,
   ModelItem,
   Settings,
   ThemeMode,
@@ -88,6 +90,8 @@ export function SettingsPage({
   // «Сохранить»/«Отменить», настройки в это время не трогаются.
   const [promptEditorOpen, setPromptEditorOpen] = useState(false);
   const [promptDraft, setPromptDraft] = useState('');
+  // Vulkan-адаптеры для GPU-саммари (запрашиваются при llm_device=vulkan).
+  const [llmDevices, setLlmDevices] = useState<LlmDevice[]>([]);
   const savedPayload = useRef<string | null>(null);
 
   useEffect(() => {
@@ -157,6 +161,29 @@ export function SettingsPage({
     setSettings((current) => (current === null ? current : { ...current, ...patch }));
     setSaveResult(null);
   };
+
+  // Список Vulkan-адаптеров нужен только при выборе GPU-устройства; запрос
+  // идёт при каждом переключении на «vulkan», чтобы увидеть свежий список.
+  useEffect(() => {
+    if (settings?.llm_device !== 'vulkan' || settings.llm_provider !== 'llamacpp-local') {
+      return;
+    }
+    let cancelled = false;
+    getLlmDevices()
+      .then((response) => {
+        if (!cancelled) {
+          setLlmDevices(response.devices);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setLlmDevices([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [settings?.llm_device, settings?.llm_provider]);
 
   const handleThemeChange = (value: string | undefined): void => {
     if (!isThemeMode(value)) {
@@ -823,6 +850,81 @@ export function SettingsPage({
 
               <div className="settings-row">
                 <div className="settings-row-text">
+                  <span className="settings-label">Устройство вычислений</span>
+                  <span className="settings-hint">
+                    {settings.llm_device === 'vulkan'
+                      ? 'Саммари считается на видеоадаптере (дискретном или интегрированном). Vulkan-среда ~37 МБ скачается при первом запуске.'
+                      : 'GPU (Vulkan) ускоряет саммари в разы — подойдёт и встроенная графика. Среда скачается при первом запуске.'}
+                  </span>
+                </div>
+                <div className="settings-control settings-control-rag">
+                  <Dropdown
+                    aria-label="Устройство вычислений LLM"
+                    value={settings.llm_device === 'vulkan' ? 'GPU (Vulkan)' : 'CPU'}
+                    selectedOptions={[settings.llm_device === 'vulkan' ? 'vulkan' : 'cpu']}
+                    disabled={usesHttpLlm}
+                    onOptionSelect={(_event, data) => {
+                      if (data.optionValue !== undefined) {
+                        update({
+                          llm_device: data.optionValue,
+                          // Смена устройства сбрасывает выбор адаптера.
+                          llm_gpu_device: '',
+                        });
+                      }
+                    }}
+                  >
+                    <Option key="cpu" value="cpu">
+                      CPU
+                    </Option>
+                    <Option key="vulkan" value="vulkan">
+                      GPU (Vulkan)
+                    </Option>
+                  </Dropdown>
+                </div>
+              </div>
+
+              {settings.llm_device === 'vulkan' && llmDevices.length > 0 ? (
+                <div className="settings-row">
+                  <div className="settings-row-text">
+                    <span className="settings-label">Видеоадаптер</span>
+                    <span className="settings-hint">
+                      Авто — llama-server сам выберет быстрейший адаптер.
+                    </span>
+                  </div>
+                  <div className="settings-control settings-control-rag">
+                    <Dropdown
+                      aria-label="Видеоадаптер для LLM"
+                      value={
+                        settings.llm_gpu_device === ''
+                          ? 'Авто'
+                          : llmDevices.find((d) => d.id === settings.llm_gpu_device)?.name ??
+                            settings.llm_gpu_device
+                      }
+                      selectedOptions={[settings.llm_gpu_device]}
+                      disabled={usesHttpLlm}
+                      onOptionSelect={(_event, data) => {
+                        if (data.optionValue !== undefined) {
+                          update({ llm_gpu_device: data.optionValue });
+                        }
+                      }}
+                    >
+                      <Option key="auto" value="">
+                        Авто
+                      </Option>
+                      {llmDevices.map((device) => (
+                        <Option key={device.id} value={device.id}>
+                          {device.memory
+                            ? `${device.name} · ${device.memory}`
+                            : device.name}
+                        </Option>
+                      ))}
+                    </Dropdown>
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="settings-row">
+                <div className="settings-row-text">
                   <span className="settings-label">Модель LLM</span>
                   <span className="settings-hint">
                     {settings.llm_provider === 'ollama'
@@ -975,7 +1077,8 @@ export function SettingsPage({
                 <div className="settings-row-text">
                   <span className="settings-label">Потоки CPU</span>
                   <span className="settings-hint">
-                    Количество потоков для llama-server (0 = автоматически).
+                    Потоки для llama-server (0 = автоматически). При устройстве
+                    GPU (Vulkan) на них ложится лишь остаточная работа.
                   </span>
                 </div>
                 <div className="settings-control settings-control-rag-k">

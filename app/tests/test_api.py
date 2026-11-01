@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from airec.api.app import create_app
@@ -110,6 +112,56 @@ def test_models_catalog(tmp_path: Path) -> None:
         assert response.status_code == 200
         ids = {item["id"] for item in response.json()["items"]}
         assert "gigaam-v3-e2e-ctc" in ids
+
+
+def test_llm_devices_parses_list_devices_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GET /llm/devices парсит вывод llama-server --list-devices."""
+    from airec.api import llm as llm_api
+
+    captured_cmds: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        captured_cmds.append(cmd)
+        return SimpleNamespace(
+            stdout="Available devices:\n  Vulkan0: AMD Radeon 780M Graphics (16286 MiB, 15472 MiB free)\n  Vulkan1: Some Other GPU (8192 MiB, 8000 MiB free)\n",
+            stderr="",
+            returncode=0,
+        )
+
+    monkeypatch.setattr(llm_api.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        llm_api,
+        "find_llama_server",
+        lambda paths, custom=None, *, device="cpu": Path("C:/fake/llama-server.exe"),
+    )
+
+    with make_client(tmp_path) as client:
+        response = client.get(
+            "/api/v1/llm/devices", headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+
+    assert response.status_code == 200
+    devices = response.json()["devices"]
+    assert devices == [
+        {
+            "id": "Vulkan0",
+            "name": "AMD Radeon 780M Graphics",
+            "memory": "16286 MiB, 15472 MiB free",
+        },
+        {"id": "Vulkan1", "name": "Some Other GPU", "memory": "8192 MiB, 8000 MiB free"},
+    ]
+    assert captured_cmds[0][1:] == ["--list-devices"]
+
+
+def test_llm_devices_empty_when_no_runtime(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        response = client.get(
+            "/api/v1/llm/devices", headers={"Authorization": f"Bearer {TOKEN}"}
+        )
+    assert response.status_code == 200
+    assert response.json() == {"devices": []}
 
 
 def test_spa_fallback_does_not_capture_api(tmp_path: Path) -> None:

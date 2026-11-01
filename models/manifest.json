@@ -148,6 +148,18 @@
       "purpose": "саммаризация"
     },
     {
+      "id": "llama-server-vulkan-x64",
+      "kind": "runtime",
+      "title": "llama.cpp Vulkan / GPU (llama-server)",
+      "filename": "llama-server-vulkan-x64.zip",
+      "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11946/llama-b11946-bin-win-vulkan-x64.zip",
+      "size_bytes": 37303240,
+      "sha256": "B65B2837C584CA2D37033B8A947513FC02649199077A17455F416921AA6EB8F5",
+      "license": "MIT",
+      "note": "GPU-ускорение саммари через Vulkan: NVIDIA, AMD и Intel (включая iGPU). Скачивается при первом запуске с устройством GPU.",
+      "purpose": "саммаризация"
+    },
+    {
       "id": "silero-vad-v5-onnx",
       "kind": "vad",
       "title": "Silero VAD ONNX",

@@ -49,6 +49,15 @@ class Settings(BaseModel):
     llm_server_path: str = ""
     llm_ctx_size: int = Field(default=4096, ge=512, le=131072)
     llm_threads: int = Field(default=0, ge=0, le=256)
+    # Устройство вычислений для llama-server: ``cpu`` или ``vulkan`` (GPU —
+    # дискретный или интегрированный; Vulkan-сборка скачивается отдельно).
+    llm_device: str = "cpu"
+    # Конкретный Vulkan-адаптер (например ``Vulkan0``); пусто — llama-server
+    # сам выбирает быстрейший доступный.  Игнорируется при llm_device=cpu.
+    llm_gpu_device: str = ""
+    # Слои GGUF-модели, выгружаемые на GPU при llm_device=vulkan
+    # (99 — все; меньше — частичная выгрузка при нехватке видеопамяти).
+    llm_gpu_layers: int = Field(default=99, ge=0, le=99)
     # Run the summary stage automatically after each successful transcription.
     # Disabled by default because it requires a local LLM runtime + GGUF model.
     summarize_enabled: bool = False

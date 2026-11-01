@@ -108,7 +108,10 @@ def list_models(request: Request) -> dict[str, Any]:
         model_id = entry.get("id", "")
         info = dict(entry)
         if entry.get("kind") == "runtime":
-            server = runtime.find_llama_server(paths)
+            # CPU- и Vulkan-сборки живут в разных папках; статус каждой
+            # записи проверяется по своему устройству.
+            device = "vulkan" if model_id == runtime.RUNTIME_ID_VULKAN else "cpu"
+            server = runtime.find_llama_server(paths, device=device)
             info["installed"] = server is not None
             info["local"] = server is not None
             info["location"] = "runtime" if server is not None else None
@@ -147,8 +150,10 @@ def list_models(request: Request) -> dict[str, Any]:
     items.extend(ollama_models)
 
     disk_ids = {m["id"] for m in disk_installed}
-    if runtime.runtime_installed(paths):
+    if runtime.runtime_installed(paths, device="cpu"):
         disk_ids.add(runtime.RUNTIME_ID)
+    if runtime.runtime_installed(paths, device="vulkan"):
+        disk_ids.add(runtime.RUNTIME_ID_VULKAN)
     return {
         "items": items,
         "installed": sorted(
@@ -197,7 +202,8 @@ async def download_model_by_id(
 
     if entry is not None and entry.get("kind") == "runtime":
         paths = request.app.state.paths
-        if runtime.find_llama_server(paths) is not None:
+        device = "vulkan" if model_id == runtime.RUNTIME_ID_VULKAN else "cpu"
+        if runtime.find_llama_server(paths, device=device) is not None:
             raise HTTPException(status_code=409, detail="llama-server уже установлен")
 
         def runtime_progress(value: float, phase: str) -> None:
@@ -210,7 +216,7 @@ async def download_model_by_id(
         def run_runtime_download() -> None:
             try:
                 runtime.ensure_runtime(
-                    paths, progress=runtime_progress, force=True
+                    paths, progress=runtime_progress, force=True, device=device
                 )
                 _DOWNLOAD_PROGRESS[model_id] = {
                     "value": 1.0,
@@ -288,9 +294,11 @@ def download_progress(request: Request, model_id: str) -> dict[str, Any]:
     if progress is None:
         progress = _DOWNLOAD_PROGRESS.get(model_id)
     if progress is None:
-        if model_id == runtime.RUNTIME_ID:
+        if model_id in {runtime.RUNTIME_ID, runtime.RUNTIME_ID_VULKAN}:
+            device = "vulkan" if model_id == runtime.RUNTIME_ID_VULKAN else "cpu"
             installed_runtime = (
-                runtime.find_llama_server(request.app.state.paths) is not None
+                runtime.find_llama_server(request.app.state.paths, device=device)
+                is not None
             )
             return {
                 "id": model_id,

@@ -16,6 +16,7 @@ from airec.llm.providers import (
     LLMError,
     _normalize_summary,
     _parse_json_strict,
+    _server_cmd,
     _summary_messages,
     _summary_response_format,
 )
@@ -40,7 +41,9 @@ def test_summary_runner_uses_custom_llama_server_without_download(
     custom.write_bytes(b"exe")
     seen: list[str | None] = []
 
-    def fake_find(_paths: object, custom: str | None = None) -> Path | None:
+    def fake_find(
+        _paths: object, custom: str | None = None, *, device: str = "cpu"
+    ) -> Path | None:
         seen.append(custom)
         return Path(custom) if custom else None
 
@@ -567,3 +570,134 @@ class TestMapPhaseSalvage:
         assert "tl_dr" in result
         # Текст упавшего фрагмента дошёл до reduce сырым текстом (fallback).
         assert any("Предложение номер" in call for call in calls)
+
+
+# -------------------------------------------------------------------------- #
+# GPU (Vulkan): команда llama-server и откат на CPU
+# -------------------------------------------------------------------------- #
+
+
+class TestServerCmdGpuFlags:
+    def test_cpu_device_has_no_gpu_flags(self) -> None:
+        cmd = _server_cmd(
+            binary="llama-server.exe",
+            model="model.gguf",
+            ctx_size=4096,
+            threads=8,
+            port=8765,
+            device="cpu",
+            gpu_device="Vulkan0",
+            gpu_layers=99,
+        )
+        joined = " ".join(cmd)
+        assert "--n-gpu-layers" not in joined
+        assert "--device" not in joined
+        assert cmd[-1] == "8765"
+
+    def test_vulkan_device_adds_gpu_layers_and_adapter(self) -> None:
+        cmd = _server_cmd(
+            binary="llama-server.exe",
+            model="model.gguf",
+            ctx_size=4096,
+            threads=8,
+            port=8765,
+            device="vulkan",
+            gpu_device="Vulkan0",
+            gpu_layers=33,
+        )
+        joined = " ".join(cmd)
+        assert "--n-gpu-layers 33" in joined
+        assert "--device Vulkan0" in joined
+
+    def test_vulkan_without_adapter_omits_device_flag(self) -> None:
+        cmd = _server_cmd(
+            binary="llama-server.exe",
+            model="model.gguf",
+            ctx_size=4096,
+            threads=8,
+            port=8765,
+            device="vulkan",
+            gpu_device="  ",
+            gpu_layers=99,
+        )
+        joined = " ".join(cmd)
+        assert "--n-gpu-layers 99" in joined
+        assert "--device" not in joined
+
+    def test_gpu_layers_clamped_to_bounds(self) -> None:
+        cmd = _server_cmd(
+            binary="b",
+            model="m",
+            ctx_size=4096,
+            threads=1,
+            port=1,
+            device="vulkan",
+            gpu_layers=1000,
+        )
+        assert "--n-gpu-layers" in cmd
+        assert str(cmd[cmd.index("--n-gpu-layers") + 1]) == "99"
+
+
+class TestVulkanFallbackToCpu:
+    def test_failed_vulkan_start_falls_back_to_cpu(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        model = tmp_path / "model.gguf"
+        model.write_bytes(b"gguf")
+        provider = LlamaCppProvider(
+            model=model, device="vulkan", gpu_device="Vulkan0"
+        )
+        started_with: list[dict[str, object]] = []
+
+        def fake_start() -> None:
+            started_with.append({"device": provider.device, "gpu": provider.gpu_device})
+            if provider.device == "vulkan":
+                raise LLMError("Vulkan runtime startup failed")
+
+        monkeypatch.setattr(provider, "_start_server", fake_start)
+        monkeypatch.setattr(
+            provider, "_resolve_binary", lambda: "llama-server.exe"
+        )
+        provider._ensure_running()
+
+        assert [s["device"] for s in started_with] == ["vulkan", "cpu"]
+        # После отката адаптер сброшен: CPU-сборка его не понимает.
+        assert provider.device == "cpu"
+        assert provider.gpu_device == ""
+
+    def test_cpu_failure_is_not_swallowed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        model = tmp_path / "model.gguf"
+        model.write_bytes(b"gguf")
+        provider = LlamaCppProvider(model=model, device="cpu")
+        attempts: list[str] = []
+
+        def fake_start() -> None:
+            attempts.append(provider.device)
+            raise LLMError("llama-server не стал доступен")
+
+        monkeypatch.setattr(provider, "_start_server", fake_start)
+        with pytest.raises(LLMError):
+            provider._ensure_running()
+        assert attempts == ["cpu"]
+
+    def test_vulkan_fallback_restores_device_after_total_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        model = tmp_path / "model.gguf"
+        model.write_bytes(b"gguf")
+        provider = LlamaCppProvider(
+            model=model, device="vulkan", gpu_device="Vulkan0"
+        )
+
+        def fake_start() -> None:
+            raise LLMError("no luck")
+
+        monkeypatch.setattr(provider, "_start_server", fake_start)
+        with pytest.raises(LLMError, match=r"no luck.+CPU"):
+            provider._ensure_running()
+        # Настройки восстановлены: следующая задача снова попробует Vulkan
+        # с выбранным пользователем адаптером.
+        assert provider.device == "vulkan"
+        assert provider.gpu_device == "Vulkan0"
