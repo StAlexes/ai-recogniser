@@ -59,13 +59,6 @@ export function statusColor(status: JobStatus): BadgeColor {
   }
 }
 
-export function formatSeconds(value: number | null): string {
-  if (value === null || !Number.isFinite(value) || value < 0) {
-    return '—';
-  }
-  return `${value.toFixed(1).replace('.', ',')} с`;
-}
-
 export function formatDate(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
@@ -98,16 +91,21 @@ export function formatDuration(value: number | null): string {
 }
 
 export function jobElapsedSeconds(job: JobSummary, now: number): number | null {
-  if (job.elapsed_s !== null) {
-    return job.elapsed_s;
-  }
-  if (isActive(job.status) && job.started_at !== null) {
-    const started = new Date(job.started_at).getTime();
-    if (Number.isFinite(started)) {
-      return Math.max((now - started) / 1000, 0);
+  if (isActive(job.status)) {
+    // Пока задача выполняется, живой таймер идёт от старта; по завершении
+    // этапов показывается сумма их длительностей (total_elapsed_s).
+    if (job.started_at !== null) {
+      const started = new Date(job.started_at).getTime();
+      if (Number.isFinite(started)) {
+        return Math.max((now - started) / 1000, 0);
+      }
     }
+    return null;
   }
-  return null;
+  if (job.total_elapsed_s !== null && job.total_elapsed_s !== undefined) {
+    return job.total_elapsed_s;
+  }
+  return job.elapsed_s;
 }
 
 export function stageStatusText(stage: JobStage): string {
@@ -137,7 +135,11 @@ export function StageProgress({ name, stage }: { name: StageKey; stage: JobStage
         aria-label={`${STAGE_LABELS[name]}: ${percent}%`}
       />
       <span className="job-stage-value" title={stageStatusText(stage)}>
-        {stage.status === 'skipped' ? '—' : `${percent}%`}
+        {stage.status === 'skipped'
+          ? '—'
+          : stage.status === 'done' && stage.elapsed_s !== null && Number.isFinite(stage.elapsed_s)
+            ? formatDuration(stage.elapsed_s)
+            : `${percent}%`}
       </span>
     </div>
   );

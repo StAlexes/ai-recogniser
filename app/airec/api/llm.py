@@ -258,19 +258,21 @@ def summarize_preview(request: Request) -> dict[str, Any]:
     """Инструкция, которая уйдёт в модель при следующем саммари.
 
     Возвращает собранный промпт (системный + пользовательский) для проверки
-    кастомного промпта из настроек без запуска LLM.
+    кастомного промпта из настроек без запуска LLM.  При кастомном промпте
+    JSON-схема не применяется: модель отвечает свободным текстом.
     """
     settings = request.app.state.settings
     from airec.llm.providers import _summary_messages
 
+    custom = bool(settings.summary_prompt.strip())
     messages = _summary_messages(
         "…текст задачи…", instructions=settings.summary_prompt
     )
     return {
         "custom_prompt": settings.summary_prompt,
-        "uses_custom_prompt": bool(settings.summary_prompt.strip()),
+        "uses_custom_prompt": custom,
         "messages": messages,
-        "schema_is_fixed": True,
+        "schema_is_fixed": not custom,
     }
 
 

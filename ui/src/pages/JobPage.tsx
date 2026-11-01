@@ -51,7 +51,6 @@ import {
   describeError,
   formatDate,
   formatDuration,
-  formatSeconds,
   isActive,
   jobElapsedSeconds,
   STAGE_LABELS,
@@ -83,6 +82,15 @@ function summaryList(value: unknown): any[] {
 
 /** Formatted summary content, rendered inside the shared result panel. */
 function SummaryBody({ summary }: { summary: Record<string, any> }) {
+  // Кастомный промпт возвращает свободный текст (custom: true) — показываем
+  // его как есть: пользователь сам задаёт оформление в настройках.
+  if (summary.custom === true && typeof summary.tl_dr === 'string') {
+    return (
+      <div className="summary-body">
+        <div className="summary-tldr">{summary.tl_dr || 'Пустой ответ модели.'}</div>
+      </div>
+    );
+  }
   const topics = summaryList(summary.topics);
   const decisions = summaryList(summary.decisions);
   const actionItems = summaryList(summary.action_items);
@@ -195,6 +203,9 @@ function StageControl({
       />
       <span className="job-stage-control-phase" title={stage.phase}>
         {stage.phase || 'Ожидает'}
+        {stage.status === 'done' && stage.elapsed_s !== null && Number.isFinite(stage.elapsed_s)
+          ? ` · ${formatDuration(stage.elapsed_s)}`
+          : ''}
       </span>
       {children}
       <div className="job-stage-control-actions">
@@ -576,7 +587,6 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
   };
 
   const summaryStage = job?.stages?.summary;
-  const summaryRunning = summaryStage?.status === 'running';
   const recognitionDone = job?.stages?.recognition?.status === 'done';
   const canStartDiarization =
     job !== null && job.status === 'done' && recognitionDone && job.segments.length > 0;
@@ -642,9 +652,9 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
           formatDate(job.created_at),
           job.audio_format.toUpperCase(),
           formatBytes(job.size_bytes),
-          job.duration_s !== null ? `аудио ${formatSeconds(job.duration_s)}` : null,
+          job.duration_s !== null ? `аудио ${formatDuration(job.duration_s)}` : null,
           job.status !== 'queued'
-            ? `время ${formatDuration(jobElapsedSeconds(job, now))}`
+            ? `время выполнения ${formatDuration(jobElapsedSeconds(job, now))}`
             : null,
           speakerCount > 0 ? `спикеров: ${speakerCount}` : null,
           job.rtf !== null ? `RTFx ${job.rtf.toFixed(1).replace('.', ',')}` : null,
@@ -955,16 +965,6 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                 }
               />
             </MessageBar>
-          </section>
-        ) : summaryRunning ? (
-          <section className="summary-panel surface" aria-labelledby="job-summary-state">
-            <h2 id="job-summary-state" className="summary-heading">
-              Саммари
-            </h2>
-            <div className="summary-loading">
-              <Spinner size="small" />
-              <span>{summaryStage?.phase || 'Составляем саммари…'}</span>
-            </div>
           </section>
         ) : null
       ) : null}

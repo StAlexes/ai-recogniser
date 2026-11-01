@@ -143,9 +143,16 @@ def format_summary(summary: Any, *, title: str | None = None) -> str:
 
     Mirrors the structure produced by the LLM (tl_dr, topics, decisions,
     action items, ...); tolerates missing keys and non-dict payloads.
+    Свободный текст кастомного промпта (``custom: True``) возвращается как
+    есть — пользователь сам задаёт оформление.
     """
     if not isinstance(summary, dict):
         return str(summary).strip()
+    if summary.get("custom") and isinstance(summary.get("tl_dr"), str):
+        text = summary["tl_dr"].strip()
+        if title:
+            return f"# Саммари — {title}\n\n{text}"
+        return text
     lines: list[str] = []
     if title:
         lines += [f"# Саммари — {title}", ""]

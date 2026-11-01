@@ -99,6 +99,8 @@ def test_manager_transcribes_and_persists(tmp_path: Path) -> None:
     assert "result_file" not in summary
     assert "segments" not in summary
     assert summary["segment_count"] == 2
+    # Общее время задачи: сумма завершённых этапов (здесь — распознавание).
+    assert summary["total_elapsed_s"] == finished.stages["recognition"]["elapsed_s"]
 
     manager.shutdown()
     restored = JobManager(paths, lambda: Settings())
@@ -246,6 +248,63 @@ def test_manager_auto_summary(tmp_path: Path) -> None:
     assert summary_file.is_file()
     assert "Короткое содержание." in summary_file.read_text(encoding="utf-8")
     assert finished.text == "Привет, это тестовая расшифровка."
+    # Общее время: сумма завершённых этапов (распознавание + саммаризация).
+    detail = finished.detail()
+    expected_total = (
+        finished.stages["recognition"]["elapsed_s"]
+        + finished.stages["summary"]["elapsed_s"]
+    )
+    assert detail["total_elapsed_s"] == pytest.approx(expected_total, abs=1e-6)
+    manager.shutdown()
+
+
+def test_manager_custom_prompt_freeform_summary(tmp_path: Path) -> None:
+    """Кастомный промпт: свободный текст вместо JSON-схемы."""
+    paths = paths_for(tmp_path)
+
+    def summary_runner(
+        job_id: str, progress: Callable[[float, str], None]
+    ) -> dict[str, object]:
+        assert job_id
+        progress(0.5, "Саммаризация")
+        # Как реальные провайдеры при instructions != "": свободный текст.
+        return {
+            "tl_dr": "# Итоги встречи\n\n1. Решение А\n2. Решение Б\n\n| Задача | Срок |\n|---|---|",
+            "custom": True,
+        }
+
+    settings = Settings(summarize_enabled=True)
+    manager = JobManager(
+        paths,
+        lambda: settings,
+        transcriber=fake_transcriber,
+        summary_runner=summary_runner,
+    )
+    upload = tmp_path / "meeting.wav"
+    upload.write_bytes(b"RIFF....WAVEfmt ")
+
+    job = manager.submit(upload, "meeting.wav", "gigaam-v3-e2e-ctc")
+    deadline = time.monotonic() + 5.0
+    finished = manager.get(job.id)
+    while time.monotonic() < deadline:
+        finished = manager.get(job.id)
+        assert finished is not None
+        if finished.stages["summary"]["status"] in {"done", "error"}:
+            break
+        time.sleep(0.02)
+    assert finished is not None
+    assert finished.status == "done"
+    assert finished.stages["summary"]["status"] == "done", finished.stages["summary"]
+    # Свободный текст сохранён как есть, без перестройки в схему.
+    assert finished.summary is not None
+    assert finished.summary.get("custom") is True
+    assert "# Итоги встречи" in finished.summary_text
+    assert "| Задача | Срок |" in finished.summary_text
+    summary_file = paths.results / job.id / "summary.md"
+    assert summary_file.is_file()
+    content = summary_file.read_text(encoding="utf-8")
+    assert "1. Решение А" in content
+    assert "| Задача | Срок |" in content
     manager.shutdown()
 
 

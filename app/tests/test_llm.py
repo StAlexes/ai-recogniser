@@ -66,17 +66,25 @@ def test_summary_runner_uses_custom_llama_server_without_download(
 # Кастомный промпт саммаризации
 # -------------------------------------------------------------------------- #
 class _FakeProvider:
-    """Запоминает messages и возвращает валидный JSON-саммари."""
+    """Запоминает messages и возвращает ответ как реальный провайдер."""
 
     def __init__(self) -> None:
         self.calls: list[list[dict[str, str]]] = []
 
     def summarize(
-        self, text: str, *, language: str = "ru", instructions: str = ""
+        self,
+        text: str,
+        *,
+        language: str = "ru",
+        instructions: str = "",
+        freeform: bool | None = None,
     ) -> dict[str, object]:
         self.calls.append(
-            _summary_messages(text, instructions=instructions)
+            _summary_messages(text, instructions=instructions, freeform=freeform)
         )
+        if instructions.strip() or freeform:
+            # Кастомный промпт / свободный режим: текст, как реальные провайдеры.
+            return {"tl_dr": f"custom:{text[:50]}", "custom": True}
         return {
             "tl_dr": text[:50],
             "topics": [],
@@ -108,23 +116,26 @@ class TestSummaryPromptMessages:
         assert '"tl_dr"' in user
         assert "Верни JSON строго со схемой" in user
 
-    def test_custom_instructions_replace_task_keep_schema(self) -> None:
+    def test_custom_instructions_replace_task_drop_schema(self) -> None:
         messages = _summary_messages(
             "Текст", instructions="Делай саммари в стиле телеграм-канала."
         )
+        system = messages[0]["content"]
         user = messages[1]["content"]
-        # Кастомная инструкция заменяет стандартную задачу...
+        # Кастомная инструкция заменяет стандартную задачу и снимает
+        # JSON-ограничения: модель отвечает свободным текстом по правилам
+        # пользователя (разделы, списки, таблицы).
         assert "Делай саммари в стиле телеграм-канала." in user
         assert DEFAULT_SUMMARY_TASK not in user
-        # ...но схема и требование JSON всегда добавляются приложением.
-        assert '"tl_dr"' in user
-        assert '"action_items"' in user
-        assert "Верни JSON строго со схемой" in user
+        assert "Верни JSON строго со схемой" not in user
+        assert '"tl_dr"' not in user
+        assert "строго в формате JSON" not in system
+        assert "оформи ответ читаемым текстом" in system
 
     def test_schema_is_never_user_controlled(self) -> None:
-        # Даже если пользователь попросит вернуть другой формат, схема
-        # приписывается приложением и сохраняет ключи результата.
-        messages = _summary_messages("Текст", instructions="Верни CSV, не JSON.")
+        # Без кастомного промпта схема приписывается приложением и сохраняет
+        # ключи результата.
+        messages = _summary_messages("Текст", instructions="")
         user = messages[1]["content"]
         assert '"tl_dr"' in user and "quotes" in user
 
@@ -137,17 +148,44 @@ class TestSummarizerCustomPrompt:
         assert len(provider.calls) == 1
         user = provider.calls[0][1]["content"]
         assert "Подчёркивай сроки." in user
-        assert '"tl_dr"' in user
+        assert "Короткий текст встречи." in user
 
     def test_instructions_passed_to_map_and_reduce(self) -> None:
         provider = _FakeProvider()
         summarizer = Summarizer(provider, instructions="Подчёркивай сроки.")
         long_text = ". ".join(f"Предложение номер {i} про проект" for i in range(400))
         summarizer.summarize(long_text)
-        # map-вызовы + reduce-вызов — все с кастомной инструкцией
+        # map-вызовы (инструкция внутри map-промпта) + reduce-вызов
         assert len(provider.calls) >= 3
         for messages in provider.calls:
             assert "Подчёркивай сроки." in messages[1]["content"]
+
+    def test_map_and_reduce_use_freeform_mode(self) -> None:
+        # Длинный транскрипт с кастомным промптом: map- и reduce-вызовы идут
+        # в свободном режиме (freeform=True) — провайдер не навязывает схему.
+        seen_freeform: list[bool | None] = []
+
+        class _FreeformProvider(_FakeProvider):
+            def summarize(
+                self,
+                text: str,
+                *,
+                language: str = "ru",
+                instructions: str = "",
+                freeform: bool | None = None,
+            ) -> dict[str, object]:
+                seen_freeform.append(freeform)
+                return super().summarize(
+                    text, language=language, instructions=instructions, freeform=freeform
+                )
+
+        provider = _FreeformProvider()
+        summarizer = Summarizer(provider, instructions="Подчёркивай сроки.")
+        long_text = ". ".join(f"Предложение номер {i} про проект" for i in range(400))
+        result = summarizer.summarize(long_text)
+        assert len(seen_freeform) >= 3
+        assert all(flag is True for flag in seen_freeform)
+        assert result.get("custom") is True
 
     def test_blank_instructions_use_default(self) -> None:
         provider = _FakeProvider()
@@ -162,10 +200,17 @@ class TestSummarizerCustomPrompt:
 
         class _CaptureProvider(_FakeProvider):
             def summarize(
-                self, text: str, *, language: str = "ru", instructions: str = ""
+                self,
+                text: str,
+                *,
+                language: str = "ru",
+                instructions: str = "",
+                freeform: bool | None = None,
             ) -> dict[str, object]:
                 captured["instructions"] = instructions
-                return super().summarize(text, language=language, instructions=instructions)
+                return super().summarize(
+                    text, language=language, instructions=instructions, freeform=freeform
+                )
 
         app = SimpleNamespace(
             state=SimpleNamespace(
@@ -195,14 +240,18 @@ class TestProviderSummarizeSignatures:
         def fake_chat(messages, *, temperature: float = 0.2, response_format=None) -> str:
             seen["messages"] = messages
             seen["response_format"] = response_format
-            return json.dumps({"tl_dr": "ok", "topics": []}, ensure_ascii=False)
+            return "Саммари свободным текстом по промпту."
 
         monkeypatch.setattr(provider, "_chat", fake_chat)
         provider._ensure_running = lambda: None  # type: ignore[method-assign]
         result = provider.summarize("Текст", instructions="Мой промпт.")
-        assert result["tl_dr"] == "ok"
+        # Кастомный промпт: свободный текст, без навязанной схемы.
+        assert result["tl_dr"] == "Саммари свободным текстом по промпту."
+        assert result["custom"] is True
+        assert seen["response_format"] is None
         user = seen["messages"][1]["content"]
-        assert "Мой промпт." in user and '"tl_dr"' in user
+        assert "Мой промпт." in user and "Текст" in user
+        assert '"tl_dr"' not in user
 
     def test_external_summarize_accepts_instructions(self, monkeypatch) -> None:
         provider = ExternalProvider(
@@ -212,6 +261,7 @@ class TestProviderSummarizeSignatures:
 
         def fake_post(url, *, json=None, headers=None, **_kwargs):
             seen["messages"] = json["messages"]
+            seen["response_format"] = json.get("response_format")
 
             class _Resp:
                 status_code = 200
@@ -221,7 +271,7 @@ class TestProviderSummarizeSignatures:
                         "choices": [
                             {
                                 "message": {
-                                    "content": json_str({"tl_dr": "ok", "topics": []})
+                                    "content": "Свободный текст саммари."
                                 }
                             }
                         ]
@@ -229,16 +279,13 @@ class TestProviderSummarizeSignatures:
 
             return _Resp()
 
-        def json_str(payload: dict[str, object]) -> str:
-            import json as _json
-
-            return _json.dumps(payload, ensure_ascii=False)
-
         monkeypatch.setattr(provider._client, "post", fake_post)
         result = provider.summarize("Текст", instructions="Мой промпт.")
-        assert result["tl_dr"] == "ok"
+        assert result["tl_dr"] == "Свободный текст саммари."
+        assert result["custom"] is True
+        assert seen["response_format"] is None
         user = seen["messages"][1]["content"]
-        assert "Мой промпт." in user and '"tl_dr"' in user
+        assert "Мой промпт." in user and "Текст" in user
 
 
 class TestParseJsonStrict:
@@ -500,16 +547,23 @@ class TestMapPhaseSalvage:
 
         class _FlakyProvider(_FakeProvider):
             def summarize(
-                self, text: str, *, language: str = "ru", instructions: str = ""
+                self,
+                text: str,
+                *,
+                language: str = "ru",
+                instructions: str = "",
+                freeform: bool | None = None,
             ) -> dict[str, object]:
-                calls.append(text[:30])
+                calls.append(text)
                 if len(calls) == 2:
                     raise LLMError("модель вернула невалидный JSON: Expecting ':'")
-                return super().summarize(text, language=language, instructions=instructions)
+                return super().summarize(
+                    text, language=language, instructions=instructions, freeform=freeform
+                )
 
         summarizer = Summarizer(_FlakyProvider())
         long_text = ". ".join(f"Предложение номер {i} про проект" for i in range(400))
         result = summarizer.summarize(long_text)
         assert "tl_dr" in result
-        # Второй блок дошёл до reduce сырым текстом (fallback).
+        # Текст упавшего фрагмента дошёл до reduce сырым текстом (fallback).
         assert any("Предложение номер" in call for call in calls)

@@ -72,6 +72,8 @@ export interface JobSummary {
   model: string;
   duration_s: number | null;
   elapsed_s: number | null;
+  /** Сумма длительностей завершённых этапов (распознавание+диаризация+саммари). */
+  total_elapsed_s: number | null;
   rtf: number | null;
   segment_count: number;
   size_bytes: number;

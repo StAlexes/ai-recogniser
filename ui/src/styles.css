@@ -2152,13 +2152,6 @@ textarea {
   font-size: 16px;
   font-weight: 600;
 }
-.summary-loading {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  color: var(--colorNeutralForeground2, var(--text-2));
-  font-size: 13px;
-}
 .summary-owner {
   margin-left: 6px;
   color: var(--colorNeutralForeground3, var(--text-3));

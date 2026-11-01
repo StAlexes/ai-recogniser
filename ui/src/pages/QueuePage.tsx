@@ -593,7 +593,7 @@ export function QueuePage({ onAuthError, onOpenJob }: QueuePageProps) {
                       <span className="job-meta">
                         {formatDate(job.created_at)} · {job.audio_format.toUpperCase()} ·{' '}
                         {formatBytes(job.size_bytes)}
-                        {job.status !== 'queued' ? ` · время: ${elapsed}` : ''}
+                        {job.status !== 'queued' ? ` · время выполнения: ${elapsed}` : ''}
                         {job.status !== 'queued' ? ` · ${percent}%` : ''}
                       </span>
                     </span>

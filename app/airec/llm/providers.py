@@ -122,6 +122,15 @@ DEFAULT_SUMMARY_SYSTEM = (
     "Ответ строго в формате JSON без markdown-блоков."
 )
 
+# Системный промпт для кастомной инструкции: модель отвечает свободным
+# текстом по правилам пользователя, поэтому требование JSON снимается.
+DEFAULT_SUMMARY_SYSTEM_FREEFORM = (
+    "Ты — ассистент по саммари встреч. Пиши на русском языке. "
+    "Не выдумывай фактов, которых нет в тексте. "
+    "Следуй инструкции пользователя: оформи ответ читаемым текстом, "
+    "можно с разделами, списками и таблицами."
+)
+
 DEFAULT_SUMMARY_TASK = (
     "Проанализируй транскрибированную речь ниже и составь структурированное "
     "саммари. Каждое решение и каждую задачу привяжи к таймкоду (начало фрагмента), "
@@ -138,17 +147,32 @@ def _summary_response_format() -> dict[str, Any]:
 
 
 def _summary_messages(
-    text: str, *, instructions: str = ""
+    text: str, *, instructions: str = "", freeform: bool | None = None
 ) -> list[dict[str, str]]:
     """Build chat messages for a summary request.
 
     *instructions* — необязательная инструкция пользователя (настройка
-    ``summary_prompt``); она заменяет стандартную задачу, но JSON-схема и
-    требование «ответ строго JSON» всегда добавляются приложением.
+    ``summary_prompt``).  Кастомная инструкция заменяет стандартную задачу и
+    снимает JSON-ограничения: модель отвечает свободным текстом по правилам
+    пользователя (разделы, списки, таблицы), поэтому ``response_format`` и
+    «Верни JSON строго со схемой» в этом режиме не применяются.
+
+    *freeform* — явное переключение режима для map/reduce-вызовов, где
+    инструкция уже вшита в *text*: ``True`` принудительно снимает JSON-режим,
+    ``None`` выводит его из наличия *instructions*.
     """
-    task = instructions.strip() or DEFAULT_SUMMARY_TASK
+    use_freeform = bool(instructions.strip()) if freeform is None else freeform
+    if use_freeform:
+        head = instructions.strip()
+        user = (
+            f"{head}\n\n" if head else ""
+        ) + "Текст:\n---\n" + text + "\n---\n"
+        return [
+            {"role": "system", "content": DEFAULT_SUMMARY_SYSTEM_FREEFORM},
+            {"role": "user", "content": user},
+        ]
     user = (
-        f"{task}\n\n"
+        f"{DEFAULT_SUMMARY_TASK}\n\n"
         "Текст:\n---\n" + text + "\n---\n\n"
         "Верни JSON строго со схемой ниже, без лишних ключей и markdown:\n"
         f"{SUMMARY_SCHEMA}\n"
@@ -168,12 +192,20 @@ class LLMProvider(ABC):
 
     @abstractmethod
     def summarize(
-        self, text: str, *, language: str = "ru", instructions: str = ""
+        self,
+        text: str,
+        *,
+        language: str = "ru",
+        instructions: str = "",
+        freeform: bool | None = None,
     ) -> dict[str, Any]:
         """Produce structured summary of *text*.
 
         *instructions* — необязательная инструкция пользователя (кастомный
-        промпт из настроек); схема JSON-результата остаётся встроенной.
+        промпт из настроек); она заменяет встроенную задачу и отвечает
+        свободным текстом (``custom: True``), без навязанной JSON-схемы.
+        *freeform* — явное переключение свободного режима для map/reduce,
+        где инструкция уже вшита в *text*.
         """
         ...
 
@@ -452,13 +484,28 @@ class LlamaCppProvider(LLMProvider):
         return data["choices"][0]["message"]["content"]
 
     def summarize(
-        self, text: str, *, language: str = "ru", instructions: str = ""
+        self,
+        text: str,
+        *,
+        language: str = "ru",
+        instructions: str = "",
+        freeform: bool | None = None,
     ) -> dict[str, Any]:
-        content = self._chat(
-            _summary_messages(text, instructions=instructions),
-            temperature=0.2,
-            response_format=_summary_response_format(),
+        messages = _summary_messages(
+            text, instructions=instructions, freeform=freeform
         )
+        # Кастомный промпт отвечает свободным текстом: грамматика JSON-схемы
+        # физически не позволяет модели оформить саммари разделами/таблицами,
+        # поэтому ограничение включается только для встроенного промпта.
+        custom = bool(instructions.strip()) or bool(freeform)
+        content = self._chat(
+            messages,
+            temperature=0.2,
+            response_format=None if custom else _summary_response_format(),
+        )
+        if custom:
+            # Свободный текст — результат как есть, UI рендерит его без схемы.
+            return {"tl_dr": content.strip(), "custom": True}
         try:
             parsed = _parse_json_strict(content)
         except json.JSONDecodeError as exc:
@@ -566,14 +613,28 @@ class ExternalProvider(LLMProvider):
         return data["choices"][0]["message"]["content"]
 
     def summarize(
-        self, text: str, *, language: str = "ru", instructions: str = ""
+        self,
+        text: str,
+        *,
+        language: str = "ru",
+        instructions: str = "",
+        freeform: bool | None = None,
     ) -> dict[str, Any]:
-        messages = _summary_messages(text, instructions=instructions)
+        messages = _summary_messages(
+            text, instructions=instructions, freeform=freeform
+        )
+        # Кастомный промпт отвечает свободным текстом: json_schema ломает
+        # оформление из промпта (разделы/таблицы), ограничение — только для
+        # встроенного промпта.
+        custom = bool(instructions.strip()) or bool(freeform)
         content = self._chat(
             messages,
             temperature=0.2,
-            response_format=_summary_response_format(),
+            response_format=None if custom else _summary_response_format(),
         )
+        if custom:
+            # Свободный текст без JSON-ретрая: ответ как есть.
+            return {"tl_dr": content.strip(), "custom": True}
         try:
             parsed = _parse_json_strict(content)
         except json.JSONDecodeError as exc:

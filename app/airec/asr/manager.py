@@ -183,6 +183,20 @@ class Job:
             else:
                 self.stages[key] = {**value, **current}
 
+    def total_elapsed_s(self) -> float | None:
+        """Сумма длительностей завершённых этапов задачи.
+
+        ``None`` — ни один этап ещё не завершён (или задача в очереди).
+        """
+        total = 0.0
+        any_done = False
+        for stage in self.stages.values():
+            elapsed = stage.get("elapsed_s")
+            if stage.get("status") == STAGE_DONE and isinstance(elapsed, (int, float)):
+                total += float(elapsed)
+                any_done = True
+        return round(total, 3) if any_done else None
+
     def as_dict_summary(self) -> dict[str, Any]:
         data = asdict(self)
         # The queue list must stay light: no transcript texts, no segments.
@@ -191,6 +205,9 @@ class Job:
         data.pop("result_file", None)
         data["segment_count"] = len(self.segments)
         data.pop("segments", None)
+        # Общее время задачи: сумма длительностей всех завершённых этапов
+        # (распознавание + диаризация + саммаризация), а не только распознавания.
+        data["total_elapsed_s"] = self.total_elapsed_s()
         return data
 
     def detail(self) -> dict[str, Any]:
@@ -201,6 +218,7 @@ class Job:
             {key: value for key, value in segment.items() if key not in ("token_times", "tokens")}
             for segment in self.segments
         ]
+        data["total_elapsed_s"] = self.total_elapsed_s()
         data["result_url"] = (
             f"/api/v1/jobs/{self.id}/result" if self.status == "done" else None
         )
@@ -482,8 +500,12 @@ class JobManager:
             return
         current = job.stages.setdefault(stage, _stage())
         if status is not None:
+            previous = current.get("status")
             current["status"] = status
-            if status == STAGE_RUNNING:
+            if status == STAGE_RUNNING and previous != STAGE_RUNNING:
+                # Таймер ставится один раз при входе в «running»; тики прогресса
+                # приходят с тем же статусом и не должны его перезапускать,
+                # иначе elapsed_s измеряет лишь хвост этапа.
                 current["elapsed_s"] = None
                 self._stage_started[(job.id, stage)] = time.perf_counter()
             elif status in {STAGE_DONE, STAGE_ERROR, STAGE_SKIPPED}:

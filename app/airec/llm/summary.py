@@ -5,10 +5,10 @@ summarised independently (map), then the block summaries are merged into one
 final structured summary (reduce).  This keeps context within the model's
 context window even for hour-long recordings.
 
-The user-defined summary prompt (``Settings.summary_prompt``) is passed to every
-provider call as *instructions*: it may replace the task part of the prompt, but
-the JSON schema of the result and the «answer strictly JSON» requirement are
-always appended by the app, so the result shape stays stable.
+The user-defined summary prompt (``Settings.summary_prompt``) replaces the
+built-in task and unlocks free-form output: the model may use sections, lists
+and tables as the user's instructions demand.  The built-in prompt keeps the
+structured JSON schema (``custom`` flag marks free-form results).
 """
 
 from __future__ import annotations
@@ -60,8 +60,33 @@ def _block_summary_prompt(block: str, index: int, total: int) -> str:
     )
 
 
-def _reduce_prompt(block_summaries: list[str]) -> str:
+def _custom_block_prompt(
+    instructions: str, block: str, index: int, total: int
+) -> str:
+    """Map-prompt for a custom summary prompt: единый стиль всех фрагментов."""
+    return (
+        f"Фрагмент {index + 1} из {total} транскрибированной встречи.\n\n"
+        f"Инструкция пользователя:\n---\n{instructions}\n---\n\n"
+        f"Текст фрагмента:\n---\n{block}\n---\n\n"
+        "Обработай фрагмент по инструкции. Ответ — только результат, без "
+        "преамбулы."
+    )
+
+
+def _reduce_prompt(
+    block_summaries: list[str], *, instructions: str = ""
+) -> str:
     joined = "\n\n".join(f"[{i+1}] {s}" for i, s in enumerate(block_summaries))
+    if instructions.strip():
+        return (
+            "Ниже результаты обработки фрагментов одной встречи "
+            "(порядковый номер фрагмента указан в квадратных скобках).\n\n"
+            f"Инструкция пользователя:\n---\n{instructions.strip()}\n---\n\n"
+            f"Результаты фрагментов:\n---\n{joined}\n---\n\n"
+            "Объедини их в единый итоговый ответ по инструкции пользователя. "
+            "Таймкоды фрагментов при необходимости замени на их примерное "
+            "время от начала встречи. Ответ — только итоговый результат."
+        )
     return (
         "Ниже несколько кратких резюме фрагментов одной и той же встречи. "
         "Сложи их в одно структурированное саммари всей встречи. "
@@ -104,15 +129,28 @@ class Summarizer:
             notify(1.0, "Готово")
             return result
 
-        # Map: summarise each block.  The custom instructions shape what the
-        # model extracts from each fragment; the block prompt stays intact.
+        # Map: обработка фрагментов.  С кастомным промптом каждый фрагмент
+        # обрабатывается по инструкции пользователя с её же оформлением;
+        # встроенный путь сохраняет прежний фиксированный промпт.
         block_summaries: list[str] = []
         total = len(blocks)
+        custom = bool(self.instructions)
         for index, block in enumerate(blocks):
             notify(0.1 + 0.7 * (index / max(total, 1)), f"Фрагмент {index + 1} из {total}")
+            map_text = (
+                _custom_block_prompt(self.instructions, block, index, total)
+                if custom
+                else _block_summary_prompt(block, index, total)
+            )
             try:
                 summary = self.provider.summarize(
-                    block, language=language, instructions=self.instructions
+                    map_text,
+                    language=language,
+                    # Инструкция уже вшита в map-промпт; свободный режим
+                    # включается явно, чтобы провайдер не навязывал JSON-схему
+                    # (она сломала бы оформление из промпта пользователя).
+                    instructions="",
+                    freeform=True if custom else None,
                 )
             except LLMError as exc:
                 # Сбой одного фрагмента не должен ронять всю стадию: на map-
@@ -125,10 +163,15 @@ class Summarizer:
             block_text = summary.get("tl_dr", "") if isinstance(summary, dict) else str(summary)
             block_summaries.append(block_text)
 
-        # Reduce: merge into one structured summary.
+        # Reduce: объединение в итоговый ответ.
         notify(0.85, "Объединение фрагментов")
         result = self.provider.summarize(
-            _reduce_prompt(block_summaries), language=language, instructions=self.instructions
+            _reduce_prompt(block_summaries, instructions=self.instructions),
+            language=language,
+            # Промпт уже содержит инструкцию и формат ответа; freeform=True
+            # удерживает свободный режим и для встроенного reduce-текста.
+            instructions="",
+            freeform=True if custom else None,
         )
         notify(1.0, "Готово")
         return result
