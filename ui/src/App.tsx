@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { FluentProvider } from '@fluentui/react-components';
-import { AuthError, getHealth } from './api';
+import { AuthError, getHealth, getSettings } from './api';
 import type { HealthResponse } from './api';
 import { AppErrorBoundary } from './components/AppErrorBoundary';
 import { AuthErrorPanel } from './components/AuthErrorPanel';
@@ -123,6 +123,28 @@ export function App() {
     document.title = `${label} — AI Recogniser`;
     mainRef.current?.scrollTo({ top: 0 });
   }, [page, selectedJobId, authLost]);
+
+  // Тема и язык хранятся в настройках ядра; до открытия страницы настроек
+  // их никто не читал — окно стартовало с дефолтным оформлением. Подтягиваем
+  // сохранённую тему один раз при старте приложения.
+  useEffect(() => {
+    if (!core.online || authLost) {
+      return;
+    }
+    let cancelled = false;
+    getSettings()
+      .then((settings) => {
+        if (!cancelled) {
+          setMode(settings.theme);
+        }
+      })
+      .catch(() => {
+        // Без настроек остаётся тема из localStorage / системная.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [core.online, authLost, setMode]);
 
   const renderPage = (): ReactNode => {
     switch (page) {

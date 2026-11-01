@@ -808,7 +808,7 @@ class ShellBridge:
         return {"ok": False, "error": "Папка результата ещё не создана."}
 
     def save_result(
-        self, job_id: str, default_name: str = "", format: str = "txt"
+        self, job_id: str, default_name: str = "", format: str = "txt", view: str = ""
     ) -> dict[str, Any]:
         """Ask for a target path with the native dialog and save the result."""
         if not job_id:
@@ -864,7 +864,7 @@ class ShellBridge:
         try:
             response = httpx.post(
                 f"{self._app.core.base_url}/api/v1/jobs/{job_id}/save",
-                json={"path": target, "format": format},
+                json={"path": target, "format": format, "view": view or "recognition"},
                 headers=headers,
                 timeout=30.0,
                 trust_env=False,

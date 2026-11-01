@@ -1187,14 +1187,18 @@ class JobManager:
             path = Path(job.result_file)
             return path if path.is_file() else None
 
-    def export_result(self, job_id: str, format: str) -> tuple[Path, str, str]:
+    def export_result(
+        self, job_id: str, format: str, view: str | None = None
+    ) -> tuple[Path, str, str]:
         """Export a finished job in *format*.
 
         Returns ``(file_path, download_name, content_type)``.  The exported
         file is written to the job's results folder next to ``transcript.txt``.
+        *view* selects the saved result: "summary", "diarization" or the
+        default plain transcript ("recognition"/None).
         """
         job = self._finished_job(job_id)
-        content = self._export_content(job, format)
+        content = self._export_content(job, format, view=view)
 
         job_dir = self._job_dir(job_id)
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -1213,10 +1217,29 @@ class JobManager:
                 raise ValueError(f"Job {job_id} is not finished (status={job.status}).")
             return job
 
-    def _export_content(self, job: Job, format: str) -> str:
-        from airec.asr.export import export
+    def _export_content(
+        self, job: Job, format: str, view: str | None = None
+    ) -> str:
+        from airec.asr.export import export, format_summary
 
-        segments = job.segments or []
+        view = view or "recognition"
+        if view == "summary":
+            if job.summary is None:
+                raise FileNotFoundError(f"У задачи нет саммари: {job.id}")
+            # The saved summary is a text document, not a segment export.
+            if format == "json":
+                return json.dumps(
+                    job.summary or {}, ensure_ascii=False, indent=2
+                )
+            return format_summary(job.summary, title=job.filename)
+        if view == "diarization":
+            segments = [
+                {**segment, "speaker": segment.get("speaker") or "Спикер ?"}
+                for segment in (job.segments or [])
+                if segment.get("text", "").strip()
+            ]
+        else:
+            segments = job.segments or []
         return export(
             segments,
             format,
@@ -1232,11 +1255,18 @@ class JobManager:
             },
         )
 
-    def save_result(self, job_id: str, target: Path, format: str | None = None) -> Path:
-        """Write the finished transcript to an arbitrary user-chosen path.
+    def save_result(
+        self,
+        job_id: str,
+        target: Path,
+        format: str | None = None,
+        view: str | None = None,
+    ) -> Path:
+        """Write the shown result to an arbitrary user-chosen path.
 
         When *format* is omitted it is inferred from the target extension; a
-        directory target gets a sensible default file name.
+        directory target gets a sensible default file name.  *view* selects
+        the saved result: "summary", "diarization" or the plain transcript.
         """
         job = self._finished_job(job_id)
         target = Path(target).expanduser()
@@ -1252,7 +1282,7 @@ class JobManager:
             # The UI/dialog may leave a different extension (for example the
             # user picked "all files" or typed .txt while SRT is selected).
             target = target.with_suffix(EXPORT_EXTENSIONS[format])
-        content = self._export_content(job, format)
+        content = self._export_content(job, format, view=view)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8", newline="\n")
         log.info("job %s saved as %s (%s)", job_id, target, EXPORT_DOWNLOAD_NAMES[format])

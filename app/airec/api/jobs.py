@@ -28,6 +28,7 @@ class SaveResultRequest(BaseModel):
 
     path: str
     format: str | None = None
+    view: str | None = None
 
 
 class StageActionRequest(BaseModel):
@@ -268,7 +269,7 @@ def save_job_result(
     manager = _manager(request)
     try:
         target = manager.save_result(
-            job_id, Path(payload.path), format=payload.format
+            job_id, Path(payload.path), format=payload.format, view=payload.view
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -284,11 +285,13 @@ def save_job_result(
 
 @router.get("/{job_id}/export")
 def export_job(
-    request: Request, job_id: str, format: str = "txt"
+    request: Request, job_id: str, format: str = "txt", view: str | None = None
 ) -> FileResponse:
-    """Export a finished job transcript in the requested format.
+    """Export a finished job result in the requested format.
 
     Supported formats: txt, srt, vtt, md, json.  Defaults to txt.
+    *view* selects the saved result: recognition (plain transcript),
+    diarization (speaker-attributed) or summary.  Defaults to recognition.
     """
     if format not in EXPORT_FORMATS:
         raise HTTPException(
@@ -298,7 +301,9 @@ def export_job(
 
     manager = _manager(request)
     try:
-        path, download_name, content_type = manager.export_result(job_id, format)
+        path, download_name, content_type = manager.export_result(
+            job_id, format, view=view
+        )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:

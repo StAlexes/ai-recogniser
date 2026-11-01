@@ -13,7 +13,9 @@ import {
 } from '@fluentui/react-components';
 import {
   ArrowClockwiseRegular,
+  ArrowLeftRegular,
   DismissRegular,
+  EditRegular,
   FolderRegular,
   SettingsRegular,
 } from '@fluentui/react-icons';
@@ -82,6 +84,10 @@ export function SettingsPage({
   const [autosave, setAutosave] = useState<'idle' | 'saving' | 'saved' | 'error'>(
     'idle'
   );
+  // Отдельный экран правки промпта саммаризации: черновик живёт до нажатия
+  // «Сохранить»/«Отменить», настройки в это время не трогаются.
+  const [promptEditorOpen, setPromptEditorOpen] = useState(false);
+  const [promptDraft, setPromptDraft] = useState('');
   const savedPayload = useRef<string | null>(null);
 
   useEffect(() => {
@@ -315,6 +321,62 @@ export function SettingsPage({
   }
   const profileLabel =
     profileGroups.find((group) => group.id === profileValue)?.label ?? profileValue;
+
+  if (promptEditorOpen && settings !== null) {
+    return (
+      <div className="prompt-editor">
+        <PageHeader
+          title="Промпт саммаризации"
+          subtitle="Дополнительная инструкция для модели: что вынести в саммари, стиль,
+            объём, как выбирать задачи. JSON-схема результата всегда добавляется
+            приложением, поэтому её указывать не нужно."
+          actions={
+            <Button icon={<ArrowLeftRegular />} onClick={() => setPromptEditorOpen(false)}>
+              Отменить
+            </Button>
+          }
+        />
+        <section className="prompt-editor-card surface" aria-labelledby="prompt-editor-title">
+          <h2 id="prompt-editor-title" className="settings-card-title">
+            Текст промпта
+          </h2>
+          <Textarea
+            className="prompt-editor-textarea"
+            aria-label="Текст промпта саммаризации"
+            value={promptDraft}
+            placeholder="Например: составляй саммари от лица руководителя встречи, отдельно выноси риски со сроками и всех упомянутых клиентов."
+            resize="vertical"
+            rows={14}
+            maxLength={4000}
+            onChange={(_event, data) => {
+              setPromptDraft(data.value);
+            }}
+          />
+          <p className="settings-footnote">
+            Пустое поле — используется встроенная инструкция. Максимум 4000 символов.
+          </p>
+          <div className="prompt-editor-actions">
+            <Button
+              appearance="primary"
+              onClick={() => {
+                update({ summary_prompt: promptDraft });
+                setPromptEditorOpen(false);
+              }}
+            >
+              Сохранить
+            </Button>
+            <Button
+              onClick={() => {
+                setPromptEditorOpen(false);
+              }}
+            >
+              Отменить
+            </Button>
+          </div>
+        </section>
+      </div>
+    );
+  }
 
   return (
     <>
@@ -911,19 +973,17 @@ export function SettingsPage({
                   </span>
                 </div>
                 <div className="settings-control settings-control-rag">
-                  <Textarea
-                    className="settings-textarea-prompt"
-                    aria-label="Промпт саммаризации"
-                    value={settings.summary_prompt}
+                  <Button
+                    className="settings-prompt-open"
+                    icon={<EditRegular />}
                     disabled={!settings.summarize_enabled}
-                    placeholder="Например: составляй саммари от лица руководителя встречи, отдельно выноси риски со сроками и всех упомянутых клиентов."
-                    resize="vertical"
-                    rows={4}
-                    maxLength={4000}
-                    onChange={(_event, data) => {
-                      update({ summary_prompt: data.value });
+                    onClick={() => {
+                      setPromptDraft(settings.summary_prompt);
+                      setPromptEditorOpen(true);
                     }}
-                  />
+                  >
+                    {settings.summary_prompt.trim() === '' ? 'Написать промпт' : 'Изменить промпт'}
+                  </Button>
                 </div>
               </div>
 

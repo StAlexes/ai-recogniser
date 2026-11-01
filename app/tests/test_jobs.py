@@ -450,6 +450,76 @@ def test_upload_endpoint_with_fake_worker(tmp_path: Path) -> None:
         assert saved.json()["name"] == "meeting.srt"
 
 
+def test_save_and_export_respect_view(tmp_path: Path) -> None:
+    """«Сохранить как» пишет тот вид, который открыт в интерфейсе."""
+    paths = paths_for(tmp_path)
+
+    def summary_runner(
+        job_id: str, progress: Callable[[float, str], None]
+    ) -> dict[str, object]:
+        assert job_id
+        progress(0.5, "Саммаризация")
+        return {"tl_dr": "Короткое содержание.", "topics": ["тест"]}
+
+    settings = Settings(summarize_enabled=True)
+    app = create_app(settings=settings, paths=paths, token=TOKEN, auth_enabled=True, port=12345)
+    app.state.jobs.shutdown()
+    app.state.jobs = JobManager(
+        paths,
+        lambda: app.state.settings,
+        transcriber=fake_transcriber,
+        summary_runner=summary_runner,
+    )
+
+    with TestClient(app) as client:
+        headers = {"Authorization": f"Bearer {TOKEN}"}
+        response = client.post(
+            "/api/v1/jobs",
+            headers=headers,
+            files={"file": ("meeting.wav", b"RIFF....WAVEfmt ", "audio/wav")},
+        )
+        assert response.status_code == 202
+        job_id = response.json()["id"]
+        for _ in range(100):
+            detail = client.get(f"/api/v1/jobs/{job_id}", headers=headers).json()
+            if detail["status"] in {"done", "error"} and detail["stages"]["summary"][
+                "status"
+            ] in {"done", "error", "skipped"}:
+                break
+            time.sleep(0.02)
+        assert detail["status"] == "done", detail
+        assert detail["stages"]["summary"]["status"] == "done", detail["stages"]
+
+        # summary: текст саммари вместо сегментов; json — структура саммари.
+        summary_md = client.get(
+            f"/api/v1/jobs/{job_id}/export", headers=headers, params={"format": "md", "view": "summary"}
+        )
+        assert summary_md.status_code == 200
+        assert "Саммари" in summary_md.text
+        assert "Короткое содержание." in summary_md.text
+        summary_json = client.get(
+            f"/api/v1/jobs/{job_id}/export", headers=headers, params={"format": "json", "view": "summary"}
+        )
+        assert summary_json.status_code == 200
+        assert "tl_dr" in summary_json.text
+
+        # recognition (по умолчанию) — сегменты без спикеров.
+        plain = client.get(f"/api/v1/jobs/{job_id}/export", headers=headers, params={"format": "txt"})
+        assert plain.status_code == 200
+        assert "тестовая" in plain.text
+        assert "[" not in plain.text  # без диаризации нет меток спикеров/времени
+
+        # save с view=summary в пользовательский путь.
+        target = tmp_path / "saved" / "meeting.md"
+        saved = client.post(
+            f"/api/v1/jobs/{job_id}/save",
+            headers=headers,
+            json={"path": str(target), "format": "md", "view": "summary"},
+        )
+        assert saved.status_code == 200, saved.text
+        assert "Саммари" in target.read_text(encoding="utf-8")
+
+
 def wait_stage(
     manager: JobManager,
     job_id: str,

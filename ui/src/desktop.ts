@@ -21,6 +21,7 @@ interface PywebviewApi {
     jobId: string,
     defaultName: string,
     format?: string,
+    view?: string,
   ) => Promise<BridgeResult> | BridgeResult;
 }
 
@@ -64,15 +65,20 @@ export async function openResultFolder(jobId: string): Promise<BridgeResult | nu
   return bridge.open_result_folder(jobId);
 }
 
-/** Show the native Save-As dialog and copy the transcript to the chosen path. */
+/** Show the native Save-As dialog and copy the shown result to the chosen path.
+
+ *view* selects which result to save: recognition (plain transcript),
+ diarization (speaker-attributed) or summary.  Defaults to the transcript.
+ */
 export async function saveResultAs(
   jobId: string,
   defaultName: string,
   format = 'txt',
+  view: string = 'recognition',
 ): Promise<BridgeResult | null> {
   const bridge = api();
   if (!bridge?.save_result) {
     return null;
   }
-  return bridge.save_result(jobId, defaultName, format);
+  return bridge.save_result(jobId, defaultName, format, view);
 }

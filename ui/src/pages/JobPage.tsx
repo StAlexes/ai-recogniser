@@ -68,6 +68,13 @@ const EXPORT_EXTENSIONS: Record<ExportFormat, string> = {
   json: '.json',
 };
 
+/** Formats offered for each saved view (Саммари / Расшифровка / Диаризация). */
+const VIEW_EXPORT_FORMATS: Record<ResultView, ExportFormat[]> = {
+  summary: ['md', 'txt', 'json'],
+  recognition: ['txt', 'srt', 'vtt', 'md', 'json'],
+  diarization: ['txt', 'srt', 'vtt', 'md', 'json'],
+};
+
 const SUMMARY_MAX_POINTS = 8;
 
 /** The saved results a finished job can show: one per processing stage. */
@@ -171,6 +178,25 @@ function StageControl({
   children?: ReactNode;
 }) {
   const running = stage.status === 'running';
+  // Одна кнопка вместо трёх: запущено — «Стоп», завершено или упало —
+  // «Перезапустить», иначе — «Запустить».
+  let action: StageAction;
+  let icon: ReactNode;
+  let label: string;
+  if (running) {
+    action = 'stop';
+    icon = <StopRegular />;
+    label = 'Стоп';
+  } else if (stage.status === 'done' || stage.status === 'error') {
+    action = 'restart';
+    icon = <ArrowClockwiseRegular />;
+    label = 'Перезапустить';
+  } else {
+    action = 'start';
+    icon = <PlayRegular />;
+    label = 'Запустить';
+  }
+  const disabled = busy || (action !== 'stop' && !canStart);
   return (
     <div className="job-stage-control" data-status={stage.status}>
       <div className="job-stage-control-head">
@@ -190,29 +216,11 @@ function StageControl({
         <Button
           size="small"
           appearance="subtle"
-          icon={<PlayRegular />}
-          disabled={busy || running || !canStart || stage.status === 'done'}
-          onClick={() => onAction('start')}
+          icon={icon}
+          disabled={disabled}
+          onClick={() => onAction(action)}
         >
-          Запустить
-        </Button>
-        <Button
-          size="small"
-          appearance="subtle"
-          icon={<StopRegular />}
-          disabled={busy || !running}
-          onClick={() => onAction('stop')}
-        >
-          Стоп
-        </Button>
-        <Button
-          size="small"
-          appearance="subtle"
-          icon={<ArrowClockwiseRegular />}
-          disabled={busy || !canStart}
-          onClick={() => onAction('restart')}
-        >
-          Перезапустить
+          {label}
         </Button>
       </div>
     </div>
@@ -368,6 +376,19 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     }
   }, [resultViews, viewPicked, view]);
 
+  // Keep the export format valid for the active view: switching to
+  // «Саммари» hides subtitle formats, switching back restores them.
+  useEffect(() => {
+    if (view === null) {
+      return;
+    }
+    const allowed = VIEW_EXPORT_FORMATS[view];
+    const fallback: ExportFormat = view === 'summary' ? 'md' : 'txt';
+    if (!allowed.includes(format)) {
+      setFormat(allowed[0] ?? fallback);
+    }
+  }, [view, format]);
+
   const viewText =
     view === 'diarization'
       ? speakersText
@@ -413,7 +434,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
   };
 
   const handleSave = async (): Promise<void> => {
-    if (job === null || job.status !== 'done') {
+    if (job === null || job.status !== 'done' || view === null) {
       return;
     }
     const base = job.filename.replace(/\.[^.]+$/, '') || 'transcript';
@@ -421,7 +442,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     setSaving(true);
     setError(null);
     try {
-      const bridgeResult = await saveResultAs(job.id, `${base}${extension}`, format);
+      const bridgeResult = await saveResultAs(job.id, `${base}${extension}`, format, view);
       if (bridgeResult !== null) {
         if (bridgeResult.cancelled) {
           return;
@@ -433,9 +454,9 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
         setNotice(`Результат сохранён: ${bridgeResult.path ?? ''}`);
         return;
       }
-      // Browser fallback: download the selected format.
+      // Browser fallback: download the selected format of the active view.
       const response = await fetch(
-        `/api/v1/jobs/${encodeURIComponent(job.id)}/export?format=${format}`,
+        `/api/v1/jobs/${encodeURIComponent(job.id)}/export?format=${format}&view=${view}`,
         {
           method: 'GET',
           credentials: 'same-origin',
@@ -715,11 +736,13 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
             }}
             disabled={job === null || job.status !== 'done'}
           >
-            <Option value="txt">TXT</Option>
-            <Option value="srt">SRT</Option>
-            <Option value="vtt">VTT</Option>
-            <Option value="md">Markdown</Option>
-            <Option value="json">JSON</Option>
+            {(view !== null ? VIEW_EXPORT_FORMATS[view] : Object.keys(EXPORT_EXTENSIONS)).map(
+              (key) => (
+                <Option key={key} value={key}>
+                  {key === 'md' ? 'Markdown' : key.toUpperCase()}
+                </Option>
+              ),
+            )}
           </Dropdown>
           <Button
             size="small"
