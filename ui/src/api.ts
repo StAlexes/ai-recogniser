@@ -36,10 +36,7 @@ export interface Settings {
   summary_prompt: string;
   vad_enabled: boolean;
   vad_max_segment_s: number;
-  vad_min_silence_ms: number;
-  vad_speech_pad_ms: number;
   diarize_enabled: boolean;
-  diarize_threshold: number;
   diarize_model: string;
   diarize_model_path: string;
   diarize_profile: string;

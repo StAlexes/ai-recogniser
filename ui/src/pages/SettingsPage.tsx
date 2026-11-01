@@ -596,6 +596,8 @@ export function SettingsPage({
                   <span className="settings-label">Нарезка по сегментам (VAD)</span>
                   <span className="settings-hint">
                     Длинные записи делятся по паузам речи перед распознаванием.
+                    Пауза, порог речи и отступ берутся из калиброванной группы
+                    параметров (diarization_profiles.yaml).
                   </span>
                 </div>
                 <div className="settings-control">
@@ -633,58 +635,6 @@ export function SettingsPage({
                   />
                 </div>
               </div>
-
-              <div className="settings-row">
-                <div className="settings-row-text">
-                  <span className="settings-label">Минимальная пауза</span>
-                  <span className="settings-hint">
-                    Паузы короче этого значения не разделяют сегменты, мс.
-                  </span>
-                </div>
-                <div className="settings-control settings-control-rag-k">
-                  <Input
-                    type="number"
-                    min={50}
-                    max={5000}
-                    step={50}
-                    aria-label="Минимальная пауза, миллисекунды"
-                    value={String(settings.vad_min_silence_ms)}
-                    disabled={!settings.vad_enabled}
-                    onChange={(_event, data) => {
-                      const parsed = Number.parseInt(data.value, 10);
-                      if (Number.isFinite(parsed)) {
-                        update({ vad_min_silence_ms: Math.min(5000, Math.max(50, parsed)) });
-                      }
-                    }}
-                  />
-                </div>
-              </div>
-
-              <div className="settings-row">
-                <div className="settings-row-text">
-                  <span className="settings-label">Отступ вокруг речи</span>
-                  <span className="settings-hint">
-                    Сколько миллисекунд речи оставлять до и после сегмента.
-                  </span>
-                </div>
-                <div className="settings-control settings-control-rag-k">
-                  <Input
-                    type="number"
-                    min={0}
-                    max={1000}
-                    step={10}
-                    aria-label="Отступ вокруг речи, миллисекунды"
-                    value={String(settings.vad_speech_pad_ms)}
-                    disabled={!settings.vad_enabled}
-                    onChange={(_event, data) => {
-                      const parsed = Number.parseInt(data.value, 10);
-                      if (Number.isFinite(parsed)) {
-                        update({ vad_speech_pad_ms: Math.min(1000, Math.max(0, parsed)) });
-                      }
-                    }}
-                  />
-                </div>
-              </div>
             </div>
           </section>
 
@@ -712,38 +662,6 @@ export function SettingsPage({
                     checked={settings.diarize_enabled}
                     onChange={(_event, data) => {
                       update({ diarize_enabled: data.checked });
-                    }}
-                  />
-                </div>
-              </div>
-
-              <div className="settings-row">
-                <div className="settings-row-text">
-                  <span className="settings-label">
-                    {diarizationValue === 'pyannote-segmentation-3.0'
-                      ? 'Порог активности речи'
-                      : 'Порог сходства'}
-                  </span>
-                  <span className="settings-hint">
-                    {diarizationValue === 'pyannote-segmentation-3.0'
-                      ? 'Для PyAnnote обычно подходит 0.5 — меняйте только если спикеры дробятся или слипаются.'
-                      : 'От 0.1 до 0.99. Выше — строже группировка по одному спикеру.'}
-                  </span>
-                </div>
-                <div className="settings-control settings-control-rag-k">
-                  <Input
-                    type="number"
-                    min={0.1}
-                    max={0.99}
-                    step={0.05}
-                    aria-label="Порог сходства диаризации"
-                    value={String(settings.diarize_threshold)}
-                    disabled={!settings.diarize_enabled}
-                    onChange={(_event, data) => {
-                      const parsed = Number.parseFloat(data.value);
-                      if (Number.isFinite(parsed)) {
-                        update({ diarize_threshold: Math.min(0.99, Math.max(0.1, parsed)) });
-                      }
                     }}
                   />
                 </div>
