@@ -21,6 +21,7 @@ import {
   VideoRegular,
 } from '@fluentui/react-icons';
 import {
+  addJobsFromPaths,
   AuthError,
   cancelJob,
   getJobs,
@@ -34,7 +35,13 @@ import type { JobSummary } from '../api';
 import { Dropzone } from '../components/Dropzone';
 import { InfoCard } from '../components/InfoCard';
 import { PageHeader } from '../components/PageHeader';
-import { openResultFolder } from '../desktop';
+import {
+  addFilesViaBridge,
+  hasDesktopBridge,
+  openResultFolder,
+  takeDroppedPaths,
+  watchDroppedFiles,
+} from '../desktop';
 import { formatBytes, pluralFiles } from '../format';
 import {
   describeError,
@@ -71,6 +78,8 @@ const ACCEPT_ATTRIBUTE = Array.from(ACCEPTED_EXTENSIONS)
 interface SelectedFile {
   id: string;
   file: File;
+  /** Полный путь исходника (native dialog / drop в десктопе), иначе "". */
+  path: string;
   name: string;
   size: number;
   kind: 'audio' | 'video';
@@ -128,6 +137,14 @@ export function QueuePage({ onAuthError, onOpenJob }: QueuePageProps) {
     return undefined;
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // В десктопе shell отдаёт полные пути файлов, брошенных в окно
+  // (WebView2 скрывает их от JS).  Достаточно попросить один раз.
+  useEffect(() => {
+    if (hasDesktopBridge()) {
+      void watchDroppedFiles();
+    }
+  }, []);
+
   const hasActive = jobs.some(
     (job) =>
       isActive(job.status) ||
@@ -182,7 +199,7 @@ export function QueuePage({ onAuthError, onOpenJob }: QueuePageProps) {
 
     for (const file of batch) {
       try {
-        const job = await uploadJob(file.file);
+        const job = await uploadJob(file.file, undefined, file.path || undefined);
         uploadedIds.add(file.id);
         jobIds.push(job.id);
       } catch (reason: unknown) {
@@ -232,6 +249,10 @@ export function QueuePage({ onAuthError, onOpenJob }: QueuePageProps) {
   };
 
   const addFiles = (incoming: FileList): void => {
+    // В десктопе shell хранит соответствие имя → полный путь для последнего
+    // drop (WebView2 не отдаёт пути в JS).  В браузере пути нет.
+    const droppedPaths = takeDroppedPaths();
+    const pathByName = new Map(droppedPaths.map((item) => [item.name, item.path]));
     const accepted: SelectedFile[] = [];
     let rejected = 0;
 
@@ -245,6 +266,7 @@ export function QueuePage({ onAuthError, onOpenJob }: QueuePageProps) {
       accepted.push({
         id: `file-${nextId.current}`,
         file,
+        path: pathByName.get(file.name) ?? '',
         name: file.name,
         size: file.size,
         kind: VIDEO_EXTENSIONS.has(extension) ? 'video' : 'audio',
@@ -261,6 +283,62 @@ export function QueuePage({ onAuthError, onOpenJob }: QueuePageProps) {
       }
     }
     setRejectedCount(rejected);
+  };
+
+  const addPaths = async (paths: string[]): Promise<void> => {
+    if (paths.length === 0) {
+      return;
+    }
+    setError(null);
+    setNotice(`Загрузка файлов: ${paths.length}…`);
+    try {
+      const response = await addJobsFromPaths(paths);
+      const items = response.items;
+      const failures = response.errors;
+      if (items.length > 0) {
+        setNotice(
+          recognizeImmediately
+            ? 'Файлы добавлены. Обработка запущена.'
+            : 'Файлы добавлены в очередь.',
+        );
+      } else {
+        setNotice(null);
+      }
+      if (failures.length > 0) {
+        setError(failures.map((item) => `${item.path}: ${item.error}`).join('; '));
+      }
+      await refreshJobs();
+    } catch (reason: unknown) {
+      if (reason instanceof AuthError) {
+        onAuthError();
+        return;
+      }
+      setError(describeError(reason));
+    }
+  };
+
+  const handleBrowse = (): void => {
+    // В десктопе — нативный диалог с полными путями (файл не копируется);
+    // в браузере — обычный input type=file.
+    if (hasDesktopBridge()) {
+      void (async () => {
+        const result = await addFilesViaBridge();
+        if (result === null) {
+          openPicker();
+          return;
+        }
+        if (result.cancelled) {
+          return;
+        }
+        if (!result.ok) {
+          setError(result.error ?? 'Не удалось открыть диалог выбора файлов.');
+          return;
+        }
+        void addPaths(result.paths ?? []);
+      })();
+      return;
+    }
+    openPicker();
   };
 
   const handleInputChange = (event: ChangeEvent<HTMLInputElement>): void => {
@@ -422,7 +500,7 @@ export function QueuePage({ onAuthError, onOpenJob }: QueuePageProps) {
         </MessageBar>
       ) : null}
 
-      <Dropzone onFiles={addFiles} onBrowse={openPicker} />
+      <Dropzone onFiles={addFiles} onBrowse={handleBrowse} />
 
       {rejectedCount > 0 ? (
         <p className="queue-hint" role="status">

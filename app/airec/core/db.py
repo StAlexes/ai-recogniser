@@ -17,7 +17,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # All Job dataclass fields that are persisted, in column order.
 JOB_COLUMNS = (
@@ -49,6 +49,10 @@ JOB_COLUMNS = (
     # Per-job override of the diarization hyperparameter group ("" = use the
     # global setting) — added in schema v5.
     "diarize_profile",
+    # Absolute path of the original file outside the job folder ("": the
+    # original location is unknown) — added in schema v6.  The job no longer
+    # keeps a copy of the source file, so restarts read from this location.
+    "original_path",
 )
 
 # Columns that may be missing in databases created by older releases.
@@ -67,6 +71,8 @@ JOB_COLUMN_MIGRATIONS: dict[str, str] = {
     "summary_text": "TEXT",
     # Per-job diarization profile override ("" = use the global setting).
     "diarize_profile": "TEXT NOT NULL DEFAULT ''",
+    # Absolute path of the original file outside the job folder (schema v6).
+    "original_path": "TEXT",
 }
 
 CREATE_JOBS_TABLE = """
@@ -97,7 +103,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     paused INTEGER NOT NULL DEFAULT 0,
     segment_count INTEGER NOT NULL DEFAULT 0,
     stages TEXT,
-    diarize_profile TEXT NOT NULL DEFAULT ''
+    diarize_profile TEXT NOT NULL DEFAULT '',
+    original_path TEXT
 );
 """
 
@@ -200,7 +207,8 @@ class Database:
                     paused=excluded.paused,
                     segment_count=excluded.segment_count,
                     stages=excluded.stages,
-                    diarize_profile=excluded.diarize_profile
+                    diarize_profile=excluded.diarize_profile,
+                    original_path=excluded.original_path
                 """,
                 values,
             )

@@ -183,10 +183,16 @@ def test_manager_retry_error_job(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         manager.retry(finished.id)
 
-    # Повтор отмененной задачи — ок.
-    upload2 = tmp_path / "meeting2.wav"
-    upload2.write_bytes(b"RIFF....WAVEfmt ")
-    job2 = manager.submit(upload2, "meeting2.wav", "gigaam-v3-e2e-ctc")
+    # Повтор отмененной задачи — ок (файл остаётся на исходном месте).
+    # Имитируем реальную загрузку: multipart-копия в temp + оригинал у пользователя.
+    original2 = tmp_path / "meeting2.wav"
+    original2.write_bytes(b"RIFF....WAVEfmt ")
+    upload_copy = tmp_path / "uploads" / "meeting2.wav"
+    upload_copy.parent.mkdir(exist_ok=True)
+    upload_copy.write_bytes(b"RIFF....WAVEfmt ")
+    job2 = manager.submit(
+        upload_copy, "meeting2.wav", "gigaam-v3-e2e-ctc", original_path=original2
+    )
     manager.cancel(job2.id)
 
     retried = manager.retry(job2.id)
@@ -450,6 +456,146 @@ def test_upload_endpoint_with_fake_worker(tmp_path: Path) -> None:
         assert saved.json()["name"] == "meeting.srt"
 
 
+def test_submit_keeps_original_path_instead_of_copy(tmp_path: Path) -> None:
+    """Копия исходника больше не хранится: только путь до оригинала."""
+    paths = paths_for(tmp_path)
+    manager = JobManager(paths, lambda: Settings(), transcriber=fake_transcriber)
+    original = tmp_path / "source_meeting.wav"
+    original.write_bytes(b"RIFF....WAVEfmt ")
+    upload_copy = tmp_path / "uploads" / "source_meeting.wav"
+    upload_copy.parent.mkdir(exist_ok=True)
+    upload_copy.write_bytes(b"RIFF....WAVEfmt ")
+
+    job = manager.submit(
+        upload_copy, "source_meeting.wav", "gigaam-v3-e2e-ctc", original_path=original
+    )
+    finished = wait_done(manager, job.id)
+
+    assert finished.status == "done"
+    # Копия в папке задачи не создаётся; сохраняется исходное расположение.
+    stored = list((paths.results / job.id).glob("source*"))
+    assert stored == []
+    assert finished.original_path == str(original.resolve())
+    detail = finished.detail()
+    assert detail["original_path"] == str(original.resolve())
+
+    # После завершения work-dir очищается, перезапуск читает исходник с места.
+    manager.restart_recognition(job.id)
+    retried = wait_done(manager, job.id)
+    assert retried.status == "done"
+    assert original.is_file()  # исходник не был ни перемещён, ни изменён
+    manager.shutdown()
+
+
+def test_restart_fails_clearly_when_original_is_gone(tmp_path: Path) -> None:
+    """Исходник удалён — понятная ошибка вместо тихого падения."""
+    paths = paths_for(tmp_path)
+    manager = JobManager(paths, lambda: Settings(), transcriber=fake_transcriber)
+    original = tmp_path / "meeting.wav"
+    original.write_bytes(b"RIFF....WAVEfmt ")
+    upload_copy = tmp_path / "uploads" / "meeting.wav"
+    upload_copy.parent.mkdir(exist_ok=True)
+    upload_copy.write_bytes(b"RIFF....WAVEfmt ")
+
+    job = manager.submit(
+        upload_copy, "meeting.wav", "gigaam-v3-e2e-ctc", original_path=original
+    )
+    finished = wait_done(manager, job.id)
+    assert finished.status == "done"
+
+    original.unlink()
+    with pytest.raises(FileNotFoundError, match="перемещён или удалён"):
+        manager.restart_recognition(job.id)
+
+    # Путь неизвестен вовсе — тоже понятная ошибка (после чистки work-dir).
+    upload3 = tmp_path / "uploads" / "anon.wav"
+    upload3.write_bytes(b"RIFF....WAVEfmt ")
+    job_no_path = manager.submit(upload3, "anon.wav", "gigaam-v3-e2e-ctc")
+    done = wait_done(manager, job_no_path.id)
+    with pytest.raises(FileNotFoundError, match="перемещён или удалён"):
+        manager.restart_recognition(done.id)
+    manager.shutdown()
+
+
+def test_from_paths_endpoint_queues_local_files(tmp_path: Path) -> None:
+    """Native-dialog endpoint: очередь по абсолютным путям без копирования."""
+    paths = paths_for(tmp_path)
+    settings = Settings()
+    app = create_app(settings=settings, paths=paths, token=TOKEN, auth_enabled=True, port=12345)
+    app.state.jobs.shutdown()
+    app.state.jobs = JobManager(paths, lambda: app.state.settings, transcriber=fake_transcriber)
+
+    with TestClient(app) as client:
+        headers = {"Authorization": f"Bearer {TOKEN}"}
+        good = tmp_path / "local.wav"
+        good.write_bytes(b"RIFF....WAVEfmt ")
+        bad = tmp_path / "notes.txt"
+        bad.write_text("не аудио", encoding="utf-8")
+
+        response = client.post(
+            "/api/v1/jobs/from-paths",
+            headers=headers,
+            json={"paths": [str(good), str(bad), str(tmp_path / "missing.wav")]},
+        )
+        assert response.status_code == 202, response.text
+        payload = response.json()
+        assert len(payload["items"]) == 1
+        assert payload["items"][0]["original_path"] == str(good.resolve())
+        assert len(payload["errors"]) == 2
+
+        for _ in range(100):
+            detail = client.get(
+                f"/api/v1/jobs/{payload['items'][0]['id']}", headers=headers
+            ).json()
+            if detail["status"] in {"done", "error"}:
+                break
+            time.sleep(0.02)
+        assert detail["status"] == "done", detail
+        assert good.is_file()
+
+
+def test_reveal_source_endpoint(tmp_path: Path) -> None:
+    paths = paths_for(tmp_path)
+    settings = Settings()
+    app = create_app(settings=settings, paths=paths, token=TOKEN, auth_enabled=True, port=12345)
+    app.state.jobs.shutdown()
+    app.state.jobs = JobManager(paths, lambda: app.state.settings, transcriber=fake_transcriber)
+
+    with TestClient(app) as client:
+        headers = {"Authorization": f"Bearer {TOKEN}"}
+        # Неизвестная задача — 404.
+        assert (
+            client.post("/api/v1/jobs/missing/reveal-source", headers=headers).status_code
+            == 404
+        )
+
+        original = tmp_path / "meeting.wav"
+        original.write_bytes(b"RIFF....WAVEfmt ")
+        upload_copy = tmp_path / "uploads" / "meeting.wav"
+        upload_copy.parent.mkdir(exist_ok=True)
+        upload_copy.write_bytes(b"RIFF....WAVEfmt ")
+        queued = client.post(
+            "/api/v1/jobs",
+            headers=headers,
+            files={"file": ("meeting.wav", b"RIFF....WAVEfmt ", "audio/wav")},
+        )
+        assert queued.status_code == 202, queued.text
+        job_id = queued.json()["id"]
+        for _ in range(100):
+            detail = client.get(f"/api/v1/jobs/{job_id}", headers=headers).json()
+            if detail["status"] in {"done", "error"}:
+                break
+            time.sleep(0.02)
+        # Файлы исчезли (multipart-загрузка не знает исходного расположения,
+        # temp-копия вычищена) — endpoint отвечает 409, а не падает.
+        import shutil as _shutil
+
+        for work_dir in (paths.temp / "jobs").glob(f"{job_id}*"):
+            _shutil.rmtree(work_dir, ignore_errors=True)
+        response = client.post(f"/api/v1/jobs/{job_id}/reveal-source", headers=headers)
+        assert response.status_code == 409
+
+
 def test_save_and_export_respect_view(tmp_path: Path) -> None:
     """«Сохранить как» пишет тот вид, который открыт в интерфейсе."""
     paths = paths_for(tmp_path)
@@ -580,10 +726,15 @@ def test_stage_controls_restart_diarization_and_summary(
         transcriber=fake_transcriber,
         summary_runner=summary_runner,
     )
-    upload = tmp_path / "meeting.wav"
+    original = tmp_path / "meeting.wav"
+    original.write_bytes(b"RIFF....WAVEfmt ")
+    upload = tmp_path / "uploads" / "meeting.wav"
+    upload.parent.mkdir(exist_ok=True)
     upload.write_bytes(b"RIFF....WAVEfmt ")
 
-    job = manager.submit(upload, "meeting.wav", "gigaam-v3-e2e-ctc")
+    job = manager.submit(
+        upload, "meeting.wav", "gigaam-v3-e2e-ctc", original_path=original
+    )
     wait_done(manager, job.id)
 
     manager.start_stage(job.id, "diarization")
@@ -668,10 +819,15 @@ def test_auto_diarization_runs_before_summary(
 def test_recognition_stage_restart_keeps_job_id(tmp_path: Path) -> None:
     paths = paths_for(tmp_path)
     manager = JobManager(paths, lambda: Settings(), transcriber=fake_transcriber)
-    upload = tmp_path / "meeting.wav"
-    upload.write_bytes(b"RIFF....WAVEfmt ")
+    original = tmp_path / "meeting.wav"
+    original.write_bytes(b"RIFF....WAVEfmt ")
+    upload_copy = tmp_path / "uploads" / "meeting.wav"
+    upload_copy.parent.mkdir(exist_ok=True)
+    upload_copy.write_bytes(b"RIFF....WAVEfmt ")
 
-    job = manager.submit(upload, "meeting.wav", "gigaam-v3-e2e-ctc")
+    job = manager.submit(
+        upload_copy, "meeting.wav", "gigaam-v3-e2e-ctc", original_path=original
+    )
     wait_done(manager, job.id)
 
     restarted = manager.restart_stage(job.id, "recognition")

@@ -935,6 +935,33 @@ textarea {
   padding: 0;
 }
 
+/* Группа параметров диаризации вынесена из карточки этапа в тулбар. */
+.job-profile-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.job-profile-label {
+  color: var(--colorNeutralForeground3, var(--text-3));
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.job-profile-row .fui-Dropdown {
+  width: 260px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.job-profile-row .fui-Dropdown__button {
+  grid-template-columns: '[content] minmax(0, 1fr) [icon] auto [end]';
+  overflow: hidden;
+  white-space: nowrap;
+}
+
 .job-live-progress {
   margin-top: 12px;
   padding: 10px 16px;

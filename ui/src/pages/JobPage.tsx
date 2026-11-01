@@ -16,6 +16,7 @@ import {
   ArrowLeftRegular,
   CopyRegular,
   DismissRegular,
+  DocumentArrowRightRegular,
   FolderOpenRegular,
   HistoryRegular,
   PlayRegular,
@@ -31,6 +32,7 @@ import {
   getSettings,
   retryJob,
   revealJobFolder,
+  revealJobSource,
   setJobDiarizeProfile,
   stageAction,
   startJob,
@@ -43,7 +45,7 @@ import type {
   StageKey,
 } from '../api';
 import { PageHeader } from '../components/PageHeader';
-import { openResultFolder, saveResultAs } from '../desktop';
+import { openResultFolder, revealSourceFile, saveResultAs } from '../desktop';
 import { formatBytes } from '../format';
 import {
   describeError,
@@ -57,23 +59,6 @@ import {
   statusColor,
   statusLabel,
 } from '../jobUtils';
-
-type ExportFormat = 'txt' | 'srt' | 'vtt' | 'md' | 'json';
-
-const EXPORT_EXTENSIONS: Record<ExportFormat, string> = {
-  txt: '.txt',
-  srt: '.srt',
-  vtt: '.vtt',
-  md: '.md',
-  json: '.json',
-};
-
-/** Formats offered for each saved view (Саммари / Расшифровка / Диаризация). */
-const VIEW_EXPORT_FORMATS: Record<ResultView, ExportFormat[]> = {
-  summary: ['md', 'txt', 'json'],
-  recognition: ['txt', 'srt', 'vtt', 'md', 'json'],
-  diarization: ['txt', 'srt', 'vtt', 'md', 'json'],
-};
 
 const SUMMARY_MAX_POINTS = 8;
 
@@ -233,7 +218,6 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
   const [notice, setNotice] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [stageBusy, setStageBusy] = useState<StageKey | null>(null);
-  const [format, setFormat] = useState<ExportFormat>('txt');
   const [now, setNow] = useState(() => Date.now());
   // Группы гиперпараметров из YAML-конфига и глобальные настройки; селект
   // ниже показывает локальный выбор профиля для этой задачи.
@@ -376,19 +360,6 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     }
   }, [resultViews, viewPicked, view]);
 
-  // Keep the export format valid for the active view: switching to
-  // «Саммари» hides subtitle formats, switching back restores them.
-  useEffect(() => {
-    if (view === null) {
-      return;
-    }
-    const allowed = VIEW_EXPORT_FORMATS[view];
-    const fallback: ExportFormat = view === 'summary' ? 'md' : 'txt';
-    if (!allowed.includes(format)) {
-      setFormat(allowed[0] ?? fallback);
-    }
-  }, [view, format]);
-
   const viewText =
     view === 'diarization'
       ? speakersText
@@ -421,6 +392,30 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     }
   };
 
+  const handleRevealSource = async (): Promise<void> => {
+    if (job === null) {
+      return;
+    }
+    setError(null);
+    try {
+      const bridgeResult = await revealSourceFile(job.id);
+      if (bridgeResult !== null) {
+        if (!bridgeResult.ok) {
+          setError(bridgeResult.error ?? 'Не удалось открыть расположение файла.');
+        }
+        return;
+      }
+      // Browser fallback (dev mode): same endpoint through the core API.
+      await revealJobSource(job.id);
+    } catch (reason: unknown) {
+      if (reason instanceof AuthError) {
+        onAuthError();
+        return;
+      }
+      setError(describeError(reason));
+    }
+  };
+
   const handleCopy = async (): Promise<void> => {
     if (viewText === '') {
       return;
@@ -438,11 +433,10 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
       return;
     }
     const base = job.filename.replace(/\.[^.]+$/, '') || 'transcript';
-    const extension = EXPORT_EXTENSIONS[format];
     setSaving(true);
     setError(null);
     try {
-      const bridgeResult = await saveResultAs(job.id, `${base}${extension}`, format, view);
+      const bridgeResult = await saveResultAs(job.id, base, view);
       if (bridgeResult !== null) {
         if (bridgeResult.cancelled) {
           return;
@@ -454,9 +448,9 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
         setNotice(`Результат сохранён: ${bridgeResult.path ?? ''}`);
         return;
       }
-      // Browser fallback: download the selected format of the active view.
+      // Browser fallback: download the default format of the active view.
       const response = await fetch(
-        `/api/v1/jobs/${encodeURIComponent(job.id)}/export?format=${format}&view=${view}`,
+        `/api/v1/jobs/${encodeURIComponent(job.id)}/export?view=${view}`,
         {
           method: 'GET',
           credentials: 'same-origin',
@@ -475,7 +469,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = `${base}${extension}`;
+      link.download = `${base}.txt`;
       link.click();
       URL.revokeObjectURL(url);
       setNotice('Результат сохранён в папку загрузок браузера.');
@@ -725,25 +719,16 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
           >
             Папка
           </Button>
-          <Dropdown
-            aria-label="Формат сохранения"
-            value={format.toUpperCase()}
-            selectedOptions={[format]}
-            onOptionSelect={(_event, data) => {
-              if (data.optionValue !== undefined) {
-                setFormat(data.optionValue as ExportFormat);
-              }
+          <Button
+            size="small"
+            icon={<DocumentArrowRightRegular />}
+            onClick={() => {
+              void handleRevealSource();
             }}
-            disabled={job === null || job.status !== 'done'}
+            disabled={job === null}
           >
-            {(view !== null ? VIEW_EXPORT_FORMATS[view] : Object.keys(EXPORT_EXTENSIONS)).map(
-              (key) => (
-                <Option key={key} value={key}>
-                  {key === 'md' ? 'Markdown' : key.toUpperCase()}
-                </Option>
-              ),
-            )}
-          </Dropdown>
+            Исходный файл
+          </Button>
           <Button
             size="small"
             icon={saving ? <Spinner size="tiny" /> : <SaveRegular />}
@@ -816,30 +801,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
               onAction={(action) => {
                 void handleStageAction('diarization', action);
               }}
-            >
-              <div className="job-stage-profile">
-                <Dropdown
-                  aria-label="Группа параметров диаризации для этой задачи"
-                  value={profileLabel}
-                  selectedOptions={[profileValue]}
-                  disabled={stageBusy !== null || profileOptions.length <= 1}
-                  onOptionSelect={(_event, data) => {
-                    void handleProfileSelect(data.optionValue);
-                  }}
-                >
-                  {profileOptions.map((option) => (
-                    <Option key={option.value} value={option.value}>
-                      {option.label}
-                    </Option>
-                  ))}
-                </Dropdown>
-                {effectiveProfile === '' ? (
-                  <span className="job-stage-profile-hint">
-                    Глобальная группа: {globalGroupLabel}
-                  </span>
-                ) : null}
-              </div>
-            </StageControl>
+            />
             <StageControl
               name="summary"
               stage={job.stages.summary}
@@ -849,6 +811,32 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                 void handleStageAction('summary', action);
               }}
             />
+          </div>
+        ) : null}
+
+        {job !== null ? (
+          <div className="job-profile-row" aria-label="Группа параметров диаризации">
+            <span className="job-profile-label">Группа параметров:</span>
+            <Dropdown
+              aria-label="Группа параметров диаризации для этой задачи"
+              value={profileLabel}
+              selectedOptions={[profileValue]}
+              disabled={stageBusy !== null || profileOptions.length <= 1}
+              onOptionSelect={(_event, data) => {
+                void handleProfileSelect(data.optionValue);
+              }}
+            >
+              {profileOptions.map((option) => (
+                <Option key={option.value} value={option.value}>
+                  {option.label}
+                </Option>
+              ))}
+            </Dropdown>
+            {effectiveProfile === '' ? (
+              <span className="job-stage-profile-hint">
+                Глобальная группа: {globalGroupLabel}
+              </span>
+            ) : null}
           </div>
         ) : null}
       </section>

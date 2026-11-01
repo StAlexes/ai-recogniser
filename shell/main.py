@@ -807,24 +807,117 @@ class ShellBridge:
             return {"ok": True, "path": str(self._app.paths.results / job_id)}
         return {"ok": False, "error": "Папка результата ещё не создана."}
 
+    def reveal_source(self, job_id: str) -> dict[str, Any]:
+        """Show the original file of the job in Explorer."""
+        if not job_id:
+            return {"ok": False, "error": "Не указан идентификатор задачи."}
+        headers = (
+            {"Authorization": f"Bearer {self._app.core.token}"}
+            if self._app.core.token
+            else {}
+        )
+        try:
+            response = httpx.post(
+                f"{self._app.core.base_url}/api/v1/jobs/{job_id}/reveal-source",
+                headers=headers,
+                timeout=15.0,
+                trust_env=False,
+            )
+        except Exception as exc:
+            LOG.exception("cannot reveal the source of job %s", job_id)
+            return {"ok": False, "error": f"Не удалось открыть расположение файла: {exc}"}
+        if response.status_code == 200:
+            return {"ok": True, "path": str(response.json().get("path", ""))}
+        try:
+            detail = response.json().get("detail") or response.text
+        except ValueError:
+            detail = response.text
+        return {"ok": False, "error": str(detail)}
+
+    def add_files(self) -> dict[str, Any]:
+        """Native open dialog; returns full paths of the picked media files."""
+        import webview
+
+        file_types = (
+            "Аудио и видео (*.mp3;*.mp4;*.m4a;*.wav;*.flac;*.ogg;*.opus;*.mkv;*.mov;*.webm;*.avi)",
+            "Все файлы (*.*)",
+        )
+        window = self._app.window
+        try:
+            selection = window.create_file_dialog(
+                webview.OPEN_DIALOG,
+                allow_multiple=True,
+                file_types=file_types,
+            )
+        except Exception as exc:
+            LOG.exception("cannot show the open dialog")
+            return {"ok": False, "error": f"Не удалось открыть диалог выбора: {exc}"}
+        if not selection:
+            return {"ok": True, "cancelled": True, "paths": []}
+        paths = [
+            str(item)
+            for item in (selection if isinstance(selection, (list, tuple)) else [selection])
+        ]
+        return {"ok": True, "paths": [item for item in paths if item]}
+
+    def watch_dropped_files(self) -> dict[str, Any]:
+        """Map dropped file names to their full paths for the UI.
+
+        WebView2 keeps the real paths of dropped files; pywebview delivers
+        them only to Python (``FilesDropped``).  A document-level ``drop``
+        listener stores ``name -> path`` in ``window.__airecDropPaths`` where
+        the UI picks it up right after the browser drop event.
+        """
+        window = self._app.window
+
+        def on_drop(event: dict[str, Any]) -> None:
+            try:
+                files = (event.get("dataTransfer") or {}).get("files") or []
+                pairs = [
+                    (file.get("name"), file.get("pywebviewFullPath"))
+                    for file in files
+                    if isinstance(file, dict) and file.get("name")
+                ]
+                js_array = json.dumps(
+                    [{"name": name, "path": path} for name, path in pairs if path],
+                    ensure_ascii=False,
+                )
+                window.evaluate_js(
+                    f"window.__airecDropPaths = {js_array};"
+                    "document.dispatchEvent(new CustomEvent('airec-drop-paths'));"
+                )
+            except Exception:
+                LOG.exception("cannot store dropped file paths")
+
+        try:
+            window.dom.document.events.drop += on_drop
+        except Exception:
+            LOG.exception("cannot watch dropped files")
+            return {"ok": False}
+        return {"ok": True}
+
     def save_result(
-        self, job_id: str, default_name: str = "", format: str = "txt", view: str = ""
+        self, job_id: str, default_name: str = "", view: str = ""
     ) -> dict[str, Any]:
-        """Ask for a target path with the native dialog and save the result."""
+        """Ask for a target path with the native dialog and save the result.
+
+        The format is derived from the extension of the file the user picked
+        in the dialog (no separate format picker in the UI): an unknown or
+        missing extension falls back to ``.txt``.
+        """
         if not job_id:
             return {"ok": False, "error": "Не указан идентификатор задачи."}
         import webview
 
-        extension = {
-            "txt": ".txt",
-            "srt": ".srt",
-            "vtt": ".vtt",
-            "md": ".md",
-            "json": ".json",
-        }.get(format, ".txt")
-        safe_name = Path(default_name or f"transcript{extension}").name
-        if not Path(safe_name).suffix:
-            safe_name += extension
+        extension_by_format = {
+            ".txt": "txt",
+            ".srt": "srt",
+            ".vtt": "vtt",
+            ".md": "md",
+            ".markdown": "md",
+            ".json": "json",
+        }
+        base = Path(default_name or "transcript.txt").name or "transcript.txt"
         file_types = (
             "Текст (*.txt)",
             "Субтитры SRT (*.srt)",
@@ -833,21 +926,11 @@ class ShellBridge:
             "JSON (*.json)",
             "Все файлы (*.*)",
         )
-        # Put the selected format first so the native dialog preselects it.
-        preferred = {
-            "txt": "Текст (*.txt)",
-            "srt": "Субтитры SRT (*.srt)",
-            "vtt": "Субтитры VTT (*.vtt)",
-            "md": "Markdown (*.md)",
-            "json": "JSON (*.json)",
-        }.get(format)
-        if preferred is not None:
-            file_types = (preferred, *[item for item in file_types if item != preferred])
         window = self._app.window
         try:
             selection = window.create_file_dialog(
                 webview.SAVE_DIALOG,
-                save_filename=safe_name,
+                save_filename=base,
                 file_types=file_types,
             )
         except Exception as exc:
@@ -856,6 +939,9 @@ class ShellBridge:
         if not selection:
             return {"ok": False, "cancelled": True}
         target = selection[0] if isinstance(selection, (list, tuple)) else str(selection)
+        # Формат определяет выбранное в диалоге расширение; «Все файлы» или
+        # незнакомый суффикс означают обычный текст.
+        fmt = extension_by_format.get(Path(target).suffix.lower(), "txt")
         headers = (
             {"Authorization": f"Bearer {self._app.core.token}"}
             if self._app.core.token
@@ -864,7 +950,7 @@ class ShellBridge:
         try:
             response = httpx.post(
                 f"{self._app.core.base_url}/api/v1/jobs/{job_id}/save",
-                json={"path": target, "format": format, "view": view or "recognition"},
+                json={"path": target, "format": fmt, "view": view or "recognition"},
                 headers=headers,
                 timeout=30.0,
                 trust_env=False,
@@ -1018,6 +1104,9 @@ def run_gui(paths: AppPaths, args: argparse.Namespace) -> int:
                 bridge.quit,
                 bridge.minimize,
                 bridge.open_result_folder,
+                bridge.reveal_source,
+                bridge.add_files,
+                bridge.watch_dropped_files,
                 bridge.save_result,
             )
         app.tray.start()
@@ -1078,12 +1167,14 @@ def enqueue_files(
         try:
             with path.open("rb") as handle:
                 files_payload = {"file": (path.name, handle, "application/octet-stream")}
+                form_payload = {"original_path": str(path.resolve())}
                 headers: dict[str, str] = {}
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
                 resp = httpx.post(
                     f"{core.base_url}/api/v1/jobs",
                     files=files_payload,
+                    data=form_payload,
                     headers=headers,
                     timeout=300.0,
                     trust_env=False,

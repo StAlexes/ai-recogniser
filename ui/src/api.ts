@@ -99,6 +99,8 @@ export interface JobDetail extends JobSummary {
   result_url: string | null;
   segments: JobSegment[];
   summary: Record<string, any> | null;
+  /** Полный путь исходного файла вне папки задачи ("" = неизвестен). */
+  original_path?: string;
 }
 
 export interface JobsResponse {
@@ -520,6 +522,28 @@ export function revealJobFolder(jobId: string): Promise<{ id: string; path: stri
   );
 }
 
+/** Show the original file of a job in Explorer (desktop shell only). */
+export function revealJobSource(jobId: string): Promise<{ id: string; path: string }> {
+  return request<{ id: string; path: string }>(
+    `/api/v1/jobs/${encodeURIComponent(jobId)}/reveal-source`,
+    { method: 'POST', timeoutMs: 15_000 },
+  );
+}
+
+/** Queue local files by absolute path (desktop shell only, no upload). */
+export interface AddPathsResponse {
+  items: JobDetail[];
+  errors: Array<{ path: string; error: string }>;
+}
+
+export function addJobsFromPaths(paths: string[]): Promise<AddPathsResponse> {
+  return request<AddPathsResponse>('/api/v1/jobs/from-paths', {
+    method: 'POST',
+    body: { paths },
+    timeoutMs: 30_000,
+  });
+}
+
 export function saveJobResult(
   jobId: string,
   targetPath: string,
@@ -546,6 +570,7 @@ export function summarizeJob(jobId: string): Promise<any> {
 export async function uploadJob(
   file: File,
   diarizeProfile?: string,
+  originalPath?: string,
 ): Promise<JobDetail> {
   const timeoutMs = 600_000;
   const controller = new AbortController();
@@ -559,6 +584,9 @@ export async function uploadJob(
   form.append('file', file, file.name);
   if (diarizeProfile) {
     form.append('diarize_profile', diarizeProfile);
+  }
+  if (originalPath) {
+    form.append('original_path', originalPath);
   }
 
   let response: Response;

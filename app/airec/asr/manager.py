@@ -140,6 +140,9 @@ class Job:
     error: str | None = None
     result_file: str | None = None
     source_path: str | None = None
+    # Absolute path of the original file outside the job folder ("" = the
+    # original location is unknown, e.g. a browser upload without full path).
+    original_path: str = ""
     summary: dict[str, Any] | None = None
     # Saved text of every finished stage, so the UI can switch between the
     # plain transcript, the speaker-attributed one and the summary without
@@ -381,14 +384,61 @@ class JobManager:
         if future is not None:
             future.cancel()
 
+    def _stored_source(self, job: Job) -> Path | None:
+        """Первый существующий файл из исходного расположения и рабочей копии.
+
+        Оригинал проверяется первым: рабочая копия в temp исчезает сразу после
+        завершения задачи, а исходное расположение стабильно.
+        """
+        candidates: list[Path] = []
+        if job.original_path:
+            candidates.append(Path(job.original_path))
+        if job.source_path:
+            candidates.append(Path(job.source_path))
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return None
+
     def _source_for_job(self, job: Job) -> Path:
-        """Return the stored source file, copying it into a fresh work folder."""
+        """Return the file a (re)start reads from: the temp work copy or the
+        original location the file was added from."""
+        source = self._stored_source(job)
+        if source is not None:
+            return source
+        if job.source_path or job.original_path:
+            # The job keeps no copy of the source any more; when the original
+            # is gone, restarting is impossible — say so clearly.
+            hint = job.original_path or job.source_path or job.filename
+            raise FileNotFoundError(
+                f"Исходный файл перемещён или удалён: {hint}. "
+                "Добавьте файл в очередь заново, чтобы повторить задачу."
+            )
+        raise FileNotFoundError(f"Исходный файл задачи не найден: {job.filename}")
+
+    def _purge_source_copies(self, job: Job) -> bool:
+        """Удалить копию исходника из папки задачи (поведение до 0.4.4).
+
+        Копии next к результатам забивали диск; после перехода на хранение
+        пути до исходника старые копии удаляются при загрузке задач.
+        """
         if not job.source_path:
-            raise FileNotFoundError(f"Исходный файл задачи не найден: {job.filename}")
-        source = Path(job.source_path)
-        if not source.is_file():
-            raise FileNotFoundError(f"Исходный файл задачи не найден: {source}")
-        return source
+            return False
+        path = Path(job.source_path)
+        try:
+            inside = self._job_dir(job.id).resolve() in path.resolve().parents
+        except OSError:
+            return False
+        if not inside:
+            return False
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            log.warning("cannot remove the old source copy %s", path)
+            return False
+        job.source_path = None
+        log.info("removed the stored source copy for job %s", job.id)
+        return True
 
     def _job_dir(self, job_id: str) -> Path:
         return self._paths.results / job_id
@@ -559,6 +609,8 @@ class JobManager:
         changed = self._backfill_stage_texts(job)
         if self._recover_interrupted(job):
             changed = True
+        if self._purge_source_copies(job):
+            changed = True
         if changed:
             try:
                 self._db.upsert_job(asdict(job))
@@ -636,7 +688,13 @@ class JobManager:
     # Submission
     # ------------------------------------------------------------------ #
     def submit(
-        self, uploaded: Path, original_name: str, model_id: str, diarize_profile: str = ""
+        self,
+        uploaded: Path,
+        original_name: str,
+        model_id: str,
+        diarize_profile: str = "",
+        original_path: str | Path | None = None,
+        move_uploaded: bool = True,
     ) -> Job:
         filename = _safe_name(original_name)
         suffix = Path(filename).suffix.lower()
@@ -656,15 +714,26 @@ class JobManager:
         job_id = f"{datetime.now(UTC):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}"
         work_dir = self._paths.temp / "jobs" / job_id
         work_dir.mkdir(parents=True, exist_ok=True)
-        source = work_dir / f"input{suffix}"
-        shutil.move(str(uploaded), source)
+        if move_uploaded:
+            # Upload goes to a temp folder owned by the job; a local file
+            # queued by path stays where it is and is read from that spot.
+            source = work_dir / f"input{suffix}"
+            shutil.move(str(uploaded), source)
+        else:
+            source = uploaded
 
-        # Keep a copy of the source file next to the results so the job can be
-        # retried even after the temp folder is cleaned up.
-        result_dir = self._job_dir(job_id)
-        result_dir.mkdir(parents=True, exist_ok=True)
-        source_copy = result_dir / f"source{suffix}"
-        shutil.copy2(source, source_copy)
+        # The job keeps only the path of the original file, not a copy: copies
+        # quickly filled the disk.  When the original disappears (moved or
+        # deleted), restarts fail with a clear error instead.
+        resolved_original = ""
+        if original_path:
+            resolved = Path(original_path).expanduser()
+            try:
+                resolved_original = str(resolved.resolve())
+            except OSError:
+                resolved_original = str(resolved)
+        elif not move_uploaded:
+            resolved_original = str(source.resolve())
 
         job = Job(
             id=job_id,
@@ -672,7 +741,8 @@ class JobManager:
             model=model_id,
             size_bytes=size,
             audio_format=suffix.lstrip("."),
-            source_path=str(source_copy),
+            source_path=str(source),
+            original_path=resolved_original,
             diarize_profile=diarize_profile or "",
         )
         settings = self._settings()
@@ -726,14 +796,16 @@ class JobManager:
             candidates = [path for path in work_dir.glob("input.*") if path.is_file()]
             if candidates:
                 source = candidates[0]
-            elif job.source_path and Path(job.source_path).is_file():
-                stored = Path(job.source_path)
+            else:
+                stored = self._stored_source(job)
+                if stored is None:
+                    hint = job.original_path or job.filename
+                    raise FileNotFoundError(
+                        f"Исходный файл перемещён или удалён: {hint}. "
+                        "Добавьте файл в очередь заново."
+                    )
                 source = work_dir / f"input{stored.suffix}"
                 shutil.copy2(stored, source)
-            else:
-                raise FileNotFoundError(
-                    f"Исходный файл задачи не найден: {job.filename}"
-                )
 
             job.paused = False
             job.phase = "В очереди"
@@ -824,14 +896,11 @@ class JobManager:
                     f"Повтор доступен только для задач со статусом 'error' или "
                     f"'cancelled', получено '{job.status}'."
                 )
-            if not job.source_path:
-                raise ValueError(
-                    f"У задачи {job_id} нет сохранённого исходного файла."
-                )
-            source = Path(job.source_path)
-            if not source.is_file():
+            if self._stored_source(job) is None:
+                hint = job.original_path or job.filename
                 raise FileNotFoundError(
-                    f"Исходный файл задачи не найден: {source}"
+                    f"Исходный файл перемещён или удалён: {hint}. "
+                    "Добавьте файл в очередь заново, чтобы повторить задачу."
                 )
         log.info("job %s retried in place", job_id)
         return self.restart_recognition(job_id)
@@ -1436,7 +1505,16 @@ class JobManager:
             )
             work_dir.mkdir(parents=True, exist_ok=True)
             run_source = work_dir / f"input{source.suffix}"
-            shutil.copy2(source, run_source)
+            try:
+                shutil.copy2(source, run_source)
+            except OSError as exc:
+                # The file vanished between the existence check and the copy
+                # (network drive, USB stick, antivirus quarantine).
+                hint = job.original_path or job.filename
+                raise FileNotFoundError(
+                    f"Исходный файл перемещён или удалён: {hint}. "
+                    "Добавьте файл в очередь заново, чтобы повторить задачу."
+                ) from exc
 
             job.status = "queued"
             job.progress = 0.0
