@@ -10,10 +10,14 @@ from airec.api import llm as llm_api
 from airec.core.config import Settings
 from airec.llm.providers import (
     DEFAULT_SUMMARY_TASK,
+    SUMMARY_JSON_SCHEMA,
     ExternalProvider,
     LlamaCppProvider,
+    LLMError,
+    _normalize_summary,
     _parse_json_strict,
     _summary_messages,
+    _summary_response_format,
 )
 from airec.llm.summary import Summarizer
 
@@ -188,8 +192,9 @@ class TestProviderSummarizeSignatures:
         provider = LlamaCppProvider(model="whatever.gguf")
         seen: dict[str, object] = {}
 
-        def fake_chat(messages, *, temperature: float = 0.2) -> str:
+        def fake_chat(messages, *, temperature: float = 0.2, response_format=None) -> str:
             seen["messages"] = messages
+            seen["response_format"] = response_format
             return json.dumps({"tl_dr": "ok", "topics": []}, ensure_ascii=False)
 
         monkeypatch.setattr(provider, "_chat", fake_chat)
@@ -244,3 +249,267 @@ class TestParseJsonStrict:
     def test_raises_on_garbage(self) -> None:
         with pytest.raises(json.JSONDecodeError):
             _parse_json_strict("модель вернула вовсе не JSON")
+
+
+# -------------------------------------------------------------------------- #
+# Защита от невалидного JSON модели (T-lite рвёт ключи: "time  code")
+# -------------------------------------------------------------------------- #
+class TestNormalizeSummary:
+    def test_broken_time_code_key_is_repaired(self) -> None:
+        # Реальный сбой T-lite: ключ "time  code" (двойной пробел) валиден для
+        # json, но терялся в UI.  Нормализация возвращает каноническое имя.
+        raw = {
+            "tl_dr": "ок",
+            "decisions": [{"formulation": "решение", "time  code": "05:10"}],
+            "action_items": [
+                {"owner": "Иван", "deadline": "пт", "formulation": "задача", "time_code": "07:00"}
+            ],
+            "quotes": [{"quote": "цитата", "time  code": "09:00", "speaker": "Спикер 1"}],
+        }
+        result = _normalize_summary(raw)
+        assert result["decisions"][0]["timecode"] == "05:10"
+        assert result["action_items"][0]["timecode"] == "07:00"
+        assert result["quotes"][0]["timecode"] == "09:00"
+
+    def test_aliases_map_to_canonical_keys(self) -> None:
+        raw = {
+            "summary": "кратко",
+            "open_questions": ["вопрос"],
+            "tasks": [{"formulation": "задача", "timecode": "01:00"}],
+        }
+        result = _normalize_summary(raw)
+        assert result["tl_dr"] == "кратко"
+        assert result["questions_open"] == ["вопрос"]
+        assert result["action_items"][0]["formulation"] == "задача"
+
+    def test_string_instead_of_array(self) -> None:
+        result = _normalize_summary({"risks": "один риск"})
+        assert result["risks"] == ["один риск"]
+
+    def test_always_has_all_schema_keys(self) -> None:
+        result = _normalize_summary({"tl_dr": "только текст"})
+        for key in (
+            "tl_dr", "topics", "decisions", "action_items",
+            "questions_open", "risks", "quotes",
+        ):
+            assert key in result
+
+    def test_unknown_keys_dropped(self) -> None:
+        result = _normalize_summary({"tl_dr": "текст", "hallucination": "лишнее"})
+        assert "hallucination" not in result
+
+
+class TestResponseFormat:
+    def test_response_format_carries_schema(self) -> None:
+        rf = _summary_response_format()
+        assert rf["type"] == "json_schema"
+        assert rf["json_schema"]["schema"] is SUMMARY_JSON_SCHEMA
+        # Все ключи схемы обязательны — грамматика не даст их пропустить.
+        assert set(SUMMARY_JSON_SCHEMA["required"]) == {
+            "tl_dr", "topics", "decisions", "action_items",
+            "questions_open", "risks", "quotes",
+        }
+
+    def test_llamacpp_sends_response_format(self, monkeypatch) -> None:
+        provider = LlamaCppProvider(model="whatever.gguf")
+        captured: dict[str, object] = {}
+
+        def fake_post(url, *, json=None, **_kwargs):
+            captured["payload"] = json
+
+            class _Resp:
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    import json as _json
+
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": _json.dumps(
+                                        {
+                                            "tl_dr": "ок",
+                                            "topics": [],
+                                            "decisions": [],
+                                            "action_items": [],
+                                            "questions_open": [],
+                                            "risks": [],
+                                            "quotes": [],
+                                        },
+                                        ensure_ascii=False,
+                                    )
+                                }
+                            }
+                        ]
+                    }
+
+            return _Resp()
+
+        monkeypatch.setattr(provider._client, "post", fake_post)
+        provider._ensure_running = lambda: None  # type: ignore[method-assign]
+        result = provider.summarize("Текст")
+        assert result["tl_dr"] == "ок"
+        payload = captured["payload"]
+        assert payload["response_format"]["type"] == "json_schema"
+        assert payload["response_format"]["json_schema"]["schema"]["type"] == "object"
+
+    def test_llamacpp_invalid_json_raises_llmerror_with_excerpt(
+        self, monkeypatch
+    ) -> None:
+        provider = LlamaCppProvider(model="whatever.gguf")
+
+        def fake_post(url, *, json=None, **_kwargs):
+            class _Resp:
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {
+                        "choices": [{"message": {"content": "совсем не JSON ответ"}}]
+                    }
+
+            return _Resp()
+
+        monkeypatch.setattr(provider._client, "post", fake_post)
+        provider._ensure_running = lambda: None  # type: ignore[method-assign]
+        with pytest.raises(LLMError, match="невалидный JSON"):
+            provider.summarize("Текст")
+
+    def test_external_retries_without_response_format_on_400(self, monkeypatch) -> None:
+        provider = ExternalProvider(
+            base_url="http://127.0.0.1:11434", model="old-ollama"
+        )
+        calls: list[dict[str, object]] = []
+
+        def fake_post(url, *, json=None, headers=None, **_kwargs):
+            # Копия: _chat мутирует payload (pop response_format) между вызовами.
+            calls.append(dict(json))
+            if "response_format" in json:
+                # Старый сервер не знает json_schema.
+                class _Bad:
+                    status_code = 400
+
+                    text = "response_format not supported"
+
+                    def json(self):  # pragma: no cover - not reached
+                        return {}
+
+                return _Bad()
+
+            class _Resp:
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    import json as _json
+
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": _json.dumps(
+                                        {
+                                            "tl_dr": "ок",
+                                            "topics": [],
+                                            "decisions": [],
+                                            "action_items": [],
+                                            "questions_open": [],
+                                            "risks": [],
+                                            "quotes": [],
+                                        },
+                                        ensure_ascii=False,
+                                    )
+                                }
+                            }
+                        ]
+                    }
+
+            return _Resp()
+
+        monkeypatch.setattr(provider._client, "post", fake_post)
+        result = provider.summarize("Текст")
+        assert result["tl_dr"] == "ок"
+        assert len(calls) == 2
+        assert "response_format" in calls[0]
+        assert "response_format" not in calls[1]
+
+    def test_external_retries_once_on_invalid_json(self, monkeypatch) -> None:
+        provider = ExternalProvider(
+            base_url="http://127.0.0.1:11434", model="gemma3:4b"
+        )
+        attempts: list[list[dict[str, str]]] = []
+
+        def fake_post(url, *, json=None, headers=None, **_kwargs):
+            import json as _json
+
+            attempts.append(json["messages"])
+            if len(attempts) == 1:
+
+                class _Broken:
+                    status_code = 200
+
+                    def json(self) -> dict[str, object]:
+                        return {
+                            "choices": [
+                                {"message": {"content": "Список решений: да; нет."}}
+                            ]
+                        }
+
+                return _Broken()
+
+            class _Fixed:
+                status_code = 200
+
+                def json(self) -> dict[str, object]:
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": _json.dumps(
+                                        {
+                                            "tl_dr": "исправлено",
+                                            "topics": [],
+                                            "decisions": [],
+                                            "action_items": [],
+                                            "questions_open": [],
+                                            "risks": [],
+                                            "quotes": [],
+                                        },
+                                        ensure_ascii=False,
+                                    )
+                                }
+                            }
+                        ]
+                    }
+
+            return _Fixed()
+
+        monkeypatch.setattr(provider._client, "post", fake_post)
+        result = provider.summarize("Текст")
+        assert result["tl_dr"] == "исправлено"
+        assert len(attempts) == 2
+        # Повтор содержит поправку и черновик предыдущего ответа.
+        assert attempts[1][-1]["role"] == "user"
+        assert "не является валидным JSON" in attempts[1][-1]["content"]
+
+
+class TestMapPhaseSalvage:
+    def test_map_block_failure_does_not_kill_stage(self) -> None:
+        # Фрагмент с ошибкой превращается в сырой текст, reduce всё равно
+        # собирает итоговое саммари.
+        calls: list[str] = []
+
+        class _FlakyProvider(_FakeProvider):
+            def summarize(
+                self, text: str, *, language: str = "ru", instructions: str = ""
+            ) -> dict[str, object]:
+                calls.append(text[:30])
+                if len(calls) == 2:
+                    raise LLMError("модель вернула невалидный JSON: Expecting ':'")
+                return super().summarize(text, language=language, instructions=instructions)
+
+        summarizer = Summarizer(_FlakyProvider())
+        long_text = ". ".join(f"Предложение номер {i} про проект" for i in range(400))
+        result = summarizer.summarize(long_text)
+        assert "tl_dr" in result
+        # Второй блок дошёл до reduce сырым текстом (fallback).
+        assert any("Предложение номер" in call for call in calls)

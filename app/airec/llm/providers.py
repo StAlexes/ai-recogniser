@@ -44,6 +44,78 @@ SUMMARY_SCHEMA = """{
   "quotes": [{"quote": "цитата", "timecode": "MM:SS", "speaker": "Спикер N"}]
 }"""
 
+# Machine-readable form of SUMMARY_SCHEMA.  It is sent to llama-server as a
+# ``response_format`` JSON-schema constraint: the model output is then produced
+# under a GBNF grammar and cannot be malformed JSON (T-lite/Qwen3 occasionally
+# break a key name mid-object, e.g. "time  code", which used to fail the whole
+# summary stage with JSONDecodeError).
+SUMMARY_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "tl_dr": {"type": "string"},
+        "topics": {"type": "array", "items": {"type": "string"}},
+        "decisions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "formulation": {"type": "string"},
+                    "timecode": {
+                        "type": "string",
+                        "pattern": "^[0-9]{1,2}:[0-9]{2}$",
+                        "description": "MM:SS от начала записи",
+                    },
+                },
+                "required": ["formulation", "timecode"],
+            },
+        },
+        "action_items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "deadline": {"type": "string"},
+                    "formulation": {"type": "string"},
+                    "timecode": {
+                        "type": "string",
+                        "pattern": "^[0-9]{1,2}:[0-9]{2}$",
+                        "description": "MM:SS от начала записи",
+                    },
+                },
+                "required": ["owner", "deadline", "formulation", "timecode"],
+            },
+        },
+        "questions_open": {"type": "array", "items": {"type": "string"}},
+        "risks": {"type": "array", "items": {"type": "string"}},
+        "quotes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "quote": {"type": "string"},
+                    "timecode": {
+                        "type": "string",
+                        "pattern": "^[0-9]{1,2}:[0-9]{2}$",
+                        "description": "MM:SS от начала записи",
+                    },
+                    "speaker": {"type": "string"},
+                },
+                "required": ["quote", "timecode", "speaker"],
+            },
+        },
+    },
+    "required": [
+        "tl_dr",
+        "topics",
+        "decisions",
+        "action_items",
+        "questions_open",
+        "risks",
+        "quotes",
+    ],
+}
+
 DEFAULT_SUMMARY_SYSTEM = (
     "Ты — ассистент по саммари встреч. Пиши на русском языке. "
     "Не выдумывай фактов, которых нет в тексте. "
@@ -55,6 +127,14 @@ DEFAULT_SUMMARY_TASK = (
     "саммари. Каждое решение и каждую задачу привяжи к таймкоду (начало фрагмента), "
     "где оно упомянуто. Если информации недостаточно, оставь поле пустым."
 )
+
+
+def _summary_response_format() -> dict[str, Any]:
+    """OpenAI-style response_format constraining output to SUMMARY_JSON_SCHEMA."""
+    return {
+        "type": "json_schema",
+        "json_schema": {"name": "summary", "schema": SUMMARY_JSON_SCHEMA},
+    }
 
 
 def _summary_messages(
@@ -106,6 +186,103 @@ class LLMProvider(ABC):
     def health(self) -> dict[str, Any]:
         """Provider health / availability."""
         ...
+
+
+def _normalize_summary(obj: Any) -> dict[str, Any]:
+    """Bring a model-returned summary to the canonical key shape.
+
+    Модели иногда искажают имена ключей ("time  code", "actionitems") и
+    возвращают строки вместо массивов.  Нормализация чинит известные
+    искажения, чтобы UI и экспорт видели ровно поля схемы.
+    """
+    if not isinstance(obj, dict):
+        return {}
+    canonical = {
+        "tl_dr": "tl_dr",
+        "tldr": "tl_dr",
+        "tl;dr": "tl_dr",
+        "summary": "tl_dr",
+        "topics": "topics",
+        "theme": "topics",
+        "decisions": "decisions",
+        "action_items": "action_items",
+        "actionitems": "action_items",
+        "action items": "action_items",
+        "tasks": "action_items",
+        "questions_open": "questions_open",
+        "open_questions": "questions_open",
+        "questions": "questions_open",
+        "risks": "risks",
+        "quotes": "quotes",
+        "quote": "quotes",
+    }
+    key_fix = {
+        "formulation": "formulation",
+        "timecode": "timecode",
+        "time code": "timecode",
+        "time_code": "timecode",
+        "owner": "owner",
+        "deadline": "deadline",
+        "quote": "quote",
+        "speaker": "speaker",
+    }
+
+    def fix_item(item: Any, fields: tuple[str, ...]) -> dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
+        fixed: dict[str, Any] = {}
+        for key, value in item.items():
+            # Схлопываем пробелы: T-lite рвёт "timecode" на "time  code".
+            norm = " ".join(key.split()).lower()
+            norm = key_fix.get(norm, norm)
+            fixed[norm] = value
+        return {field: fixed.get(field, "") for field in fields}
+
+    result: dict[str, Any] = {}
+    for key, value in obj.items():
+        norm = key.strip().lower()
+        target = canonical.get(norm)
+        if target is None:
+            continue
+        if target == "tl_dr" and isinstance(value, str):
+            result[target] = value
+        elif target in {"topics", "questions_open", "risks"}:
+            if isinstance(value, str) and value.strip():
+                result[target] = [value.strip()]
+            elif isinstance(value, list):
+                result[target] = [str(item) for item in value]
+            else:
+                result[target] = []
+        elif target == "decisions":
+            items = value if isinstance(value, list) else [value]
+            result[target] = [
+                fixed
+                for fixed in (fix_item(item, ("formulation", "timecode")) for item in items)
+                if fixed is not None
+            ]
+        elif target == "action_items":
+            items = value if isinstance(value, list) else [value]
+            result[target] = [
+                fixed
+                for fixed in (
+                    fix_item(item, ("owner", "deadline", "formulation", "timecode"))
+                    for item in items
+                )
+                if fixed is not None
+            ]
+        elif target == "quotes":
+            items = value if isinstance(value, list) else [value]
+            result[target] = [
+                fixed
+                for fixed in (
+                    fix_item(item, ("quote", "timecode", "speaker")) for item in items
+                )
+                if fixed is not None
+            ]
+    # Все ключи схемы должны присутствовать (пусть и пустыми).
+    for key in ("tl_dr", "topics", "decisions", "action_items", "questions_open", "risks", "quotes"):
+        result.setdefault(key, [] if key != "tl_dr" else "")
+    return result
 
 
 def _parse_json_strict(text: str) -> dict[str, Any]:
@@ -250,14 +427,24 @@ class LlamaCppProvider(LLMProvider):
                 "error": str(exc),
             }
 
-    def _chat(self, messages: list[dict[str, str]], *, temperature: float = 0.2) -> str:
+    def _chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.2,
+        response_format: dict[str, Any] | None = None,
+    ) -> str:
         self._ensure_running()
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
             "stream": False,
         }
+        if response_format is not None:
+            # llama-server converts a JSON schema into a GBNF grammar: the
+            # output is guaranteed to be valid JSON of this shape.
+            payload["response_format"] = response_format
         resp = self._client.post("/v1/chat/completions", json=payload, timeout=LLAMA_SERVER_REQUEST_TIMEOUT_S)
         if resp.status_code != 200:
             raise LLMError(f"llama-server вернул HTTP {resp.status_code}: {resp.text[:500]}")
@@ -270,8 +457,18 @@ class LlamaCppProvider(LLMProvider):
         content = self._chat(
             _summary_messages(text, instructions=instructions),
             temperature=0.2,
+            response_format=_summary_response_format(),
         )
-        return _parse_json_strict(content)
+        try:
+            parsed = _parse_json_strict(content)
+        except json.JSONDecodeError as exc:
+            # Грамматика делает это практически невозможным; остаётся на случай
+            # несовместимого llama-server (без поддержки json_schema).
+            raise LLMError(
+                "модель вернула невалидный JSON: "
+                f"{exc}; начало ответа: {content[:200]!r}"
+            ) from exc
+        return _normalize_summary(parsed)
 
     def ask(self, question: str, *, context: str, language: str = "ru") -> str:
         system = (
@@ -331,22 +528,80 @@ class ExternalProvider(LLMProvider):
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    def _chat(self, messages: list[dict[str, str]], *, temperature: float = 0.2) -> str:
-        payload = {"model": self.model, "messages": messages, "temperature": temperature, "stream": False}
+    def _chat(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.2,
+        response_format: dict[str, Any] | None = None,
+    ) -> str:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": False,
+        }
+        if response_format is not None:
+            # Не все OpenAI-совместимые серверы поддерживают json_schema;
+            # невалидный JSON у внешних провайдеров ловит retry ниже.
+            payload["response_format"] = response_format
         resp = self._client.post("/v1/chat/completions", json=payload, headers=self._headers())
         if resp.status_code != 200:
-            raise LLMError(f"внешний LLM вернул HTTP {resp.status_code}: {resp.text[:500]}")
+            # Некоторые серверы (старые ollama) не знают response_format —
+            # повторяем без ограничения, парсинг подстрахует нормализация.
+            if response_format is not None and resp.status_code in {400, 404, 422}:
+                log.warning(
+                    "провайдер не принял response_format (HTTP %s); повтор без него",
+                    resp.status_code,
+                )
+                payload.pop("response_format")
+                resp = self._client.post(
+                    "/v1/chat/completions", json=payload, headers=self._headers()
+                )
+                if resp.status_code != 200:
+                    raise LLMError(f"внешний LLM вернул HTTP {resp.status_code}: {resp.text[:500]}")
+            else:
+                raise LLMError(f"внешний LLM вернул HTTP {resp.status_code}: {resp.text[:500]}")
         data = resp.json()
         return data["choices"][0]["message"]["content"]
 
     def summarize(
         self, text: str, *, language: str = "ru", instructions: str = ""
     ) -> dict[str, Any]:
+        messages = _summary_messages(text, instructions=instructions)
         content = self._chat(
-            _summary_messages(text, instructions=instructions),
+            messages,
             temperature=0.2,
+            response_format=_summary_response_format(),
         )
-        return _parse_json_strict(content)
+        try:
+            parsed = _parse_json_strict(content)
+        except json.JSONDecodeError as exc:
+            # Модели без грамматического ограничения иногда ломают JSON
+            # (T-lite/Qwen3: "time  code", обрыв на середине).  Одна попытка
+            # с явной поправкой почти всегда даёт валидный ответ.
+            log.warning("invalid JSON from LLM (%s); retrying with correction", exc)
+            retry_messages = [
+                *messages,
+                {"role": "assistant", "content": content[:2000]},
+                {
+                    "role": "user",
+                    "content": (
+                        "Твой предыдущий ответ не является валидным JSON "
+                        f"({exc}). Верни ответ заново: только JSON, точно по "
+                        "схеме, без markdown и пояснений."
+                    ),
+                },
+            ]
+            retry_content = self._chat(retry_messages, temperature=0.2)
+            try:
+                parsed = _parse_json_strict(retry_content)
+            except json.JSONDecodeError as retry_exc:
+                raise LLMError(
+                    "модель вернула невалидный JSON дважды: "
+                    f"{retry_exc}; начало ответа: {retry_content[:200]!r}"
+                ) from retry_exc
+        return _normalize_summary(parsed)
 
     def ask(self, question: str, *, context: str, language: str = "ru") -> str:
         system = (

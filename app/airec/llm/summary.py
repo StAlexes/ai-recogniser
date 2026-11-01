@@ -17,7 +17,7 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from airec.llm.providers import SUMMARY_SCHEMA, LLMProvider
+from airec.llm.providers import SUMMARY_SCHEMA, LLMError, LLMProvider
 
 log = logging.getLogger(__name__)
 
@@ -110,9 +110,17 @@ class Summarizer:
         total = len(blocks)
         for index, block in enumerate(blocks):
             notify(0.1 + 0.7 * (index / max(total, 1)), f"Фрагмент {index + 1} из {total}")
-            summary = self.provider.summarize(
-                block, language=language, instructions=self.instructions
-            )
+            try:
+                summary = self.provider.summarize(
+                    block, language=language, instructions=self.instructions
+                )
+            except LLMError as exc:
+                # Сбой одного фрагмента не должен ронять всю стадию: на map-
+                # шаге провайдеру нужен лишь связный текст резюме.  Грамматика
+                # llama-server практически исключает такой сценарий; запасной
+                # путь спасает внешних провайдеров без response_format.
+                log.warning("map block %d failed (%s); using raw text", index, exc)
+                summary = {"tl_dr": block[:1200]}
             # LlamaCppProvider.summarize returns a dict; flatten to text.
             block_text = summary.get("tl_dr", "") if isinstance(summary, dict) else str(summary)
             block_summaries.append(block_text)
