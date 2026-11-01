@@ -556,6 +556,12 @@ class LlamaCppProvider(LLMProvider):
             payload["response_format"] = response_format
         resp = self._client.post("/v1/chat/completions", json=payload, timeout=LLAMA_SERVER_REQUEST_TIMEOUT_S)
         if resp.status_code != 200:
+            if resp.status_code == 400 and "exceed_context_size" in resp.text:
+                raise LLMError(
+                    "Промпт саммаризации не влез в контекст модели. "
+                    "Увеличьте «Размер контекста» в настройках саммари "
+                    f"(сейчас {self.ctx_size}) — например до {self.ctx_size * 2}."
+                )
             raise LLMError(f"llama-server вернул HTTP {resp.status_code}: {resp.text[:500]}")
         data = resp.json()
         return data["choices"][0]["message"]["content"]

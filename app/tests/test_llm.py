@@ -20,7 +20,7 @@ from airec.llm.providers import (
     _summary_messages,
     _summary_response_format,
 )
-from airec.llm.summary import Summarizer
+from airec.llm.summary import MAX_BLOCK_CHARS, Summarizer, _split_into_blocks
 
 
 def test_summary_runner_uses_custom_llama_server_without_download(
@@ -570,6 +570,134 @@ class TestMapPhaseSalvage:
         assert "tl_dr" in result
         # Текст упавшего фрагмента дошёл до reduce сырым текстом (fallback).
         assert any("Предложение номер" in call for call in calls)
+
+
+# -------------------------------------------------------------------------- #
+# Бюджет контекста: сплит, иерархический reduce, salvage
+# -------------------------------------------------------------------------- #
+class TestContextBudget:
+    def test_split_respects_reduced_budget(self) -> None:
+        # При меньшем бюджете сплит даёт больше блоков, каждый — в бюджете.
+        text = ". ".join(f"Предложение номер {i} про проект" for i in range(400))
+        default = _split_into_blocks(text, max_chars=MAX_BLOCK_CHARS)
+        tight = _split_into_blocks(text, max_chars=1500)
+        assert len(tight) > len(default)
+        assert all(len(block) <= 1500 for block in tight)
+
+    def test_custom_prompt_shrinks_block_budget(self) -> None:
+        # Длинная инструкция вшивается в каждый map-промпт: блоки должны
+        # стать мельче, иначе промпт не влезает в контекст (баг 0.4.6).
+        class _CaptureProvider(_FakeProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.map_texts: list[str] = []
+
+            def summarize(
+                self,
+                text: str,
+                *,
+                language: str = "ru",
+                instructions: str = "",
+                freeform: bool | None = None,
+            ) -> dict[str, object]:
+                self.calls.append(
+                    _summary_messages(text, instructions=instructions, freeform=freeform)
+                )
+                if "Фрагмент" in text:
+                    self.map_texts.append(text)
+                return super().summarize(
+                    text, language=language, instructions=instructions, freeform=freeform
+                )
+
+        provider = _CaptureProvider()
+        long_instructions = "Инструкция. " * 90  # ~990 символов, как у пользователя
+        summarizer = Summarizer(provider, instructions=long_instructions)
+        text = ". ".join(f"Предложение номер {i} map-текст про проект" for i in range(400))
+        summarizer.summarize(text, ctx_size=4096)
+        assert provider.map_texts
+        # Инвариант фикса: целый map-промпт (инструкция + блок) влезает в
+        # символьный бюджет контекста.  До фикса блоки были до 6000 символов
+        # независимо от длины инструкции и ctx.
+        from airec.llm.summary import _chars_budget, _map_scaffold_len
+
+        budget = _chars_budget(4096)
+        for map_text in provider.map_texts:
+            assert len(map_text) <= budget, len(map_text)
+        # И при этом блоки реально мельчали: карта бюджета сработала.
+        assert _map_scaffold_len(long_instructions) > 1000
+
+    def test_reduce_overflows_into_intermediate_merges(self) -> None:
+        # 4 «протокола» фрагментов не влезают в reduce при ctx 4096:
+        # слияние идёт группами, финальный вызов получает короткий список.
+        class _SizedProvider(_FakeProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.reduce_calls: list[str] = []
+
+            def summarize(
+                self,
+                text: str,
+                *,
+                language: str = "ru",
+                instructions: str = "",
+                freeform: bool | None = None,
+            ) -> dict[str, object]:
+                if text.startswith("Ниже результаты"):
+                    self.reduce_calls.append(text)
+                return super().summarize(
+                    text, language=language, instructions=instructions, freeform=freeform
+                )
+
+        provider = _SizedProvider()
+        summarizer = Summarizer(provider, instructions="Протокол. " * 100)
+        long_summary = "Пункт протокола. " * 120  # ~2200 символов
+        result = summarizer._reduce(
+            [long_summary] * 4, language="ru", custom=True, ctx_size=4096
+        )
+        assert "tl_dr" in result
+        # Был хотя бы один промежуточный merge, финальный промпт — в бюджете.
+        assert len(provider.reduce_calls) >= 2
+
+    def test_final_reduce_failure_salvages_drafts(self) -> None:
+        # Финальный reduce упал — стадия всё равно возвращает черновики.
+        class _FailingReduceProvider(_FakeProvider):
+            def summarize(
+                self,
+                text: str,
+                *,
+                language: str = "ru",
+                instructions: str = "",
+                freeform: bool | None = None,
+            ) -> dict[str, object]:
+                if text.startswith("Ниже результаты"):
+                    raise LLMError("HTTP 400: exceed_context_size_error")
+                return super().summarize(
+                    text, language=language, instructions=instructions, freeform=freeform
+                )
+
+        summarizer = Summarizer(_FailingReduceProvider(), instructions="Инструкция.")
+        result = summarizer._reduce(
+            ["Резюме один.", "Резюме два."], language="ru", custom=True, ctx_size=4096
+        )
+        assert result["custom"] is True
+        assert "Резюме один." in result["tl_dr"]
+
+    def test_single_block_failure_still_raises(self) -> None:
+        # Без map-работ salvage не имеет смысла: ошибка поднимается дальше.
+        class _AlwaysFails(_FakeProvider):
+            def summarize(
+                self,
+                text: str,
+                *,
+                language: str = "ru",
+                instructions: str = "",
+                freeform: bool | None = None,
+            ) -> dict[str, object]:
+                raise LLMError("boom")
+
+        summarizer = Summarizer(_AlwaysFails())
+        with pytest.raises(LLMError):
+            summarizer._reduce(["Один."], language="ru", custom=False, ctx_size=4096)
 
 
 # -------------------------------------------------------------------------- #

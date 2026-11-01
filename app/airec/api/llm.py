@@ -157,7 +157,9 @@ def _summarize_text(
     glossary = getattr(app.state, "llm_glossary", None)
     if not isinstance(glossary, Glossary):
         glossary = Glossary.from_dicts([])
-    return summarizer.summarize(glossary.apply(text), progress=progress)
+    return summarizer.summarize(
+        glossary.apply(text), progress=progress, ctx_size=settings.llm_ctx_size
+    )
 
 
 def make_summary_runner(app: Any) -> Any:
