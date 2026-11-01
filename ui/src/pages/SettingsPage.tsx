@@ -894,7 +894,6 @@ export function SettingsPage({
                   <Button
                     className="settings-prompt-open"
                     icon={<EditRegular />}
-                    disabled={!settings.summarize_enabled}
                     onClick={() => {
                       setPromptDraft(settings.summary_prompt);
                       setPromptEditorOpen(true);
