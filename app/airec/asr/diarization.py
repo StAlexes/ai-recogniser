@@ -23,6 +23,7 @@ without a speaker label, but recognition keeps working.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import re
 import threading
@@ -69,6 +70,10 @@ MIN_SLOT_SPEECH_S = 2.0
 # faster but pad every clip to the longest one, so keep it modest.
 EMBED_BATCH = 8
 MIN_CLIP_SAMPLES = 400  # 25 ms at 16 kHz
+# Длинные клипы для эмбеддинга нарезаются на окна этого размера (с шагом в
+# половину окна) и вектор сегмента — среднее по окнам: цельный эмбеддинг
+# многоспикерного куска «размазывается» и путает кластеризацию.
+EMBED_WINDOW_S = 3.0
 
 _se: Any | None = None
 _se_key: tuple[str, str, int] | None = None
@@ -329,6 +334,33 @@ def _regions_from_mask(
     return [(s, e) for s, e in regions if e - s >= min_duration_on]
 
 
+def _find_best_speaker_permutation(
+    prev_probs: np.ndarray,
+    curr_probs: np.ndarray,
+) -> tuple[int, ...]:
+    """Optimal permutation of the current window's speaker channels.
+
+    *prev_probs*, *curr_probs* — матрицы (3, N_samples) на участке
+    перекрытия скользящих окон.  Выходные каналы pyannote локальны для
+    каждого окна (PIT-обучение): канал 1 первого окна может быть каналом 2
+    следующего, поэтому перед аккумуляцией каналы надо «выровнять» по
+    предыдущему окну.  Для K=3 всего 3! = 6 перестановок — чистый NumPy
+    считает мгновенно, без тяжёлой зависимости SciPy.
+    """
+    dot_matrix = np.matmul(prev_probs, curr_probs.T)  # shape (3, 3)
+    best_perm = (0, 1, 2)
+    best_score = -float("inf")
+    for perm in itertools.permutations(range(3)):
+        # perm[i] — канал текущего окна, соответствующий каналу i прошлого.
+        score = sum(
+            float(dot_matrix[i, perm[i]]) for i in range(len(perm))
+        )
+        if score > best_score:
+            best_score = score
+            best_perm = perm
+    return best_perm
+
+
 def _pyannote_speaker_regions(
     session: Any,
     audio: np.ndarray,
@@ -385,7 +417,11 @@ def _pyannote_speaker_regions(
     num_speakers = 3
     probs = [np.zeros(total, dtype=np.float32) for _ in range(num_speakers)]
     counts = [np.zeros(total, dtype=np.float32) for _ in range(num_speakers)]
-    frame_stride = 270  # ~589 frames per 10 s window
+    # Состояние выравнивания каналов: аккумуляторы *probs/counts* живут в
+    # «глобальных» слотах, к которым привязано предыдущее окно.  Первое окно
+    # задаёт базовую перестановку (identity).
+    prev_window_probs: np.ndarray | None = None  # в глобальных слотах
+    prev_start = 0
 
     def process(window: np.ndarray) -> np.ndarray:
         # ONNX input shape: (batch_size, num_channels, num_samples).
@@ -411,17 +447,37 @@ def _pyannote_speaker_regions(
         # frames than the 270-sample stride implies.
         frame_samples = window_size / frames
 
+        # Матрица вероятностей текущего окна (3, window_size) — каналы сети
+        # (локальные, анонимные до сопоставления с прошлым окном).
+        curr_win_probs = np.zeros((num_speakers, window_size), dtype=np.float32)
         for frame in range(frames):
-            begin = start + int(frame * frame_samples)
-            end = min(start + int((frame + 1) * frame_samples), total)
-            if begin >= total:
-                break
-            if end <= begin:
-                end = min(begin + frame_stride, total)
-            for spk in range(num_speakers):
-                value = float(merged[frame, spk + 1])
-                probs[spk][begin:end] += value
-                counts[spk][begin:end] += 1.0
+            b = int(frame * frame_samples)
+            e = min(int((frame + 1) * frame_samples), window_size)
+            if e <= b:
+                continue
+            for local_spk in range(num_speakers):
+                curr_win_probs[local_spk, b:e] = float(merged[frame, local_spk + 1])
+
+        # PIT-выравнивание: каналы текущего окна сопоставляются с каналами
+        # предыдущего на участке перекрытия.  Без этого голоса участников
+        # перемешиваются на каждом шаге скользящего окна.
+        if prev_window_probs is not None:
+            overlap_end = min(prev_start + window_size, start + window_size, total)
+            if overlap_end > start:
+                slice_prev = prev_window_probs[:, start - prev_start : overlap_end - prev_start]
+                slice_curr = curr_win_probs[:, 0 : overlap_end - start]
+                perm = _find_best_speaker_permutation(slice_prev, slice_curr)
+                # perm[i] — локальный канал сети для глобального слота i.
+                curr_win_probs = curr_win_probs[list(perm), :]
+
+        # Аккумулируем выровненные вероятности в глобальные слоты.
+        actual_len = min(window_size, total - start)
+        for spk in range(num_speakers):
+            probs[spk][start : start + actual_len] += curr_win_probs[spk, :actual_len]
+            counts[spk][start : start + actual_len] += 1.0
+
+        prev_window_probs = curr_win_probs
+        prev_start = start
         if progress is not None:
             progress(
                 0.55 * min((index + 1) / len(starts), 1.0),
@@ -514,6 +570,62 @@ def _embed(
                 f"Эмбеддинги спикеров: {offset + len(batch)} из {len(usable)}",
             )
     return np.vstack(embeddings)
+
+
+def _embed_averaged(
+    se: Any,
+    clips: list[np.ndarray],
+    *,
+    sample_rate: int,
+    cancel: Callable[[], None] | None = None,
+    progress: Callable[[float, str], None] | None = None,
+) -> np.ndarray:
+    """Embeddings for possibly multi-speaker clips: mean of sub-window vectors.
+
+    VAD-сегмент длиннее окна нередко содержит несколько реплик; один
+    эмбеддинг такого куска «размазывается» между голосами и уводит
+    кластеризацию.  Клип нарезается на окна по :data:`EMBED_WINDOW_S`
+    (шаг — половина окна), каждый эмбеддится отдельно, вектор сегмента —
+    среднее по окнам: доминирующий голос определяет направление, короткие
+    вкрапления другого спикера лишь слегка смещают среднее.  Возвращается
+    (N, dim) — по одному вектору на входной клип.
+    """
+    window = max(1, int(EMBED_WINDOW_S * sample_rate))
+    step = max(1, window // 2)
+    sub_clips: list[np.ndarray] = []
+    spans: list[tuple[int, int]] = []  # (первое окно, последнее+1) для клипа
+    for clip in clips:
+        if clip.size <= window:
+            sub_clips.append(clip)
+            spans.append((len(sub_clips) - 1, len(sub_clips)))
+            continue
+        first = len(sub_clips)
+        for offset in range(0, max(1, clip.size - window + 1), step):
+            piece = clip[offset : offset + window]
+            if piece.size < MIN_CLIP_SAMPLES:
+                piece = np.pad(piece, (0, MIN_CLIP_SAMPLES - piece.size))
+            sub_clips.append(piece.astype(np.float32, copy=False))
+        last = len(sub_clips)
+        # Хвост, не покрытый последним окном (меньше окна).
+        tail_start = (len(range(0, max(1, clip.size - window + 1), step)) - 1) * step + window
+        if tail_start < clip.size:
+            piece = clip[tail_start:]
+            if piece.size < MIN_CLIP_SAMPLES:
+                piece = np.pad(piece, (0, MIN_CLIP_SAMPLES - piece.size))
+            sub_clips.append(piece.astype(np.float32, copy=False))
+            last = len(sub_clips)
+        spans.append((first, max(first + 1, last)))
+
+    if not sub_clips:
+        return np.zeros((0, 1), dtype=np.float32)
+
+    window_embeddings = _embed(se, sub_clips, cancel=cancel, progress=progress)
+
+    averaged: list[np.ndarray] = []
+    for first, last in spans:
+        vectors = window_embeddings[first:last]
+        averaged.append(vectors.mean(axis=0))
+    return np.vstack(averaged)
 
 
 def diarize_segments(
@@ -779,8 +891,9 @@ def _split_at_speaker_turns(
     useless fragment.  Every remaining change of speaker starts a new piece
     with its own decoded text.  Segments without tokens are unchanged.
 
-    *vote_delay_s* — компенсация задержки CTC-пика GigaAM: точка голосования
-    слова сдвигается вперёд на это значение (пик регистрируется позже фонемы).
+    *vote_delay_s* — компенсация задержки CTC-пика GigaAM: пик регистрируется
+    позже фонемы (t_token = t_audio + Δt), поэтому точка голосования слова
+    сдвигается **назад** на это значение (t_audio = t_token − Δt).
     *boundary_margin_s* — токен, попавший в зазор между регионами спикеров,
     привязывается к ближайшему краю, если тот не дальше допуска.
     """
@@ -819,12 +932,16 @@ def _split_at_speaker_turns(
             return best_label
 
         # One vote per token ("" = no region covers it), grouped into words.
-        # The vote point is the token midpoint shifted forward by the CTC
-        # peak delay (the acoustic model registers a phoneme after it is
-        # spoken), clamped so it never leaves the segment.
+        # The vote point is the token midpoint pulled *back* by the CTC peak
+        # delay: the acoustic model registers a phoneme after it is spoken
+        # (t_token = t_audio + delay), so t_audio = t_token − delay.  Clamped
+        # so it never leaves the segment.
         labels = [
             label_at(
-                min(_token_midpoint(times, index, end) + vote_delay_s, end),
+                max(
+                    start,
+                    min(_token_midpoint(times, index, end) - vote_delay_s, end),
+                ),
                 "",
             )
             for index in range(len(tokens))
@@ -983,7 +1100,9 @@ def _diarize_with_embeddings(
         progress(0.0, "Загрузка модели спикеров")
     se = load_se(cpu_threads, model_path=model_path, repo_id=repo_id)
     try:
-        embeddings = _embed(se, clips, cancel=cancel, progress=progress)
+        embeddings = _embed_averaged(
+            se, clips, sample_rate=sample_rate, cancel=cancel, progress=progress
+        )
     except DiarizationCancelled:
         raise
     except Exception as exc:  # onnx runtime/preprocessor failure

@@ -349,3 +349,107 @@ def test_manifest_includes_pyannote() -> None:
     assert entry["repo"] == diarization.PYANNOTE_REPO
     assert entry["filename"] == "model.onnx"
     assert entry["size_bytes"] > 0
+
+
+# -------------------------------------------------------------------------- #
+# PIT-выравнивание каналов pyannote между окнами
+# -------------------------------------------------------------------------- #
+class PermutedPyannoteSession:
+    """Fake pyannote: real voice A stays in «its» class across windows.
+
+    Сеть с PIT-обучением возвращает анонимные каналы: в чётных окнах голос A
+    попадает в класс 1, в нечётных — в класс 2 (классы локальны для окна).
+    Наивная аккумуляция суммировала бы голос A то в слот 1, то в слот 2 и
+    после усреднения давала бы «винегрет»; выравнивание обязано собрать
+    голос A целиком в один слот.
+    """
+
+    def __init__(self, window_samples: int, advance_samples: int) -> None:
+        self._window_samples = window_samples
+        self._advance_samples = advance_samples
+        self._calls = 0
+
+    def run(self, _outputs: object, feeds: object) -> list[np.ndarray]:
+        window = np.asarray(feeds["input_values"], dtype=np.float32)
+        assert window.ndim == 3
+        # 10 frames per window; frame length covers the whole window.
+        frames = 10
+        logits = np.full((1, frames, 7), -10.0, dtype=np.float32)
+        # Голос A звучит во всём окне; его канал чередуется 1 -> 2 -> 1 ...
+        channel = 1 if self._calls % 2 == 0 else 2
+        logits[:, :, channel] = 0.0
+        self._calls += 1
+        return [logits]
+
+
+def test_pyannote_permutation_keeps_single_speaker_stable(monkeypatch) -> None:
+    """Каналы, меняющиеся между окнами, собираются в один слот (PIT-фикс)."""
+    sample_rate = 16_000
+    session = PermutedPyannoteSession(
+        round(diarization.PYANNOTE_WINDOW_DURATION_S * sample_rate),
+        round(diarization.PYANNOTE_WINDOW_STEP_S * sample_rate),
+    )
+    monkeypatch.setattr(
+        diarization, "load_pyannote", lambda *_args, **_kwargs: session
+    )
+
+    # 30 s: пять окон с шагом 5 s — четыре сопоставления каналов.
+    audio = np.zeros(int(30.0 * sample_rate), dtype=np.float32)
+
+    regions = diarization._pyannote_speaker_regions(session, audio, sample_rate)
+
+    # Один реальный голос — одна метка во всех регионах.  До фикса голос
+    # чередовал слоты 1/2/1/2..., каждый слот набирал > MIN_SLOT_SPEECH_S
+    # речи и появлялись две метки.
+    labels = {label for label, _start, _end in regions}
+    assert labels == {"Спикер 1"}
+
+
+def test_find_best_speaker_permutation_identity_for_equal_channels() -> None:
+    """Идентичные каналы не переставляются (нулевой случай)."""
+    prev = np.array([[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]], dtype=np.float32)
+    curr = prev.copy()
+    assert diarization._find_best_speaker_permutation(prev, curr) == (0, 1, 2)
+
+
+def test_find_best_speaker_permutation_swaps_channels() -> None:
+    """Каналы, поменяные местами, восстанавливаются перестановкой."""
+    prev = np.array(
+        [[1.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]], dtype=np.float32
+    )
+    curr = prev[[1, 0, 2], :]  # голоса поменяны местами
+    perm = diarization._find_best_speaker_permutation(prev, curr)
+    # perm[i] — канал curr, соответствующий каналу i prev: голос 0 -> канал 1.
+    assert perm == (1, 0, 2)
+
+
+# -------------------------------------------------------------------------- #
+# Задержка CTC: знак компенсации
+# -------------------------------------------------------------------------- #
+def test_split_at_speaker_turns_subtracts_ctc_delay() -> None:
+    """Точка голосования сдвигается НАЗАД (t_audio = t_token − Δt).
+
+    Слово «да» стоит у границы спикеров (2.0 с): середина токена 2.025 с,
+    после вычитания задержки 0.1 — 1.925 с, регион Спикера 1.  Старый
+    (ошибочный) знак давал 2.125 с — слово перепрыгивало Спикеру 2.
+    """
+    regions = [
+        ("Спикер 1", 0.0, 2.0),
+        ("Спикер 2", 2.0, 4.0),
+    ]
+    segment = {
+        "start_s": 0.0,
+        "end_s": 3.0,
+        "text": "да нет",
+        "tokens": ["да", " нет"],
+        "token_times": [1.9, 2.15],
+    }
+
+    result = diarization._split_at_speaker_turns(
+        [dict(segment)], regions, vote_delay_s=0.1
+    )
+
+    assert len(result) == 2
+    assert result[0]["speaker"] == "Спикер 1"
+    assert result[0]["text"] == "да"
+    assert result[1]["speaker"] == "Спикер 2"
