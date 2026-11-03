@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import {
   Badge,
@@ -11,7 +11,8 @@ import {
   ProgressBar,
   Spinner,
   Textarea,
-} from '@fluentui/react-components';import {
+} from '@fluentui/react-components';
+import {
   ArrowClockwiseRegular,
   ArrowLeftRegular,
   CopyRegular,
@@ -21,7 +22,6 @@ import {
   HistoryRegular,
   PlayRegular,
   SaveRegular,
-  SparkleRegular,
   StopRegular,
 } from '@fluentui/react-icons';
 import {
@@ -54,6 +54,7 @@ import {
   isActive,
   jobElapsedSeconds,
   STAGE_LABELS,
+  stageElapsedSeconds,
   stageStatusText,
   statusColor,
   statusLabel,
@@ -160,6 +161,7 @@ function StageControl({
   stage,
   canStart,
   busy,
+  now,
   onAction,
   children,
 }: {
@@ -167,6 +169,7 @@ function StageControl({
   stage: JobDetail['stages'][StageKey];
   canStart: boolean;
   busy: boolean;
+  now: number;
   onAction: (action: StageAction) => void;
   children?: ReactNode;
 }) {
@@ -190,6 +193,9 @@ function StageControl({
     label = 'Запустить';
   }
   const disabled = busy || (action !== 'stop' && !canStart);
+  // Живой счётчик: пока этап выполняется, время растёт от started_at; для
+  // завершённых показываем сохранённое elapsed_s.
+  const elapsed = stageElapsedSeconds(stage, now);
   return (
     <div className="job-stage-control" data-status={stage.status}>
       <div className="job-stage-control-head">
@@ -203,9 +209,7 @@ function StageControl({
       />
       <span className="job-stage-control-phase" title={stage.phase}>
         {stage.phase || 'Ожидает'}
-        {stage.status === 'done' && stage.elapsed_s !== null && Number.isFinite(stage.elapsed_s)
-          ? ` · ${formatDuration(stage.elapsed_s)}`
-          : ''}
+        {elapsed !== null ? ` · ${formatDuration(elapsed)}` : ''}
       </span>
       {children}
       <div className="job-stage-control-actions">
@@ -225,8 +229,31 @@ function StageControl({
 
 export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
   const [job, setJob] = useState<JobDetail | null>(null);
+  // Единая верхняя плашка: и сообщения, и ошибки.  Всё, что раньше показывалось
+  // плашкой внизу страницы, выводится здесь.
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Чем можно ответить на ошибку прямо из верхней плашки: перезапустить
+  // упавший этап или повторить задачу целиком.
+  const [errorRetry, setErrorRetry] = useState<
+    { kind: 'job' } | { kind: 'stage'; stage: StageKey } | null
+  >(null);
+  // Ошибка обработчика действия: показывается в верхней плашке без кнопки
+  // повтора (само действие пользователь может вызвать снова вручную).
+  const showError = useCallback((message: string): void => {
+    setErrorRetry(null);
+    setError(message);
+  }, []);
+  // Ошибка этапа: рядом с текстом предлагаем перезапуск этого этапа.
+  const showStageError = useCallback((stage: StageKey, message: string): void => {
+    setErrorRetry({ kind: 'stage', stage });
+    setError(message);
+  }, []);
+  // Ошибка задачи целиком (например, сбой распознавания): предлагаем «Повторить».
+  const showJobError = useCallback((message: string): void => {
+    setErrorRetry({ kind: 'job' });
+    setError(message);
+  }, []);
   const [saving, setSaving] = useState(false);
   const [stageBusy, setStageBusy] = useState<StageKey | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -240,6 +267,9 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
   // a manual pick makes the selection sticky for this visit.
   const [view, setView] = useState<ResultView | null>(null);
   const [viewPicked, setViewPicked] = useState(false);
+  // Какие ошибки этапов уже показаны верхним уведомлением — чтобы опрос не
+  // дублировал одну и ту же плашку каждые пару секунд.
+  const announcedStages = useRef(new Set<string>());
 
   const loadJob = useCallback(
     async (silent = false): Promise<void> => {
@@ -255,21 +285,23 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
           return;
         }
         if (!silent) {
-          setError(describeError(reason));
+          showError(describeError(reason));
         }
       }
     },
-    [jobId, onAuthError],
+    [jobId, onAuthError, showError],
   );
 
   useEffect(() => {
     setJob(null);
     setError(null);
+    setErrorRetry(null);
     setNotice(null);
     setStageBusy(null);
     setView(null);
     setViewPicked(false);
     setProfileDraft(null);
+    announcedStages.current = new Set();
     void loadJob();
   }, [jobId]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -328,6 +360,71 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
       window.clearInterval(timer);
     };
   }, [active, loadJob]);
+
+  // Фоновые ошибки приходят только с опросом — их не ловит ни один обработчик
+  // клика.  Показываем их в верхней плашке один раз на ошибку, чтобы опрос
+  // каждые 1.2 с не заваливал экран одинаковыми сообщениями.
+  useEffect(() => {
+    if (job === null) {
+      return;
+    }
+    // Забываем прошлые ошибки, когда состояние ушло из «ошибочного»: если
+    // задача/этап упадёт снова (например, после «Повторить»), плашка вернётся.
+    if (job.status !== 'error' && job.status !== 'cancelled') {
+      for (const key of announcedStages.current) {
+        if (key.startsWith('job:')) {
+          announcedStages.current.delete(key);
+        }
+      }
+    }
+    for (const [name, stage] of Object.entries(job.stages ?? {})) {
+      if (stage.status === 'error') {
+        continue;
+      }
+      for (const key of announcedStages.current) {
+        if (key.startsWith(`${name}:`)) {
+          announcedStages.current.delete(key);
+        }
+      }
+    }
+
+    if (job.status === 'error') {
+      const message = (job.error ?? 'Не удалось распознать файл.').trim();
+      const key = `job:${message}`;
+      if (!announcedStages.current.has(key)) {
+        announcedStages.current.add(key);
+        showJobError(message);
+      }
+      return;
+    }
+
+    if (job.status === 'cancelled') {
+      if (!announcedStages.current.has('job:cancelled')) {
+        announcedStages.current.add('job:cancelled');
+        setNotice('Задача отменена.');
+      }
+      return;
+    }
+
+    for (const [name, stage] of Object.entries(job.stages ?? {})) {
+      if (stage.status !== 'error') {
+        continue;
+      }
+      const key = `${name}:${stage.phase}`;
+      if (announcedStages.current.has(key)) {
+        continue;
+      }
+      announcedStages.current.add(key);
+      const label = STAGE_LABELS[name as StageKey] ?? name;
+      const detail = stage.phase.trim();
+      showStageError(
+        name as StageKey,
+        detail === '' || detail === 'Ошибка'
+          ? `Этап «${label}» завершился с ошибкой.`
+          : `${label}: ${detail}`,
+      );
+    }
+  }, [job, showJobError, showStageError]);
 
   const recognitionText = job !== null ? (job.text_plain ?? job.text ?? '').trim() : '';
   const speakersText = (job?.text_speakers ?? '').trim();
@@ -389,7 +486,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
       const bridgeResult = await openResultFolder(job.id);
       if (bridgeResult !== null) {
         if (!bridgeResult.ok) {
-          setError(bridgeResult.error ?? 'Не удалось открыть папку результата.');
+          showError(bridgeResult.error ?? 'Не удалось открыть папку результата.');
         }
         return;
       }
@@ -399,7 +496,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
         onAuthError();
         return;
       }
-      setError(describeError(reason));
+      showError(describeError(reason));
     }
   };
 
@@ -412,7 +509,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
       const bridgeResult = await revealSourceFile(job.id);
       if (bridgeResult !== null) {
         if (!bridgeResult.ok) {
-          setError(bridgeResult.error ?? 'Не удалось открыть расположение файла.');
+          showError(bridgeResult.error ?? 'Не удалось открыть расположение файла.');
         }
         return;
       }
@@ -423,7 +520,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
         onAuthError();
         return;
       }
-      setError(describeError(reason));
+      showError(describeError(reason));
     }
   };
 
@@ -435,7 +532,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
       await navigator.clipboard.writeText(viewText);
       setNotice('Текст скопирован в буфер обмена.');
     } catch {
-      setError('Не удалось скопировать текст. Выделите его в поле вручную.');
+      showError('Не удалось скопировать текст. Выделите его в поле вручную.');
     }
   };
 
@@ -453,7 +550,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
           return;
         }
         if (!bridgeResult.ok) {
-          setError(bridgeResult.error ?? 'Не удалось сохранить результат.');
+          showError(bridgeResult.error ?? 'Не удалось сохранить результат.');
           return;
         }
         setNotice(`Результат сохранён: ${bridgeResult.path ?? ''}`);
@@ -473,7 +570,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
         },
       );
       if (!response.ok) {
-        setError(`Сохранение не удалось (HTTP ${response.status}).`);
+        showError(`Сохранение не удалось (HTTP ${response.status}).`);
         return;
       }
       const blob = await response.blob();
@@ -489,7 +586,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
         onAuthError();
         return;
       }
-      setError(describeError(reason));
+      showError(describeError(reason));
     } finally {
       setSaving(false);
     }
@@ -508,7 +605,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
         onAuthError();
         return;
       }
-      setError(describeError(reason));
+      showError(describeError(reason));
     }
   };
 
@@ -525,7 +622,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
         onAuthError();
         return;
       }
-      setError(describeError(reason));
+      showError(describeError(reason));
     }
   };
 
@@ -542,7 +639,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
         onAuthError();
         return;
       }
-      setError(describeError(reason));
+      showError(describeError(reason));
     }
   };
 
@@ -555,6 +652,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     }
     setStageBusy(stage);
     setError(null);
+    setErrorRetry(null);
     try {
       // Перезапуск диаризации уносит с собой выбранный на странице профиль:
       // "по настройкам" сбрасывает переопределение, группа — сохраняет его.
@@ -579,14 +677,13 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
         onAuthError();
         return;
       }
-      setError(describeError(reason));
+      showError(describeError(reason));
       await loadJob(true);
     } finally {
       setStageBusy(null);
     }
   };
 
-  const summaryStage = job?.stages?.summary;
   const recognitionDone = job?.stages?.recognition?.status === 'done';
   const canStartDiarization =
     job !== null && job.status === 'done' && recognitionDone && job.segments.length > 0;
@@ -640,7 +737,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
         onAuthError();
         return;
       }
-      setError(describeError(reason));
+      showError(describeError(reason));
     }
   };
 
@@ -681,24 +778,11 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
         }
       />
 
-      {notice !== null ? (
-        <MessageBar intent="info" className="queue-notice">
-          <MessageBarBody>{notice}</MessageBarBody>
-          <MessageBarActions
-            containerAction={
-              <Button
-                appearance="transparent"
-                icon={<DismissRegular />}
-                aria-label="Скрыть сообщение"
-                onClick={() => {
-                  setNotice(null);
-                }}
-              />
-            }
-          />
-        </MessageBar>
-      ) : null}
-
+      {/*
+        Единая верхняя плашка: и сообщения, и ошибки.  Раньше ошибки этапов
+        (например, сбой саммаризации) показывались отдельной плашкой внизу
+        страницы — теперь всё выводится здесь, рядом с заголовком.
+      */}
       {error !== null ? (
         <MessageBar intent="error" className="queue-notice">
           <MessageBarBody>{error}</MessageBarBody>
@@ -710,6 +794,46 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                 aria-label="Скрыть ошибку"
                 onClick={() => {
                   setError(null);
+                  setErrorRetry(null);
+                }}
+              />
+            }
+          >
+            {errorRetry?.kind === 'stage' ? (
+              <Button
+                appearance="subtle"
+                icon={<ArrowClockwiseRegular />}
+                disabled={stageBusy !== null}
+                onClick={() => {
+                  void handleStageAction(errorRetry.stage, 'restart');
+                }}
+              >
+                Перезапустить
+              </Button>
+            ) : errorRetry?.kind === 'job' ? (
+              <Button
+                appearance="subtle"
+                icon={<HistoryRegular />}
+                onClick={() => {
+                  void handleRetry();
+                }}
+              >
+                Повторить
+              </Button>
+            ) : null}
+          </MessageBarActions>
+        </MessageBar>
+      ) : notice !== null ? (
+        <MessageBar intent="info" className="queue-notice">
+          <MessageBarBody>{notice}</MessageBarBody>
+          <MessageBarActions
+            containerAction={
+              <Button
+                appearance="transparent"
+                icon={<DismissRegular />}
+                aria-label="Скрыть сообщение"
+                onClick={() => {
+                  setNotice(null);
                 }}
               />
             }
@@ -799,6 +923,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                 job.status !== 'done' && (!isActive(job.status) || job.paused === true)
               }
               busy={stageBusy !== null}
+              now={now}
               onAction={(action) => {
                 void handleStageAction('recognition', action);
               }}
@@ -808,6 +933,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
               stage={job.stages.diarization}
               canStart={canStartDiarization}
               busy={stageBusy !== null}
+              now={now}
               onAction={(action) => {
                 void handleStageAction('diarization', action);
               }}
@@ -817,6 +943,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
               stage={job.stages.summary}
               canStart={canStartSummary}
               busy={stageBusy !== null}
+              now={now}
               onAction={(action) => {
                 void handleStageAction('summary', action);
               }}
@@ -856,29 +983,6 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
           <ProgressBar value={job.progress} thickness="medium" />
           <span>{job.phase}</span>
         </div>
-      ) : null}
-
-      {job !== null && (job.status === 'error' || job.status === 'cancelled') ? (
-        <MessageBar intent="error" className="transcript-error">
-          <MessageBarBody>
-            {job.status === 'cancelled'
-              ? 'Задача отменена.'
-              : job.error ?? 'Не удалось распознать файл.'}
-          </MessageBarBody>
-          <MessageBarActions
-            containerAction={
-              <Button
-                appearance="subtle"
-                icon={<HistoryRegular />}
-                onClick={() => {
-                  void handleRetry();
-                }}
-              >
-                Повторить
-              </Button>
-            }
-          />
-        </MessageBar>
       ) : null}
 
       {job !== null &&
@@ -938,35 +1042,6 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
             />
           )}
         </section>
-      ) : null}
-
-      {job !== null && job.status === 'done' && job.summary === null ? (
-        summaryStage?.status === 'error' ? (
-          <section className="summary-panel surface" aria-labelledby="job-summary-state">
-            <h2 id="job-summary-state" className="summary-heading">
-              Саммари
-            </h2>
-            <MessageBar intent="warning">
-              <MessageBarBody>
-                {summaryStage.phase || 'Не удалось составить саммари.'}
-              </MessageBarBody>
-              <MessageBarActions
-                containerAction={
-                  <Button
-                    appearance="subtle"
-                    icon={<SparkleRegular />}
-                    disabled={stageBusy !== null}
-                    onClick={() => {
-                      void handleStageAction('summary', 'restart');
-                    }}
-                  >
-                    Повторить
-                  </Button>
-                }
-              />
-            </MessageBar>
-          </section>
-        ) : null
       ) : null}
     </div>
   );

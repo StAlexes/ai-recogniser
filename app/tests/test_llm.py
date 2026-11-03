@@ -4,10 +4,12 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from airec.api import llm as llm_api
 from airec.core.config import Settings
+from airec.llm import providers as providers_mod
 from airec.llm.providers import (
     DEFAULT_SUMMARY_TASK,
     SUMMARY_JSON_SCHEMA,
@@ -829,3 +831,75 @@ class TestVulkanFallbackToCpu:
         # с выбранным пользователем адаптером.
         assert provider.device == "vulkan"
         assert provider.gpu_device == "Vulkan0"
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, payload: dict[str, object] | None = None) -> None:
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = ""
+
+    def json(self) -> dict[str, object]:
+        return self._payload
+
+
+class TestLoopbackProxyImmunity:
+    """llama-server слушает 127.0.0.1, поэтому системный прокси не должен
+    вмешиваться: иначе health-проба рвёт соединение (WinError 10054) и саммари
+    падает с первого раза."""
+
+    def test_client_ignores_environment_proxy(self, tmp_path: Path) -> None:
+        provider = LlamaCppProvider(model=tmp_path / "model.gguf")
+        try:
+            assert provider._client.trust_env is False
+        finally:
+            provider._client.close()
+
+    def test_start_server_tolerates_reset_connections(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        model = tmp_path / "model.gguf"
+        model.write_bytes(b"gguf")
+        provider = LlamaCppProvider(model=model)
+        monkeypatch.setattr(provider, "_resolve_binary", lambda: "llama-server.exe")
+
+        class FakeProcess:
+            returncode = 0
+
+            def poll(self) -> None:
+                return None
+
+        monkeypatch.setattr(providers_mod.subprocess, "Popen", lambda *a, **k: FakeProcess())
+        monkeypatch.setattr(providers_mod.time, "sleep", lambda _s: None)
+
+        calls = {"n": 0}
+
+        class FakeClient:
+            def get(self, *a, **k):
+                calls["n"] += 1
+                # Первая проба — сервер уже слушает, но сбросил соединение
+                # (как делал прокси); вторая — штатный ответ 200.
+                if calls["n"] == 1:
+                    raise httpx.ReadError("connection reset by peer")
+                return _FakeResponse(200)
+
+        monkeypatch.setattr(provider, "_client", FakeClient())
+
+        # ReadError не должен пробрасываться наружу: ждём до 200.
+        provider._start_server()
+        assert calls["n"] == 2
+
+    def test_chat_reports_transport_failure_as_llm_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = LlamaCppProvider(model=tmp_path / "model.gguf")
+        monkeypatch.setattr(provider, "_ensure_running", lambda: None)
+
+        class FakeClient:
+            def post(self, *a, **k):
+                raise httpx.ReadError("connection reset")
+
+        monkeypatch.setattr(provider, "_client", FakeClient())
+
+        with pytest.raises(LLMError, match="Связь с llama-server потеряна"):
+            provider._chat([{"role": "user", "content": "привет"}])

@@ -102,12 +102,17 @@ def _stage(
     phase: str = "Ожидает",
     progress: float = 0.0,
     elapsed_s: float | None = None,
+    started_at: str | None = None,
 ) -> dict[str, Any]:
     return {
         "status": status,
         "phase": phase,
         "progress": progress,
         "elapsed_s": elapsed_s,
+        # ISO-время старта этапа: пока этап идёт, UI считает живой счётчик
+        # прошедшего времени от этого момента (elapsed_s заполняется только по
+        # завершении).
+        "started_at": started_at,
     }
 
 
@@ -507,11 +512,13 @@ class JobManager:
                 # приходят с тем же статусом и не должны его перезапускать,
                 # иначе elapsed_s измеряет лишь хвост этапа.
                 current["elapsed_s"] = None
+                current["started_at"] = utc_now()
                 self._stage_started[(job.id, stage)] = time.perf_counter()
             elif status in {STAGE_DONE, STAGE_ERROR, STAGE_SKIPPED}:
                 started = self._stage_started.pop((job.id, stage), None)
                 if started is not None and current.get("elapsed_s") is None:
                     current["elapsed_s"] = round(max(time.perf_counter() - started, 0.0), 3)
+                current["started_at"] = None
         if phase is not None:
             current["phase"] = phase
         if progress is not None:
@@ -521,6 +528,7 @@ class JobManager:
             started = self._stage_started.pop((job.id, stage), None)
             if started is not None and current.get("elapsed_s") is None:
                 current["elapsed_s"] = round(max(time.perf_counter() - started, 0.0), 3)
+            current["started_at"] = None
 
     def _update_stage(
         self,
@@ -676,16 +684,24 @@ class JobManager:
             for key in ("recognition", "diarization"):
                 stage = job.stages[key]
                 if stage["status"] == STAGE_RUNNING:
-                    stage.update(status=STAGE_ERROR, phase="Прервано", progress=1.0)
+                    stage.update(
+                        status=STAGE_ERROR, phase="Прервано", progress=1.0, started_at=None
+                    )
                     changed = True
                 elif stage["status"] == STAGE_PENDING:
                     stage.update(
-                        status=STAGE_SKIPPED, phase="Не выполнялась", progress=0.0
+                        status=STAGE_SKIPPED,
+                        phase="Не выполнялась",
+                        progress=0.0,
+                        started_at=None,
                     )
                     changed = True
             if job.stages["summary"]["status"] in {STAGE_RUNNING, STAGE_PENDING}:
                 job.stages["summary"].update(
-                    status=STAGE_SKIPPED, phase="Нет результата", progress=0.0
+                    status=STAGE_SKIPPED,
+                    phase="Нет результата",
+                    progress=0.0,
+                    started_at=None,
                 )
                 changed = True
             return changed
@@ -694,7 +710,9 @@ class JobManager:
             for key in ("recognition", "diarization"):
                 stage = job.stages[key]
                 if stage["status"] == STAGE_RUNNING:
-                    stage.update(status=STAGE_DONE, phase="Готово", progress=1.0)
+                    stage.update(
+                        status=STAGE_DONE, phase="Готово", progress=1.0, started_at=None
+                    )
                     changed = True
             summary = job.stages["summary"]
             if summary["status"] == STAGE_RUNNING and job.summary is None:
@@ -702,6 +720,7 @@ class JobManager:
                     status=STAGE_ERROR,
                     phase="Саммаризация прервана при закрытии приложения.",
                     progress=1.0,
+                    started_at=None,
                 )
                 changed = True
         return changed

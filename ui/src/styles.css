@@ -885,10 +885,6 @@ textarea {
   font-size: 12px;
 }
 
-.transcript-error {
-  margin: 12px 16px;
-}
-
 .transcript-box {
   display: block;
   width: calc(100% - 32px);
@@ -2132,26 +2128,6 @@ textarea {
 }
 
 /* Саммари */
-.summary-panel {
-  margin-top: 16px;
-  border: 1px solid var(--colorNeutralStroke2, #e1e1e1);
-  border-radius: 8px;
-  background: var(--colorSubtleBackground1, #f8fafc);
-  padding: 16px;
-}
-.summary-panel h3 {
-  margin: 0 0 12px 0;
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--colorNeutralForeground1, #1b1b1b);
-}
-.summary-heading {
-  margin: 0 0 12px 0;
-  color: var(--colorNeutralForeground1, var(--text-1));
-  font-family: var(--font-display);
-  font-size: 16px;
-  font-weight: 600;
-}
 .summary-owner {
   margin-left: 6px;
   color: var(--colorNeutralForeground3, var(--text-3));

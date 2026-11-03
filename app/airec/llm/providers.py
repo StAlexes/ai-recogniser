@@ -402,7 +402,14 @@ class LlamaCppProvider(LLMProvider):
         self.gpu_layers = max(0, min(int(gpu_layers), 99))
         self._process: subprocess.Popen[bytes] | None = None
         self._base_url = f"http://127.0.0.1:{port}"
-        self._client = httpx.Client(base_url=self._base_url, timeout=LLAMA_SERVER_REQUEST_TIMEOUT_S)
+        # trust_env=False: llama-server живёт на loopback, а системный прокси
+        # (HTTP_PROXY) рвёт соединение к 127.0.0.1 (WinError 10054) — из-за
+        # этого health-проба падала и саммари не запускалось с первого раза.
+        self._client = httpx.Client(
+            base_url=self._base_url,
+            timeout=LLAMA_SERVER_REQUEST_TIMEOUT_S,
+            trust_env=False,
+        )
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
@@ -464,7 +471,11 @@ class LlamaCppProvider(LLMProvider):
                 if resp.status_code == 200:
                     log.info("llama-server ready on port %s (%s)", self.port, self.device)
                     return
-            except (httpx.ConnectError, httpx.TimeoutException):
+            except httpx.HTTPError:
+                # ConnectError/TimeoutException пока сервер поднимается, а
+                # ReadError/RemoteProtocolError — сервер уже слушает, но сбросил
+                # соединение (или вмешался прокси).  Любая транспортная ошибка
+                # здесь означает «ещё не готов»: ждём дальше, а не падаем.
                 pass
             time.sleep(0.5)
         raise LLMError(f"llama-server не стал доступен за {LLAMA_SERVER_STARTUP_TIMEOUT_S} с")
@@ -554,7 +565,18 @@ class LlamaCppProvider(LLMProvider):
             # llama-server converts a JSON schema into a GBNF grammar: the
             # output is guaranteed to be valid JSON of this shape.
             payload["response_format"] = response_format
-        resp = self._client.post("/v1/chat/completions", json=payload, timeout=LLAMA_SERVER_REQUEST_TIMEOUT_S)
+        try:
+            resp = self._client.post(
+                "/v1/chat/completions", json=payload, timeout=LLAMA_SERVER_REQUEST_TIMEOUT_S
+            )
+        except httpx.HTTPError as exc:
+            # Транспортный сбой (сервер упал, соединение сброшено).  Отдаём
+            # понятную ошибку вместо сырого «[WinError 10054]…», которую UI
+            # показывал в плашке этапа саммаризации.
+            raise LLMError(
+                f"Связь с llama-server потеряна во время саммаризации ({exc}). "
+                "Повторите запуск этапа — модель будет запущена заново."
+            ) from exc
         if resp.status_code != 200:
             if resp.status_code == 400 and "exceed_context_size" in resp.text:
                 raise LLMError(

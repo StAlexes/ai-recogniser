@@ -603,9 +603,9 @@ export function QueuePage({ onAuthError, onOpenJob }: QueuePageProps) {
                   </button>
 
                   <div className="job-stages" aria-label={`Этапы задачи ${job.filename}`}>
-                    <StageProgress name="recognition" stage={job.stages.recognition} />
-                    <StageProgress name="diarization" stage={job.stages.diarization} />
-                    <StageProgress name="summary" stage={job.stages.summary} />
+                    <StageProgress name="recognition" stage={job.stages.recognition} now={now} />
+                    <StageProgress name="diarization" stage={job.stages.diarization} now={now} />
+                    <StageProgress name="summary" stage={job.stages.summary} now={now} />
                   </div>
 
                   <div className="job-actions">

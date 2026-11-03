@@ -62,6 +62,8 @@ export interface JobStage {
   phase: string;
   progress: number;
   elapsed_s: number | null;
+  /** ISO-время старта этапа (null, если этап не выполняется). */
+  started_at: string | null;
 }
 
 export type JobStages = Record<StageKey, JobStage>;

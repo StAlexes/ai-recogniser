@@ -123,8 +123,30 @@ export function stageStatusText(stage: JobStage): string {
   }
 }
 
-export function StageProgress({ name, stage }: { name: StageKey; stage: JobStage }) {
+/**
+ * Прошедшее время этапа в секундах.
+ *
+ * Пока этап выполняется, счётчик живой: считаем от ISO-момента старта
+ * (*now* обновляется раз в секунду на странице).  Для завершённых этапов
+ * отдаём сохранённый `elapsed_s`.  `null` — считать нечего.
+ */
+export function stageElapsedSeconds(stage: JobStage, now: number): number | null {
+  if (stage.status === 'running' && stage.started_at !== null) {
+    const started = new Date(stage.started_at).getTime();
+    if (Number.isFinite(started)) {
+      return Math.max((now - started) / 1000, 0);
+    }
+  }
+  if (stage.elapsed_s !== null && Number.isFinite(stage.elapsed_s)) {
+    return stage.elapsed_s;
+  }
+  return null;
+}
+
+export function StageProgress({ name, stage, now }: { name: StageKey; stage: JobStage; now?: number }) {
   const percent = Math.round(Math.max(0, Math.min(stage.progress, 1)) * 100);
+  const live = stage.status === 'running';
+  const elapsed = now !== undefined ? stageElapsedSeconds(stage, now) : null;
   return (
     <div className="job-stage" data-status={stage.status}>
       <span className="job-stage-label">{STAGE_LABELS[name]}</span>
@@ -137,9 +159,11 @@ export function StageProgress({ name, stage }: { name: StageKey; stage: JobStage
       <span className="job-stage-value" title={stageStatusText(stage)}>
         {stage.status === 'skipped'
           ? '—'
-          : stage.status === 'done' && stage.elapsed_s !== null && Number.isFinite(stage.elapsed_s)
-            ? formatDuration(stage.elapsed_s)
-            : `${percent}%`}
+          : live && elapsed !== null
+            ? `${percent}% · ${formatDuration(elapsed)}`
+            : stage.status === 'done' && elapsed !== null
+              ? formatDuration(elapsed)
+              : `${percent}%`}
       </span>
     </div>
   );
