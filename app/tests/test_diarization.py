@@ -25,6 +25,20 @@ class FakeSpeakerEmbedding:
         return np.asarray(vectors, dtype=np.float32)
 
 
+def _disable_voice_clustering(monkeypatch) -> None:
+    """Откат гибридной кластеризации на цепочки слотов (тесты off-line).
+
+    Движок PyAnnote по умолчанию кластеризует регионы по эмбеддингам
+    WeSpeaker; в юнит-тестах модель недоступна — load_se должен падать, чтобы
+    сработал штатный откат без сети.
+    """
+
+    def _no_se(*_args, **_kwargs):
+        raise diarization.DiarizationError("speaker embeddings disabled in test")
+
+    monkeypatch.setattr(diarization, "load_se", _no_se)
+
+
 def test_diarize_segments_groups_by_embedding(monkeypatch) -> None:
     fake = FakeSpeakerEmbedding()
     monkeypatch.setattr(diarization, "load_se", lambda *args, **kwargs: fake)
@@ -116,6 +130,7 @@ def test_diarize_with_pyannote(monkeypatch) -> None:
     monkeypatch.setattr(
         diarization, "load_pyannote", lambda *_args, **_kwargs: FakePyannoteSession()
     )
+    _disable_voice_clustering(monkeypatch)
 
     sample_rate = 16_000
     audio = np.zeros(6 * sample_rate, dtype=np.float32)
@@ -136,6 +151,7 @@ def test_pyannote_splits_segment_at_speaker_turn(monkeypatch) -> None:
     monkeypatch.setattr(
         diarization, "load_pyannote", lambda *_args, **_kwargs: FakePyannoteSession()
     )
+    _disable_voice_clustering(monkeypatch)
 
     sample_rate = 16_000
     audio = np.zeros(6 * sample_rate, dtype=np.float32)
@@ -177,6 +193,7 @@ def test_pyannote_keeps_segment_without_tokens(monkeypatch) -> None:
     monkeypatch.setattr(
         diarization, "load_pyannote", lambda *_args, **_kwargs: FakePyannoteSession()
     )
+    _disable_voice_clustering(monkeypatch)
 
     sample_rate = 16_000
     audio = np.zeros(6 * sample_rate, dtype=np.float32)
@@ -216,6 +233,7 @@ def test_pyannote_drops_noise_slot(monkeypatch) -> None:
         "load_pyannote",
         lambda *_args, **_kwargs: SlotPyannoteSession({1: (0, 2), 2: (0, 10), 3: (12, 20)}),
     )
+    _disable_voice_clustering(monkeypatch)
 
     sample_rate = 16_000
     audio = np.zeros(10 * sample_rate, dtype=np.float32)
@@ -241,6 +259,7 @@ def test_pyannote_numbers_by_first_appearance(monkeypatch) -> None:
         "load_pyannote",
         lambda *_args, **_kwargs: SlotPyannoteSession({3: (0, 10), 2: (12, 20)}),
     )
+    _disable_voice_clustering(monkeypatch)
 
     sample_rate = 16_000
     audio = np.zeros(10 * sample_rate, dtype=np.float32)
@@ -264,6 +283,7 @@ def test_pyannote_fallback_continues_previous_speaker(monkeypatch) -> None:
         "load_pyannote",
         lambda *_args, **_kwargs: SlotPyannoteSession({2: (0, 6), 3: (12, 16)}),
     )
+    _disable_voice_clustering(monkeypatch)
 
     sample_rate = 16_000
     audio = np.zeros(10 * sample_rate, dtype=np.float32)
@@ -453,3 +473,120 @@ def test_split_at_speaker_turns_subtracts_ctc_delay() -> None:
     assert result[0]["speaker"] == "Спикер 1"
     assert result[0]["text"] == "да"
     assert result[1]["speaker"] == "Спикер 2"
+
+
+# -------------------------------------------------------------------------- #
+# Перекрытие спикеров: перебивка не должна поглощаться монологом
+# -------------------------------------------------------------------------- #
+def test_split_at_speaker_turns_overlap_keeps_interruption() -> None:
+    """Слова в зоне оверлапа двух регионов принадлежат вступившему спикеру.
+
+    Старый label_at отдавал момент первому региону в отсортированном списке,
+    поэтому короткое перебивание внутри длинного монолога целиком
+    приписывалось говорившему; к тому же однословный всплеск сглаживался
+    обратно, а run короче 0.6 с складывался в предыдущий.
+    """
+    regions = [
+        ("Спикер 1", 0.0, 10.75),
+        ("Спикер 2", 10.45, 10.8),
+        ("Спикер 1", 10.9, 20.0),
+    ]
+    segment = {
+        "start_s": 0.0,
+        "end_s": 20.0,
+        "text": "раз да два",
+        "tokens": ["раз", " да", " два"],
+        "token_times": [1.0, 10.5, 10.9],
+    }
+
+    result = diarization._split_at_speaker_turns([dict(segment)], regions)
+
+    assert [piece["speaker"] for piece in result] == [
+        "Спикер 1",
+        "Спикер 2",
+        "Спикер 1",
+    ]
+    assert [piece["text"] for piece in result] == ["раз", "да", "два"]
+
+
+# -------------------------------------------------------------------------- #
+# Голосовая кластеризация регионов (долгосрочная память тембра)
+# -------------------------------------------------------------------------- #
+def test_agglomerative_speaker_clusters_merge_by_threshold() -> None:
+    """Средне-связная кластеризация объединяет близкие тембры по всему файлу."""
+    embeddings = np.asarray(
+        [
+            [1.0, 0.0],  # голос A
+            [0.9, 0.1],  # голос A
+            [0.0, 1.0],  # голос B
+            [0.1, 0.9],  # голос B
+        ],
+        dtype=np.float32,
+    )
+
+    clusters = diarization._agglomerative_speaker_clusters(embeddings, 0.7)
+
+    assert clusters[0] == clusters[1]
+    assert clusters[2] == clusters[3]
+    assert clusters[0] != clusters[2]
+
+
+class ChainBreakPyannoteSession:
+    """Один и тот же голос до и после паузы попадает в разные слоты сети.
+
+    20 фреймов на 10-с окно (0.5 с на фрейм): 0–3 с — слот 2, 6–9 с —
+    слот 3.  Без голосовой кластеризации это две цепочки и два спикера.
+    """
+
+    def run(self, _outputs: object, _feeds: object) -> list[np.ndarray]:
+        frames = 20
+        logits = np.full((1, frames, 7), -10.0, dtype=np.float32)
+        logits[:, 0:6, 2] = 0.0
+        logits[:, 12:18, 3] = 0.0
+        return [logits]
+
+
+def _chain_break_setup(monkeypatch) -> tuple[int, np.ndarray, list[dict[str, object]]]:
+    monkeypatch.setattr(
+        diarization,
+        "load_pyannote",
+        lambda *_args, **_kwargs: ChainBreakPyannoteSession(),
+    )
+    sample_rate = 16_000
+    audio = np.zeros(10 * sample_rate, dtype=np.float32)
+    audio[0 : 3 * sample_rate] = 0.5
+    audio[6 * sample_rate : 9 * sample_rate] = 0.5
+    segments = [
+        {"start_s": 0.5, "end_s": 2.5, "text": "one"},
+        {"start_s": 6.5, "end_s": 8.5, "text": "two"},
+    ]
+    return sample_rate, audio, segments
+
+
+def test_pyannote_voice_clustering_rejoins_speaker_after_pause(monkeypatch) -> None:
+    """Пауза длиннее окна сегментатора не плодит нового спикера.
+
+    Две цепочки слотов с одним и тем же голосом объединяются по тембру
+    WeSpeaker в один кластер («Спикер 1» и для первой, и для второй реплики).
+    """
+    sample_rate, audio, segments = _chain_break_setup(monkeypatch)
+    fake = FakeSpeakerEmbedding()
+    monkeypatch.setattr(diarization, "load_se", lambda *args, **kwargs: fake)
+
+    result = diarization.diarize_segments(
+        segments, audio, sample_rate, repo_id="onnx-community/pyannote-segmentation-3.0"
+    )
+
+    assert [segment["speaker"] for segment in result] == ["Спикер 1", "Спикер 1"]
+
+
+def test_pyannote_voice_clustering_falls_back_without_embeddings(monkeypatch) -> None:
+    """Недоступность модели эмбеддингов — откат на цепочки слотов."""
+    sample_rate, audio, segments = _chain_break_setup(monkeypatch)
+    _disable_voice_clustering(monkeypatch)
+
+    result = diarization.diarize_segments(
+        segments, audio, sample_rate, repo_id="onnx-community/pyannote-segmentation-3.0"
+    )
+
+    assert [segment["speaker"] for segment in result] == ["Спикер 1", "Спикер 2"]

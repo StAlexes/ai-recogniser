@@ -8,8 +8,12 @@ Two engines are available:
   probabilities of "no speaker", "speaker 1", "speaker 2", "speaker 3" and
   overlapping combinations.  Overlapping windows are fused so each frame gets
   up to three per-speaker activity probabilities; frames are then turned into
-  speech regions per speaker.  The result is deterministic and captures
-  overlapped speech that embedding clustering misses.
+  speech regions per speaker.  Segmentation alone keeps a speaker's identity
+  only within one window overlap, so regions are re-labelled globally by
+  clustering WeSpeaker embeddings (the pyannote.audio 3.x scheme): a voice
+  returning after a long pause rejoins its cluster instead of getting a fresh
+  number.  When the embedding model is unavailable, slot-chain labels are
+  kept (with a warning) — diarization still works.
 - ``wespeaker`` — WeSpeaker speaker embeddings + cosine clustering (the
   original engine, kept as an option; it does not cap the number of speakers).
 
@@ -628,6 +632,170 @@ def _embed_averaged(
     return np.vstack(averaged)
 
 
+# --------------------------------------------------------------------------- #
+# Голосовая кластеризация регионов (долгосрочная память тембра)
+# --------------------------------------------------------------------------- #
+
+
+def _voice_cluster_clip(
+    regions: list[tuple[str, float, float]],
+    position: int,
+    audio: np.ndarray,
+    sample_rate: int,
+) -> np.ndarray:
+    """Аудио региона для эмбеддинга: участки без чужого речевого оверлапа.
+
+    Регионы pyannote перекрываются, когда спикеры говорят одновременно, а
+    эмбеддинг такого куска — смесь двух голосов, которая путает
+    кластеризацию.  Поэтому берётся часть региона, свободная от других
+    регионов; если её меньше минимального клипа — весь регион целиком
+    (лучше слегка смешанный вектор, чем потерянный голос).
+    """
+    _label, start_s, end_s = regions[position]
+    start = int(start_s * sample_rate)
+    end = max(int(end_s * sample_rate), start + 1)
+    pieces = [(start, end)]
+    for other_start_s, other_end_s in (
+        (other[1], other[2])
+        for index, other in enumerate(regions)
+        if index != position
+    ):
+        other_start = int(other_start_s * sample_rate)
+        other_end = int(other_end_s * sample_rate)
+        next_pieces: list[tuple[int, int]] = []
+        for piece_start, piece_end in pieces:
+            if other_end <= piece_start or other_start >= piece_end:
+                next_pieces.append((piece_start, piece_end))
+                continue
+            if other_start > piece_start:
+                next_pieces.append((piece_start, min(other_start, piece_end)))
+            if other_end < piece_end:
+                next_pieces.append((max(other_end, piece_start), piece_end))
+        pieces = next_pieces
+        if not pieces:
+            break
+    total = sum(piece_end - piece_start for piece_start, piece_end in pieces)
+    if total >= MIN_CLIP_SAMPLES:
+        if len(pieces) == 1:
+            return audio[pieces[0][0] : pieces[0][1]]
+        return np.concatenate(
+            [audio[piece_start:piece_end] for piece_start, piece_end in pieces]
+        )
+    return audio[start:end]
+
+
+def _agglomerative_speaker_clusters(
+    embeddings: np.ndarray, threshold: float
+) -> list[int]:
+    """Средне-связная агломеративная кластеризация эмбеддингов (косинус).
+
+    Классическая схема pyannote.audio 3.x: локальные регионы сегментации
+    объединяются по тембру глобально — голос, замолчавший дольше окна
+    сегментатора, всё равно находит свой кластер и не получает новый номер.
+    Без SciPy: матрица сходства обновляется по Лансу–Уильямсу, слияние идёт,
+    пока среднее косинусное сходство кластеров не упадёт ниже *threshold*.
+    Возвращает индекс кластера (0..k-1) для каждого эмбеддинга; номера
+    кластеров упорядочены по первому появлению в записи.
+    """
+    count = len(embeddings)
+    if count == 0:
+        return []
+    norms = np.linalg.norm(embeddings, axis=1)
+    norms[norms == 0.0] = 1.0
+    unit = embeddings / norms[:, None]
+    sim = unit @ unit.T
+    np.fill_diagonal(sim, -np.inf)
+    sizes = np.ones(count, dtype=np.float64)
+    parent = list(range(count))
+
+    def find_root(index: int) -> int:
+        root = index
+        while parent[root] != root:
+            root = parent[root]
+        while parent[index] != root:  # сжатие пути
+            parent[index], index = root, parent[index]
+        return root
+
+    for _ in range(count - 1):
+        best_flat = int(np.argmax(sim))
+        if float(sim.flat[best_flat]) < threshold:
+            break
+        row, col = divmod(best_flat, sim.shape[1])
+        # Слияние col в row: средневзвешенное сходство (Ланс–Уильямс).
+        combined = sizes[row] + sizes[col]
+        sim[row, :] = (sizes[row] * sim[row, :] + sizes[col] * sim[col, :]) / combined
+        sim[:, row] = sim[row, :]
+        sim[row, row] = -np.inf
+        sim[col, :] = -np.inf
+        sim[:, col] = -np.inf
+        sizes[row] = combined
+        sizes[col] = 0.0
+        parent[col] = row
+
+    cluster_of_root: dict[int, int] = {}
+    result: list[int] = []
+    for index in range(count):
+        root = find_root(index)
+        if root not in cluster_of_root:
+            cluster_of_root[root] = len(cluster_of_root)
+        result.append(cluster_of_root[root])
+    return result
+
+
+def _relabel_regions_by_voice(
+    regions: list[tuple[str, float, float]],
+    audio: np.ndarray,
+    sample_rate: int,
+    *,
+    cpu_threads: int,
+    threshold: float,
+    cancel: Callable[[], None] | None = None,
+    progress: Callable[[float, str], None] | None = None,
+) -> list[tuple[str, float, float]]:
+    """Склеить цепочки слотов pyannote в глобальных спикеров по тембру.
+
+    Чистая сегментация pyannote — локальный акустический разметчик: связь
+    голосов держится только на перекрытии скользящих окон, поэтому спикер,
+    замолчавший дольше окна, возвращается под новым номером.  Эмбеддинги
+    WeSpeaker дают долгосрочную память: регионы кластеризуются по тембру по
+    всему файлу.  Недоступность модели эмбеддингов — не ошибка стадии, а
+    откат на прежнюю схему цепочек слотов (с предупреждением в лог).
+    """
+    try:
+        se = load_se(cpu_threads, repo_id=DEFAULT_SE_REPO)
+    except DiarizationError as exc:
+        log.warning("voice clustering unavailable (%s); slot chains kept", exc)
+        return regions
+
+    clips = [
+        _voice_cluster_clip(regions, position, audio, sample_rate)
+        for position in range(len(regions))
+    ]
+
+    def embed_progress(fraction: float, message: str) -> None:
+        if progress is not None:
+            # _embed_averaged шлёт 0..0.9 — раскладываем на 0.55..0.8.
+            bounded = min(max(fraction, 0.0), 0.9)
+            progress(0.55 + (bounded / 0.9) * 0.25, message)
+
+    try:
+        embeddings = _embed_averaged(
+            se, clips, sample_rate=sample_rate, cancel=cancel, progress=embed_progress
+        )
+    except DiarizationCancelled:
+        raise
+    except Exception as exc:
+        log.warning("voice clustering failed (%s); slot chains kept", exc)
+        return regions
+
+    cluster_ids = _agglomerative_speaker_clusters(embeddings, threshold)
+    labels = [f"Спикер {cluster + 1}" for cluster in cluster_ids]
+    return [
+        (labels[position], region_start, region_end)
+        for position, (_label, region_start, region_end) in enumerate(regions)
+    ]
+
+
 def diarize_segments(
     segments: list[dict[str, Any]],
     audio: np.ndarray,
@@ -688,6 +856,7 @@ def _diarize_with_pyannote(
     repo_id: str,
     group: PyannoteGroup | None = None,
     link: GigaamLink | None = None,
+    voice_threshold: float = SIMILARITY_THRESHOLD,
     cancel: Callable[[], None] | None,
     progress: Callable[[float, str], None] | None,
 ) -> list[dict[str, Any]]:
@@ -695,7 +864,8 @@ def _diarize_with_pyannote(
 
     *group* — активная группа гиперпараметров (None -> встроенные дефолты);
     *link* — настройки связки с GigaAM (компенсация задержки CTC и допуск
-    границ слов при голосовании).
+    границ слов при голосовании);
+    *voice_threshold* — косинусный порог голосовой кластеризации регионов.
     """
     if progress is not None:
         progress(0.0, "Загрузка модели спикеров")
@@ -729,6 +899,19 @@ def _diarize_with_pyannote(
         for segment in segments:
             segment["speaker"] = "Спикер 1"
         return segments
+
+    # Долгосрочная память тембра: склеиваем цепочки слотов pyannote в
+    # глобальных спикеров по эмбеддингам WeSpeaker (схема pyannote.audio 3.x).
+    # Недоступность модели эмбеддингов — откат на цепочки слотов с предупреждением.
+    regions = _relabel_regions_by_voice(
+        regions,
+        audio.astype(np.float32, copy=False),
+        sample_rate,
+        cpu_threads=cpu_threads,
+        threshold=voice_threshold,
+        cancel=cancel,
+        progress=progress,
+    )
 
     # A VAD segment may contain several speakers: Silero only splits at real
     # pauses, and a speaker change is often seamless.  Segments with token
@@ -771,7 +954,7 @@ def _diarize_with_pyannote(
         previous_label = segment["speaker"]
         if progress is not None and (position % 32 == 0 or position + 1 == total):
             progress(
-                0.55 + 0.45 * ((position + 1) / total),
+                0.8 + 0.2 * ((position + 1) / total),
                 f"Разметка сегментов: {position + 1} из {len(segments)}",
             )
 
@@ -786,9 +969,12 @@ def _diarize_with_pyannote(
     return segments
 
 
-# A turn shorter than this is not split off: too short pieces are useless and
-# usually mean a token-time jitter right at the boundary.
-MIN_TURN_S = 0.6
+# A turn shorter than this is not split off: token-time jitter right at the
+# boundary is already handled by midpoint voting, CTC delay compensation and
+# single-word smoothing.  0.25 s (~one short word) keeps brief Russian
+# interjections («Да.», «Угу.»): with 0.6 s a reply folded back into the
+# interrupted monologue and lost its speaker.
+MIN_TURN_S = 0.25
 
 # Pyannote region edges jitter by up to a couple of frames (~200 ms), so a
 # word whose midpoint lands in a gap between regions snaps to the nearest
@@ -888,7 +1074,9 @@ def _split_at_speaker_turns(
     the speaker of its middle tokens, single-word flips are smoothed away and
     micro-runs under :data:`MIN_TURN_S` fold into the previous piece — so one
     token straddling the boundary can neither tear a word apart nor spawn a
-    useless fragment.  Every remaining change of speaker starts a new piece
+    useless fragment.  Regions overlapping in time are resolved in favour of
+    the newly entering speaker, so an interruption inside a monologue is not
+    swallowed by it.  Every remaining change of speaker starts a new piece
     with its own decoded text.  Segments without tokens are unchanged.
 
     *vote_delay_s* — компенсация задержки CTC-пика GigaAM: пик регистрируется
@@ -913,15 +1101,31 @@ def _split_at_speaker_turns(
         start = float(segment.get("start_s", 0.0))
         end = max(float(segment.get("end_s", start)), start)
 
-        def label_at(moment: float, default: str) -> str:
+        def label_at(moment: float, default: str) -> tuple[str, bool]:
             # Point-in-region check: a moment inside a region belongs to that
             # speaker; tokens in a gap between regions snap to the nearest
             # region edge within a small tolerance — pyannote boundaries
             # jitter, and words right at a speaker turn must keep their
             # speaker instead of being folded into the previous one.
-            for label, region_start, region_end in regions:
-                if region_start <= moment < region_end:
-                    return label
+            #
+            # Regions of different speakers may overlap in time (pyannote
+            # marks both speakers active on an overlap): the first match in
+            # the start-sorted list would always be the earlier monologue,
+            # swallowing the interrupting speaker's words.  The overlap
+            # therefore goes to the region whose START is nearest — the newly
+            # entering speaker owns the interruption.  The second return value
+            # flags the overlap zone: such words are protected from
+            # single-word-flip smoothing (a one-word «Да.» is real speech).
+            matching = [
+                (label, region_start)
+                for label, region_start, region_end in regions
+                if region_start <= moment < region_end
+            ]
+            if len(matching) == 1:
+                return matching[0][0], False
+            if len(matching) > 1:
+                matching.sort(key=lambda item: abs(moment - item[1]))
+                return matching[0][0], True
             best_label = default
             best_distance = boundary_margin_s
             for label, region_start, region_end in regions:
@@ -929,23 +1133,25 @@ def _split_at_speaker_turns(
                 if distance < best_distance:
                     best_label = label
                     best_distance = distance
-            return best_label
+            return best_label, False
 
         # One vote per token ("" = no region covers it), grouped into words.
         # The vote point is the token midpoint pulled *back* by the CTC peak
         # delay: the acoustic model registers a phoneme after it is spoken
         # (t_token = t_audio + delay), so t_audio = t_token − delay.  Clamped
         # so it never leaves the segment.
-        labels = [
-            label_at(
+        labels: list[str] = []
+        overlap_flags: list[bool] = []
+        for index in range(len(tokens)):
+            label, in_overlap = label_at(
                 max(
                     start,
                     min(_token_midpoint(times, index, end) - vote_delay_s, end),
                 ),
                 "",
             )
-            for index in range(len(tokens))
-        ]
+            labels.append(label)
+            overlap_flags.append(in_overlap)
         words: list[list[int]] = []
         for index in range(len(tokens)):
             if index == 0 or _token_starts_word(index, tokens):
@@ -954,12 +1160,14 @@ def _split_at_speaker_turns(
                 words[-1].append(index)
 
         word_labels: list[str] = []
+        word_overlap: list[bool] = []
         for word in words:
             counted = Counter(
                 label for label in (labels[index] for index in word) if label
             )
             best = counted.most_common(1)
             word_labels.append(best[0][0] if best else "")
+            word_overlap.append(any(overlap_flags[index] for index in word))
 
         if not any(word_labels):
             # No region covers this segment at all.
@@ -975,10 +1183,13 @@ def _split_at_speaker_turns(
             else:
                 previous = label
 
-        # Smooth single-word flips (label jitter right at the boundary).
+        # Smooth single-word flips (label jitter right at the boundary) —
+        # except words that confidently landed inside an overlap zone: a
+        # one-word interruption («Да.») is real speech, not jitter.
         for position, label in enumerate(word_labels):
             if (
                 0 < position < len(word_labels) - 1
+                and not word_overlap[position]
                 and word_labels[position - 1] == word_labels[position + 1]
                 and word_labels[position - 1] != label
             ):
@@ -1291,6 +1502,15 @@ class PyannoteSegmentationEngine(BaseDiarizationEngine):
         cancel: Callable[[], None] | None,
         progress: Callable[[float, str], None] | None,
     ) -> list[dict[str, Any]]:
+        voice_threshold = threshold
+        if self._profiles:
+            try:
+                voice_threshold = self._profiles.wespeaker_group(
+                    self._profile_id
+                ).threshold
+            except KeyError as exc:
+                self._log_missing_profile(exc)
+                voice_threshold = self._profiles.wespeaker[0].threshold
         return _diarize_with_pyannote(
             segments,
             audio,
@@ -1300,6 +1520,7 @@ class PyannoteSegmentationEngine(BaseDiarizationEngine):
             repo_id=repo_id or PYANNOTE_REPO,
             group=self._resolve_group(),
             link=self._profiles.gigaam if self._profiles else None,
+            voice_threshold=voice_threshold,
             cancel=cancel,
             progress=progress,
         )
