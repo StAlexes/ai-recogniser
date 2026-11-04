@@ -556,6 +556,44 @@ def test_cluster_region_voices_respects_cap() -> None:
     assert len(set(clusters)) <= 4
 
 
+def test_adaptive_voice_threshold_lowers_on_compressed_space() -> None:
+    """Сжатое пространство (узкая полоса): порог понижается в долину."""
+    # 24 неструктурированных вектора: попарные сходства около нуля,
+    # p95 ниже профильного порога — как у узкополосной записи.
+    rng = np.random.default_rng(7)
+    embeddings = rng.normal(size=(24, 256)).astype(np.float32)
+
+    threshold, adapted = diarization._adaptive_voice_threshold(embeddings, 0.74)
+
+    assert adapted
+    assert 0.30 <= threshold < 0.74
+
+
+def test_adaptive_voice_threshold_unchanged_on_clean_space() -> None:
+    """Чистое пространство: p95 выше порога, адаптация не нужна."""
+    rows = []
+    for base in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)):
+        for i in range(8):
+            jitter = [0.01 * ((i + j) % 3 - 1) for j in range(3)]
+            rows.append([b + dj for b, dj in zip(base, jitter, strict=True)])
+    embeddings = np.asarray(rows * 40, dtype=np.float32)
+
+    threshold, adapted = diarization._adaptive_voice_threshold(embeddings, 0.74)
+
+    assert not adapted
+    assert threshold == 0.74
+
+
+def test_adaptive_voice_threshold_skips_small_inputs() -> None:
+    """Мало векторов — перцентили непоказательны, порог не трогаем."""
+    embeddings = np.asarray([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]], dtype=np.float32)
+
+    threshold, adapted = diarization._adaptive_voice_threshold(embeddings, 0.74)
+
+    assert not adapted
+    assert threshold == 0.74
+
+
 class ChainBreakPyannoteSession:
     """Один и тот же голос до и после паузы попадает в разные слоты сети.
 

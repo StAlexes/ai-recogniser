@@ -713,6 +713,34 @@ def _cluster_region_voices(
     return result
 
 
+def _adaptive_voice_threshold(
+    embeddings: np.ndarray, threshold: float
+) -> tuple[float, bool]:
+    """Понизить порог для записей со сжатой тембровой информацией.
+
+    На чистой речи эмбеддинги одного голоса стабильно дают сходство выше
+    порога профиля.  Если 95-й перцентиль попарных сходств файла не
+    достигает порога, тембровая информация в записи сжата (телефонная
+    полоса, сильное сжатие, дальний микрофон): при профильном пороге даже
+    лучшие пары «своего» голоса не склеиваются, и один спикер рассыпается
+    на несколько кластеров.  Порог тогда ставится в «долину» распределения
+    — чуть ниже p85 (верхняя граница массы разных голосов), но не ниже
+    0,30.  Возвращает (эффективный порог, был ли понижен).
+    """
+    count = len(embeddings)
+    if count < 20:
+        return threshold, False
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0
+    unit = embeddings / norms
+    sims = unit @ unit.T
+    vals = sims[np.triu_indices(count, k=1)]
+    if vals.size == 0 or float(np.percentile(vals, 95)) >= threshold:
+        return threshold, False
+    lowered = max(0.30, float(np.percentile(vals, 85)) - 0.05)
+    return lowered, True
+
+
 def _relabel_regions_by_voice(
     regions: list[tuple[str, float, float]],
     audio: np.ndarray,
@@ -771,7 +799,15 @@ def _relabel_regions_by_voice(
         log.warning("voice clustering failed (%s); slot chains kept", exc)
         return regions
 
-    cluster_ids = _cluster_region_voices(embeddings, threshold, min_cluster_size)
+    effective_threshold, adapted = _adaptive_voice_threshold(embeddings, threshold)
+    if adapted:
+        log.warning(
+            "voice embeddings are weakly separated (narrowband/degraded audio); "
+            "voice threshold lowered %.2f -> %.2f",
+            threshold,
+            effective_threshold,
+        )
+    cluster_ids = _cluster_region_voices(embeddings, effective_threshold, min_cluster_size)
     labels = [f"Спикер {cluster + 1}" for cluster in cluster_ids]
     return [
         (labels[position], region_start, region_end)
