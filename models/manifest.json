@@ -101,14 +101,14 @@
     {
       "id": "pyannote-segmentation-3.0",
       "kind": "diarization",
-      "title": "PyAnnote Segmentation 3.0",
+      "title": "PyAnnote 3.0 + WeSpeaker (тембр)",
       "repo": "onnx-community/pyannote-segmentation-3.0",
       "filename": "model.onnx",
       "url": "https://huggingface.co/onnx-community/pyannote-segmentation-3.0/resolve/main/onnx/model.onnx",
       "size_bytes": 5986908,
       "sha256": "",
       "license": "MIT",
-      "note": "Рекомендуемая: end-to-end разметка спикеров, до 3 участников, быстрая",
+      "note": "Рекомендуемая: PyAnnote размечает границы и перекрытия, WeSpeaker ResNet34 склеивает одни голоса по тембру; до 3 участников",
       "purpose": "диаризация"
     },
     {

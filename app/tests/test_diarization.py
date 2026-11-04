@@ -590,3 +590,55 @@ def test_pyannote_voice_clustering_falls_back_without_embeddings(monkeypatch) ->
     )
 
     assert [segment["speaker"] for segment in result] == ["Спикер 1", "Спикер 2"]
+
+
+def test_pyannote_voice_clustering_keeps_different_voices_apart(monkeypatch) -> None:
+    """Разные голоса в разных цепочках не должны сливаться по тембру."""
+    monkeypatch.setattr(
+        diarization,
+        "load_pyannote",
+        lambda *_args, **_kwargs: ChainBreakPyannoteSession(),
+    )
+    monkeypatch.setattr(
+        diarization, "load_se", lambda *args, **kwargs: FakeSpeakerEmbedding()
+    )
+    sample_rate = 16_000
+    audio = np.zeros(10 * sample_rate, dtype=np.float32)
+    audio[0 : 3 * sample_rate] = 0.5  # цепочка 1: «голос А»
+    audio[6 * sample_rate : 9 * sample_rate] = -0.5  # цепочка 2: «голос Б»
+    segments = [
+        {"start_s": 0.5, "end_s": 2.5, "text": "one"},
+        {"start_s": 6.5, "end_s": 8.5, "text": "two"},
+    ]
+
+    result = diarization.diarize_segments(
+        segments, audio, sample_rate, repo_id="onnx-community/pyannote-segmentation-3.0"
+    )
+
+    assert [segment["speaker"] for segment in result] == ["Спикер 1", "Спикер 2"]
+
+
+def test_pyannote_voice_clustering_skipped_for_single_chain(monkeypatch) -> None:
+    """Одна цепочка слотов — один спикер, модель эмбеддингов не нужна."""
+    monkeypatch.setattr(
+        diarization,
+        "load_pyannote",
+        lambda *_args, **_kwargs: SlotPyannoteSession({2: (0, 10)}),
+    )
+    calls = []
+
+    def _boom(*args, **kwargs):
+        calls.append(1)
+        raise AssertionError("load_se must not be called for a single chain")
+
+    monkeypatch.setattr(diarization, "load_se", _boom)
+    sample_rate = 16_000
+    audio = np.zeros(10 * sample_rate, dtype=np.float32)
+    segments = [{"start_s": 0.5, "end_s": 8.0, "text": "solo"}]
+
+    result = diarization.diarize_segments(
+        segments, audio, sample_rate, repo_id="onnx-community/pyannote-segmentation-3.0"
+    )
+
+    assert calls == []
+    assert [segment["speaker"] for segment in result] == ["Спикер 1"]
