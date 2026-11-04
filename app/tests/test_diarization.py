@@ -512,23 +512,48 @@ def test_split_at_speaker_turns_overlap_keeps_interruption() -> None:
 # -------------------------------------------------------------------------- #
 # Голосовая кластеризация регионов (долгосрочная память тембра)
 # -------------------------------------------------------------------------- #
-def test_agglomerative_speaker_clusters_merge_by_threshold() -> None:
-    """Средне-связная кластеризация объединяет близкие тембры по всему файлу."""
+def test_cluster_region_voices_reattaches_small_clusters() -> None:
+    """Кластер меньше минимума приклеивается к ближайшему крупному."""
     embeddings = np.asarray(
         [
             [1.0, 0.0],  # голос A
-            [0.9, 0.1],  # голос A
+            [0.98, 0.2],  # голос A
+            [0.7, 0.71],  # выброс: не дотянул до порога A, одиночный
             [0.0, 1.0],  # голос B
-            [0.1, 0.9],  # голос B
+            [0.2, 0.98],  # голос B
+            [0.1, 1.0],  # голос B
         ],
         dtype=np.float32,
     )
 
-    clusters = diarization._agglomerative_speaker_clusters(embeddings, 0.7)
+    clusters = diarization._cluster_region_voices(embeddings, 0.9, min_cluster_size=2)
 
+    assert len(set(clusters)) == 2
     assert clusters[0] == clusters[1]
-    assert clusters[2] == clusters[3]
-    assert clusters[0] != clusters[2]
+    assert clusters[3] == clusters[4] == clusters[5]
+
+
+def test_cluster_region_voices_numbers_by_first_appearance() -> None:
+    """Номера кластеров отсчитываются от первого появления в записи."""
+    embeddings = np.asarray(
+        [[0.0, 1.0], [0.1, 0.9], [1.0, 0.0], [0.9, 0.1]], dtype=np.float32
+    )
+
+    clusters = diarization._cluster_region_voices(embeddings, 0.8, min_cluster_size=1)
+
+    assert clusters == [0, 0, 1, 1]
+
+
+def test_cluster_region_voices_respects_cap() -> None:
+    """Взаимно далёкие векторы не плодят кластеры сверх потолка."""
+    angles = np.linspace(0.0, np.pi, 16)
+    embeddings = np.vstack([np.cos(angles), np.sin(angles)]).T.astype(np.float32)
+
+    clusters = diarization._cluster_region_voices(
+        embeddings, 0.99, min_cluster_size=1, cap=4
+    )
+
+    assert len(set(clusters)) <= 4
 
 
 class ChainBreakPyannoteSession:

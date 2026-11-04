@@ -9,11 +9,13 @@ Two engines are available:
   overlapping combinations.  Overlapping windows are fused so each frame gets
   up to three per-speaker activity probabilities; frames are then turned into
   speech regions per speaker.  Segmentation alone keeps a speaker's identity only within one window
-  overlap, so slot chains are re-labelled globally by clustering their
-  WeSpeaker embedding centroids (the pyannote.audio 3.x scheme): a voice
-  returning after a long pause rejoins its cluster instead of getting a
-  fresh number.  When the embedding model is unavailable, slot-chain labels
-  are kept (with a warning) — diarization still works.
+  overlap and its three slots cannot represent more than three voices, so
+  regions are re-labelled by clustering their WeSpeaker embeddings (the
+  pyannote.audio 3.x scheme): a voice returning after a long pause rejoins
+  its cluster instead of getting a fresh number, and meetings with more than
+  three participants keep their real speaker count.  When the embedding
+  model is unavailable, slot-chain labels are kept (with a warning) —
+  diarization still works.
 - ``wespeaker`` — WeSpeaker speaker embeddings + cosine clustering (the
   original engine, kept as an option; it does not cap the number of speakers).
 
@@ -637,18 +639,31 @@ def _embed_averaged(
 # --------------------------------------------------------------------------- #
 
 
-def _agglomerative_speaker_clusters(
-    embeddings: np.ndarray, threshold: float
+def _cluster_region_voices(
+    embeddings: np.ndarray,
+    threshold: float,
+    min_cluster_size: int,
+    *,
+    cap: int = 12,
 ) -> list[int]:
-    """Средне-связная агломеративная кластеризация эмбеддингов (косинус).
+    """Онлайн-центроидная кластеризация эмбеддингов регионов по времени.
 
-    Классическая схема pyannote.audio 3.x: локальные регионы сегментации
-    объединяются по тембру глобально — голос, замолчавший дольше окна
-    сегментатора, всё равно находит свой кластер и не получает новый номер.
-    Без SciPy: матрица сходства обновляется по Лансу–Уильямсу, слияние идёт,
-    пока среднее косинусное сходство кластеров не упадёт ниже *threshold*.
+    Классическая вторая ступень пайплайна pyannote.audio 3.x: сегментация
+    даёт границы, тембр решает, сколько реально спикеров — лимита «три слота»
+    нет.  Каждый регион (по порядку следования) присоединяется к кластеру с
+    ближайшим центроидом, если сходство не ниже *threshold*; иначе открывает
+    новый кластер (но не больше *cap* — иначе регион уходит ближайшему
+    кластеру безусловно, что гасит патологическое дробление).  Кластеры,
+    набравшие меньше *min_cluster_size* регионов, приклеиваются к ближайшему
+    крупному: короткие реплики «мимо» порога — шум, а не новые спикеры.
     Возвращает индекс кластера (0..k-1) для каждого эмбеддинга; номера
-    кластеров упорядочены по первому появлению в записи.
+    упорядочены по первому появлению в записи.
+
+    Центроидная (а не попарная агломеративная) схема выбрана осознанно:
+    центроид кластера устойчив к шумным векторам отдельных коротких
+    регионов — на реальных записях попарное сравнение рассыпало один голос
+    на десятки кластеров, а здесь одного совпадения с «усреднённым голосом»
+    достаточно, чтобы присоединить регион.
     """
     count = len(embeddings)
     if count == 0:
@@ -656,42 +671,45 @@ def _agglomerative_speaker_clusters(
     norms = np.linalg.norm(embeddings, axis=1)
     norms[norms == 0.0] = 1.0
     unit = embeddings / norms[:, None]
-    sim = unit @ unit.T
-    np.fill_diagonal(sim, -np.inf)
-    sizes = np.ones(count, dtype=np.float64)
-    parent = list(range(count))
 
-    def find_root(index: int) -> int:
-        root = index
-        while parent[root] != root:
-            root = parent[root]
-        while parent[index] != root:  # сжатие пути
-            parent[index], index = root, parent[index]
-        return root
+    centroids: list[np.ndarray] = []
+    members: list[list[np.ndarray]] = []
+    assignment: list[int] = []
+    for vector in unit:
+        best_index = -1
+        best_sim = -1.0
+        for index, centroid in enumerate(centroids):
+            sim = float(vector @ centroid)
+            if sim > best_sim:
+                best_sim = sim
+                best_index = index
+        if best_index < 0 or (best_sim < threshold and len(centroids) < cap):
+            assignment.append(len(centroids))
+            centroids.append(vector.copy())
+            members.append([vector])
+        else:
+            assignment.append(best_index)
+            members[best_index].append(vector)
+            updated = np.mean(members[best_index], axis=0)
+            centroids[best_index] = updated / max(float(np.linalg.norm(updated)), 1e-12)
 
-    for _ in range(count - 1):
-        best_flat = int(np.argmax(sim))
-        if float(sim.flat[best_flat]) < threshold:
-            break
-        row, col = divmod(best_flat, sim.shape[1])
-        # Слияние col в row: средневзвешенное сходство (Ланс–Уильямс).
-        combined = sizes[row] + sizes[col]
-        sim[row, :] = (sizes[row] * sim[row, :] + sizes[col] * sim[col, :]) / combined
-        sim[:, row] = sim[row, :]
-        sim[row, row] = -np.inf
-        sim[col, :] = -np.inf
-        sim[:, col] = -np.inf
-        sizes[row] = combined
-        sizes[col] = 0.0
-        parent[col] = row
+    sizes = [len(cluster_members) for cluster_members in members]
+    large = [index for index in range(len(centroids)) if sizes[index] >= min_cluster_size]
+    if large:
+        for position, cluster in enumerate(assignment):
+            if sizes[cluster] >= min_cluster_size:
+                continue
+            vector = unit[position]
+            assignment[position] = max(
+                large, key=lambda index: float(vector @ centroids[index])
+            )
 
     cluster_of_root: dict[int, int] = {}
     result: list[int] = []
-    for index in range(count):
-        root = find_root(index)
-        if root not in cluster_of_root:
-            cluster_of_root[root] = len(cluster_of_root)
-        result.append(cluster_of_root[root])
+    for cluster in assignment:
+        if cluster not in cluster_of_root:
+            cluster_of_root[cluster] = len(cluster_of_root)
+        result.append(cluster_of_root[cluster])
     return result
 
 
@@ -702,28 +720,27 @@ def _relabel_regions_by_voice(
     *,
     cpu_threads: int,
     threshold: float,
+    min_cluster_size: int = 8,
     cancel: Callable[[], None] | None = None,
     progress: Callable[[float, str], None] | None = None,
 ) -> list[tuple[str, float, float]]:
-    """Склеить цепочки слотов pyannote в глобальных спикеров по тембру.
+    """Разметить регионы pyannote реальными спикерами по тембру.
 
     Чистая сегментация pyannote — локальный акустический разметчик: связь
     голосов держится только на перекрытии скользящих окон, поэтому спикер,
-    замолчавший дольше окна, возвращается под новым номером.  Эмбеддинги
-    WeSpeaker дают долгосрочную память, но кластеризовать надо не отдельные
-    регионы — у короткого куска шумный вектор, и на реальных записях один
-    голос так рассыпается на десятки кластеров, — а ЦЕПОЧКИ слотов: регионы
-    одного слота гарантированно принадлежат одному голосу (PIT-выравнивание
-    окон), а центроид цепочки (среднее эмбеддингов её регионов, взвешенное
-    по длительности) устойчив к шуму.  Слотов у модели три, поэтому спикеров
-    после склейки не больше трёх.  Одна цепочка — кластеризация не нужна
-    вовсе (и модель эмбеддингов не скачивается).  Недоступность модели —
-    не ошибка стадии, а откат на прежние цепочки слотов (с предупреждением).
+    замолчавший дольше окна, возвращается под новым номером; а лимит в три
+    слота не позволяет представить больше трёх голосов (слоты начинают
+    переиспользоваться разными людьми, и склейка слотов сливает разных
+    спикеров в одного).  Поэтому регионы сегментации эмбеддятся WeSpeaker и
+    кластеризуются по тембру уже без лимита слотов: голос после паузы любой
+    длины воссоединяется со своим кластером, а шесть или семь участников
+    совещания получают шесть-семь меток.  Недоступность модели эмбеддингов —
+    не ошибка стадии, а откат на цепочки слотов (с предупреждением в логе).
     """
-    chains: dict[str, list[int]] = {}
-    for position, (label, _start, _end) in enumerate(regions):
-        chains.setdefault(label, []).append(position)
+    chains = {label for label, _start, _end in regions}
     if len(chains) < 2:
+        # Один слот — один голос: кластеризация не нужна, модель эмбеддингов
+        # не скачивается и не грузится.
         return regions
 
     try:
@@ -754,19 +771,11 @@ def _relabel_regions_by_voice(
         log.warning("voice clustering failed (%s); slot chains kept", exc)
         return regions
 
-    ordered_chains = list(chains)
-    centroids = []
-    for label in ordered_chains:
-        members = chains[label]
-        weights = np.array(
-            [regions[i][2] - regions[i][1] for i in members], dtype=np.float64
-        )
-        centroids.append(_normalize(np.average(embeddings[members], axis=0, weights=weights)))
-    chain_clusters = _agglomerative_speaker_clusters(np.vstack(centroids), threshold)
-    cluster_of_chain = dict(zip(ordered_chains, chain_clusters, strict=True))
+    cluster_ids = _cluster_region_voices(embeddings, threshold, min_cluster_size)
+    labels = [f"Спикер {cluster + 1}" for cluster in cluster_ids]
     return [
-        (f"Спикер {cluster_of_chain[label] + 1}", start, end)
-        for label, start, end in regions
+        (labels[position], region_start, region_end)
+        for position, (_label, region_start, region_end) in enumerate(regions)
     ]
 
 
@@ -831,15 +840,18 @@ def _diarize_with_pyannote(
     group: PyannoteGroup | None = None,
     link: GigaamLink | None = None,
     voice_threshold: float = SIMILARITY_THRESHOLD,
+    voice_min_regions: int = 8,
     cancel: Callable[[], None] | None,
     progress: Callable[[float, str], None] | None,
 ) -> list[dict[str, Any]]:
-    """Label segments with the pyannote segmentation engine (up to 3 speakers).
+    """Label segments: pyannote finds turns, WeSpeaker voices count speakers.
 
     *group* — активная группа гиперпараметров (None -> встроенные дефолты);
     *link* — настройки связки с GigaAM (компенсация задержки CTC и допуск
     границ слов при голосовании);
-    *voice_threshold* — косинусный порог склейки цепочек слотов по тембру.
+    *voice_threshold* — косинусный порог тембровой кластеризации регионов;
+    *voice_min_regions* — минимум регионов в кластере, чтобы считаться
+    отдельным спикером (мелкие кластеры приклеиваются к ближайшему крупному).
     """
     if progress is not None:
         progress(0.0, "Загрузка модели спикеров")
@@ -874,15 +886,16 @@ def _diarize_with_pyannote(
             segment["speaker"] = "Спикер 1"
         return segments
 
-    # Долгосрочная память тембра: склеиваем цепочки слотов pyannote в
-    # глобальных спикеров по эмбеддингам WeSpeaker (схема pyannote.audio 3.x).
-    # Недоступность модели эмбеддингов — откат на цепочки слотов с предупреждением.
+    # Долгосрочная память тембра: регионы pyannote кластеризуются по тембру
+    # WeSpeaker (схема pyannote.audio 3.x) — без лимита трёх слотов.  Если
+    # модель эмбеддингов недоступна — откат на цепочки слотов с предупреждением.
     regions = _relabel_regions_by_voice(
         regions,
         audio.astype(np.float32, copy=False),
         sample_rate,
         cpu_threads=cpu_threads,
         threshold=voice_threshold,
+        min_cluster_size=voice_min_regions,
         cancel=cancel,
         progress=progress,
     )
@@ -1445,7 +1458,7 @@ class BaseDiarizationEngine(ABC):
 
 
 class PyannoteSegmentationEngine(BaseDiarizationEngine):
-    """PyAnnote 3.0 (границы и перекрытия) + WeSpeaker (тембр): до 3 спикеров."""
+    """PyAnnote 3.0 (границы и перекрытия) + WeSpeaker (тембр, без лимита слотов)."""
 
     id = "pyannote-segmentation-3.0"
     label = "PyAnnote 3.0 + WeSpeaker"
@@ -1477,14 +1490,17 @@ class PyannoteSegmentationEngine(BaseDiarizationEngine):
         progress: Callable[[float, str], None] | None,
     ) -> list[dict[str, Any]]:
         voice_threshold = threshold
+        voice_min_regions = 8
         if self._profiles:
             try:
-                voice_threshold = self._profiles.wespeaker_group(
-                    self._profile_id
-                ).threshold
+                voice_group = self._profiles.wespeaker_group(self._profile_id)
             except KeyError as exc:
                 self._log_missing_profile(exc)
-                voice_threshold = self._profiles.wespeaker[0].threshold
+                voice_group = self._profiles.wespeaker[0]
+            voice_threshold = voice_group.threshold
+            # Регионы короче VAD-сегментов: минимум размера кластера
+            # пересчитывается из профиля с понижающим коэффициентом.
+            voice_min_regions = max(4, voice_group.min_cluster_size // 2)
         return _diarize_with_pyannote(
             segments,
             audio,
@@ -1495,6 +1511,7 @@ class PyannoteSegmentationEngine(BaseDiarizationEngine):
             group=self._resolve_group(),
             link=self._profiles.gigaam if self._profiles else None,
             voice_threshold=voice_threshold,
+            voice_min_regions=voice_min_regions,
             cancel=cancel,
             progress=progress,
         )
