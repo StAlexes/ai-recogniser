@@ -68,9 +68,12 @@ PYANNOTE_MIN_DURATION_S = 0.2
 PYANNOTE_WINDOW_DURATION_S = 10.0
 PYANNOTE_WINDOW_STEP_S = 5.0
 # A speaker slot with less total speech than this is treated as network noise
-# (a hallucinated sub-second blip) and dropped before labels are numbered —
-# otherwise the blip steals a number from the real voices.
-MIN_SLOT_SPEECH_S = 2.0
+# (a hallucinated blip) and dropped before labels are numbered — otherwise
+# the blip steals a number from the real voices.  1.5 s keeps a real short
+# interjection (a sentence or two) alive while dropping the sub-second to
+# 1-second blips the network hallucinates; a 2 s floor was swallowing real
+# low-talk participants whole.
+MIN_SLOT_SPEECH_S = 1.5
 
 # How many segments are embedded in one onnx-asr call.  Larger batches are
 # faster but pad every clip to the longest one, so keep it modest.
@@ -340,9 +343,20 @@ def _regions_from_mask(
     return [(s, e) for s, e in regions if e - s >= min_duration_on]
 
 
+# Перестановки со счётом, отличающимся от максимального меньше чем на это,
+# считаются совпадающими: молчащий весь overlap канал не даёт сигнала, и его
+# вклад сводится к фоновым вероятностям неактивных классов (у pyannote —
+# ~exp(−10), произведения дают различия порядка 1e-4).  Осмысленные различия
+# (секунда речи) на два порядка больше.
+PERMUTATION_TIE_TOLERANCE = 1e-3
+
+
 def _find_best_speaker_permutation(
     prev_probs: np.ndarray,
     curr_probs: np.ndarray,
+    *,
+    prev_off_overlap: np.ndarray | None = None,
+    curr_off_overlap: np.ndarray | None = None,
 ) -> tuple[int, ...]:
     """Optimal permutation of the current window's speaker channels.
 
@@ -352,17 +366,46 @@ def _find_best_speaker_permutation(
     следующего, поэтому перед аккумуляцией каналы надо «выровнять» по
     предыдущему окну.  Для K=3 всего 3! = 6 перестановок — чистый NumPy
     считает мгновенно, без тяжёлой зависимости SciPy.
+
+    Участок перекрытия может не нести сигнала: участник молчал (пауза) или
+    его реплика целиком в новой части окна.  Тогда несколько перестановок
+    дают одинаковый счёт, и слепой выбор первой назначает молчащему каналу
+    произвольный слот — возвращающийся после паузы голос заводит новую
+    цепочку (дробление) или дописывается в чужую.  Совпадающие счёты
+    разрешаются вторичным критерием: активный вне overlap канал curr должен
+    наследовать слот, который нёс голос в prev-окне, а не пустой слот —
+    активность вне overlap (*prev_off_overlap*, *curr_off_overlap* —
+    суммарные вероятности каналов/слотов за пределами участка перекрытия)
+    тогда единственный сигнал для таких каналов.  Без них совпадающие счёты
+    разрешаются по-старому — первой перестановкой в лексикографическом
+    порядке.
     """
-    dot_matrix = np.matmul(prev_probs, curr_probs.T)  # shape (3, 3)
-    best_perm = (0, 1, 2)
-    best_score = -float("inf")
+    # Счёт в float64: float32-накопление на десятках тысяч сэмплов размывает
+    # совпадающие счёты, и tie-фаза перестаёт их видеть.
+    dot_matrix = np.matmul(
+        prev_probs.astype(np.float64), curr_probs.T.astype(np.float64)
+    )  # shape (3, 3)
+    candidates: list[tuple[float, float, tuple[int, ...]]] = []
     for perm in itertools.permutations(range(3)):
         # perm[i] — канал текущего окна, соответствующий каналу i прошлого.
         score = sum(
             float(dot_matrix[i, perm[i]]) for i in range(len(perm))
         )
-        if score > best_score:
-            best_score = score
+        tie = 0.0
+        if prev_off_overlap is not None and curr_off_overlap is not None:
+            tie = sum(
+                float(curr_off_overlap[perm[i]]) * float(prev_off_overlap[i])
+                for i in range(len(perm))
+            )
+        candidates.append((score, tie, perm))
+    top = max(score for score, _tie, _perm in candidates)
+    best_perm = candidates[0][2]
+    best_tie = -float("inf")
+    for score, tie, perm in candidates:
+        if score < top - PERMUTATION_TIE_TOLERANCE:
+            continue
+        if tie > best_tie:
+            best_tie = tie
             best_perm = perm
     return best_perm
 
@@ -472,7 +515,21 @@ def _pyannote_speaker_regions(
             if overlap_end > start:
                 slice_prev = prev_window_probs[:, start - prev_start : overlap_end - prev_start]
                 slice_curr = curr_win_probs[:, 0 : overlap_end - start]
-                perm = _find_best_speaker_permutation(slice_prev, slice_curr)
+                # Активность каналов ВНЕ участка перекрытия: для каналов,
+                # молчавших весь overlap (пауза, реплика целиком в новой
+                # части окна), это единственный сигнал, по которому
+                # разрешаются совпадающие счёты перестановок.
+                prev_off_overlap = (
+                    prev_window_probs[:, : start - prev_start].sum(axis=1)
+                    + prev_window_probs[:, overlap_end - prev_start :].sum(axis=1)
+                )
+                curr_off_overlap = curr_win_probs[:, overlap_end - start :].sum(axis=1)
+                perm = _find_best_speaker_permutation(
+                    slice_prev,
+                    slice_curr,
+                    prev_off_overlap=prev_off_overlap,
+                    curr_off_overlap=curr_off_overlap,
+                )
                 # perm[i] — локальный канал сети для глобального слота i.
                 curr_win_probs = curr_win_probs[list(perm), :]
 
@@ -639,23 +696,98 @@ def _embed_averaged(
 # --------------------------------------------------------------------------- #
 
 
+def _split_off_captured(
+    unit: np.ndarray, positions: list[int], threshold: float
+) -> tuple[list[int], list[int]] | None:
+    """Попытка разрезать кластер надвое: захватанный чужой голос отделяется.
+
+    Разрез ищется 2-means от самой непохожей пары членов (при равенстве
+    сходств с центрами член уходит в первый кусок).  Разрез принимается,
+    только если он разделяет голоса: среднее сходство МЕЖДУ кусками ниже
+    порога, а внутри каждого куска (между разными членами) — не ниже; иначе
+    кластер однороден или внутри-голосовое сходство ниже порога, и делить
+    его нельзя.  Возвращает (первый кусок, второй кусок) позиций или None.
+    """
+    size = len(positions)
+    vectors = unit[positions]
+    sims = vectors @ vectors.T
+    centroid = vectors.mean(axis=0)
+    centroid = centroid / max(float(np.linalg.norm(centroid)), 1e-12)
+    # Стартовые центры: центроид кластера и самый далёкий от него член —
+    # выбор по паре «самых непохожих» членов чувствителен к float-шуму на
+    # симметричных векторах (бленды оверлапа равноудалены от чистых голосов).
+    farthest = int(np.argmin(vectors @ centroid))
+    c1 = centroid.copy()
+    c2 = vectors[farthest].copy()
+    mask = None
+    for _ in range(20):
+        to_first = (vectors @ c1) >= (vectors @ c2)
+        if mask is not None and np.array_equal(to_first, mask):
+            break
+        mask = to_first
+        if not mask.any() or mask.all():
+            return None
+        first_mean = vectors[mask].mean(axis=0)
+        second_mean = vectors[~mask].mean(axis=0)
+        c1 = first_mean / max(float(np.linalg.norm(first_mean)), 1e-12)
+        c2 = second_mean / max(float(np.linalg.norm(second_mean)), 1e-12)
+    if mask is None:
+        return None
+    first = [positions[k] for k in range(size) if mask[k]]
+    second = [positions[k] for k in range(size) if not mask[k]]
+    if not first or not second:
+        return None
+    cross_mean = float(sims[mask][:, ~mask].sum()) / (len(first) * len(second))
+    if cross_mean >= threshold:
+        return None
+    for piece in (mask, ~mask):
+        piece_size = int(piece.sum())
+        if piece_size < 2:
+            continue  # одиночный кусок тривиально связен
+        inside = float(sims[piece][:, piece].sum()) - piece_size
+        if inside / (piece_size * (piece_size - 1)) < threshold:
+            return None
+    return first, second
+
+
 def _cluster_region_voices(
     embeddings: np.ndarray,
     threshold: float,
     min_cluster_size: int,
     *,
-    cap: int = 12,
+    cap: int = 16,
 ) -> list[int]:
-    """Онлайн-центроидная кластеризация эмбеддингов регионов по времени.
+    """Онлайн-кластеризация эмбеддингов регионов по времени.
 
     Классическая вторая ступень пайплайна pyannote.audio 3.x: сегментация
     даёт границы, тембр решает, сколько реально спикеров — лимита «три слота»
     нет.  Каждый регион (по порядку следования) присоединяется к кластеру с
-    ближайшим центроидом, если сходство не ниже *threshold*; иначе открывает
-    новый кластер (но не больше *cap* — иначе регион уходит ближайшему
-    кластеру безусловно, что гасит патологическое дробление).  Кластеры,
-    набравшие меньше *min_cluster_size* регионов, приклеиваются к ближайшему
-    крупному: короткие реплики «мимо» порога — шум, а не новые спикеры.
+    максимальным СРЕДНИМ сходством с его членами, если оно не ниже
+    *threshold*; иначе открывает новый кластер (но не больше *cap* — иначе
+    регион уходит ближайшему кластеру безусловно, что гасит патологическое
+    дробление).  Среднее по членам, а не сходство с центроидом-средним:
+    оба устойчивы к одиночным шумным регионам, но центроид, разбавленный
+    блендами оверлапа (регионами со смешанным голосом), дотягивает до чужого
+    голоса и захватывает его, не нарушив порог ни в одном отдельном решении;
+    среднее попарных сходств бленды утянуть не могут.
+
+    Совсем мелкие кластеры (не больше половины *min_cluster_size*) приклеиваются
+    к ближайшему крупному целиком, по сходству центроидов: короткие реплики
+    «мимо» порога — шум, а не новые спикеры; кластер, близкий к минимуму, —
+    реальный малоречивый участник, и целиком приклеивать его к чужому голосу
+    нельзя, а по-регионному приклеивание разъезжает один кластер между двумя
+    крупными.
+    Если крупных нет вовсе (порог выше внутри-голосового сходства — каждый
+    регион открыл свой кластер), мелкие кластеры жадно склеиваются между
+    собой по сходству центроидов: объединяется самая похожая пара, пока
+    мелкие не исчезнут или лучшая пара не упадёт ниже долины попарных
+    сходств (без долины — без порога); иначе дробление закреплялось бы
+    навсегда, ведь приклеивание работает только при непустом списке
+    «крупных».  После прохода назначения перепроверяются: центроид,
+    разбавленный блендами оверлапа, дрейфует к чужому голосу и захватывает
+    его, не нарушив порог ни в одном отдельном решении; кластер делится
+    надвое, если разрез разделяет голоса (между кусками сходство ниже
+    порога, внутри — не ниже), и разрезы применяются рекурсивно.
     Возвращает индекс кластера (0..k-1) для каждого эмбеддинга; номера
     упорядочены по первому появлению в записи.
 
@@ -693,16 +825,117 @@ def _cluster_region_voices(
             updated = np.mean(members[best_index], axis=0)
             centroids[best_index] = updated / max(float(np.linalg.norm(updated)), 1e-12)
 
-    sizes = [len(cluster_members) for cluster_members in members]
-    large = [index for index in range(len(centroids)) if sizes[index] >= min_cluster_size]
-    if large:
-        for position, cluster in enumerate(assignment):
-            if sizes[cluster] >= min_cluster_size:
+    # Перепроверка захваченных голосов: центроид кластера дрейфовал к блендам
+    # оверлапа и мог затянуть чужой голос, не нарушив порог ни в одном
+    # отдельном решении.  Кластер делится надвое, если разрез разделяет
+    # голоса: среднее сходство между кусками ниже порога, а внутри кусков —
+    # не ниже; разрезы применяются рекурсивно до стабилизации.
+    cluster_positions: list[list[int]] = [[] for _ in range(len(centroids))]
+    for position, cluster in enumerate(assignment):
+        cluster_positions[cluster].append(position)
+    changed = True
+    while changed:
+        changed = False
+        for index in range(len(cluster_positions)):
+            positions = cluster_positions[index]
+            if len(positions) < 2:
                 continue
-            vector = unit[position]
-            assignment[position] = max(
-                large, key=lambda index: float(vector @ centroids[index])
+            split = _split_off_captured(unit, positions, threshold)
+            if split is None:
+                continue
+            cluster_positions[index] = split[0]
+            cluster_positions.append(split[1])
+            changed = True
+
+    assignment = [0] * count
+    centroids = []
+    for new_index, positions in enumerate(cluster_positions):
+        for position in positions:
+            assignment[position] = new_index
+        mean = unit[np.asarray(positions, dtype=np.intp)].mean(axis=0)
+        centroids.append(mean / max(float(np.linalg.norm(mean)), 1e-12))
+    sizes = [len(positions) for positions in cluster_positions]
+    large = [index for index in range(len(centroids)) if sizes[index] >= min_cluster_size]
+
+    if not large and count >= min_cluster_size and len(centroids) > 1:
+        # Тупик дробления: порог выше внутри-голосового сходства сэмплов, ни
+        # один регион не смог присоединиться к синглтону-центроиду, и «крупных»
+        # кластеров нет — приклеивание молчит, дробление закрепляется навсегда
+        # (регионов хватает минимум на один крупный кластер, но никто им не
+        # стал).  Склеиваем самые похожие кластеры (жадно, по центроидам),
+        # пока мелкие не исчезнут или лучшая пара не станет непохожей: «свои»
+        # кластеры связаны сильнее «чужих», голоса не смешиваются.  Порог
+        # склейки — долина попарных сходств (та же, что калибрует адаптацию
+        # порога); долины нет — порог не добавляется, дробление навсегда хуже
+        # возможного слияния малоречивых голосов.
+        sims = unit @ unit.T
+        valley = _pairwise_valley(sims[np.triu_indices(count, k=1)])
+        glue_threshold = max(0.30, valley) if valley is not None else 0.0
+        while len(cluster_positions) > 1:
+            small = [
+                index
+                for index, positions in enumerate(cluster_positions)
+                if len(positions) < min_cluster_size
+            ]
+            if not small:
+                break
+            unit_centroids = [
+                unit[np.asarray(positions, dtype=np.intp)].mean(axis=0)
+                for positions in cluster_positions
+            ]
+            unit_centroids = [
+                mean / max(float(np.linalg.norm(mean)), 1e-12)
+                for mean in unit_centroids
+            ]
+            best_pair = (-1, -1)
+            best_sim = -1.0
+            for index in small:
+                for other in range(len(cluster_positions)):
+                    if other == index:
+                        continue
+                    sim = float(unit_centroids[index] @ unit_centroids[other])
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_pair = (index, other)
+            if best_sim < glue_threshold:
+                break
+            index, other = best_pair
+            if len(cluster_positions[other]) > len(cluster_positions[index]):
+                index, other = other, index
+            cluster_positions[index].extend(cluster_positions[other])
+            del cluster_positions[other]
+        assignment = [0] * count
+        centroids = []
+        for new_index, positions in enumerate(cluster_positions):
+            for position in positions:
+                assignment[position] = new_index
+            mean = unit[np.asarray(positions, dtype=np.intp)].mean(axis=0)
+            centroids.append(mean / max(float(np.linalg.norm(mean)), 1e-12))
+        sizes = [len(positions) for positions in cluster_positions]
+        large = [
+            index for index in range(len(centroids)) if sizes[index] >= min_cluster_size
+        ]
+    if large:
+        # Приклеиваются только совсем мелкие кластеры (не больше половины
+        # минимума) — короткие реплики «мимо» порога, шум.  Кластер, близкий
+        # к минимуму, — реальный малоречивый участник: приклеивать его целиком
+        # к чужому голосу нельзя.  Приклейка — ЦЕЛИКОМ, по сходству центроидов:
+        # по-регионное назначение разъезжает мелкий кластер между двумя
+        # крупными, и регионы одного человека получают разные метки.
+        glue_cap = max(1, min_cluster_size // 2)
+        small_clusters = [
+            index for index in range(len(centroids)) if sizes[index] <= glue_cap
+        ]
+        targets = {
+            cluster: max(
+                large, key=lambda index: float(centroids[cluster] @ centroids[index])
             )
+            for cluster in small_clusters
+        }
+        for cluster, target in targets.items():
+            for position, assigned in enumerate(assignment):
+                if assigned == cluster:
+                    assignment[position] = target
 
     cluster_of_root: dict[int, int] = {}
     result: list[int] = []
@@ -713,31 +946,101 @@ def _cluster_region_voices(
     return result
 
 
+# Долина между распределениями «свой/чужой» в попарных сходствах считается
+# реальной, если просвет между соседними отсортированными значениями не уже
+# этой ширины: внутри сплошного распределения просветы порядка 0,01, пустой
+# промежуток между распределениями — на порядок шире.
+VALLEY_MIN_WIDTH = 0.02
+# Доля пар ниже/выше долины: снизу должна лежать межспикерная масса (а не
+# хвост распределения), сверху — «своя» масса (иначе делить нечего).
+VALLEY_MIN_BELOW_SHARE = 0.15
+VALLEY_MIN_ABOVE_SHARE = 0.02
+
+
+def _pairwise_valley(vals: np.ndarray) -> float | None:
+    """Середина долины между распределениями «свой/чужой» попарных сходств.
+
+    Сходства сортируются, и между соседними значениями ищется самый широкий
+    просвет, у которого ширина не меньше :data:`VALLEY_MIN_WIDTH`, снизу
+    остаётся значимая масса пар (не хвост распределения), а сверху —
+    значимая «своя» масса.  Возвращается середина просвета; если такого
+    просвета нет (распределения перекрываются), долины в записи нет — None.
+    """
+    count = vals.size
+    if count < 2:
+        return None
+    order = np.sort(vals)
+    gaps = np.diff(order)
+    below = np.arange(1, count) / count
+    above = (count - np.arange(1, count)) / count
+    qualified = np.flatnonzero(
+        (gaps >= VALLEY_MIN_WIDTH)
+        & (below >= VALLEY_MIN_BELOW_SHARE)
+        & (above >= VALLEY_MIN_ABOVE_SHARE)
+    )
+    if qualified.size == 0:
+        return None
+    best = qualified[int(np.argmax(gaps[qualified]))]
+    return float((order[best] + order[best + 1]) / 2.0)
+
+
 def _adaptive_voice_threshold(
     embeddings: np.ndarray, threshold: float
 ) -> tuple[float, bool]:
     """Понизить порог для записей со сжатой тембровой информацией.
 
     На чистой речи эмбеддинги одного голоса стабильно дают сходство выше
-    порога профиля.  Если 95-й перцентиль попарных сходств файла не
-    достигает порога, тембровая информация в записи сжата (телефонная
-    полоса, сильное сжатие, дальний микрофон): при профильном пороге даже
-    лучшие пары «своего» голоса не склеиваются, и один спикер рассыпается
-    на несколько кластеров.  Порог тогда ставится в «долину» распределения
-    — чуть ниже p85 (верхняя граница массы разных голосов), но не ниже
-    0,30.  Возвращает (эффективный порог, был ли понижен).
+    порога профиля.  Если 85-й перцентиль попарных сходств файла — типичная
+    пара «своего» голоса — не достигает порога, тембровая информация в
+    записи сжата (телефонная полоса, сильное сжатие, дальний микрофон):
+    при профильном пороге даже типичные пары «своего» голоса не склеиваются,
+    и один спикер рассыпается на несколько кластеров.  Триггером служит
+    именно типичная пара, а не лучшая (95-й перцентиль): несколько
+    почти-дублирующихся регионов держат p95 выше порога, хотя тупик
+    дробления уже наступил.
+
+    Порог ставится в «долину» между распределениями «свой/чужой» — в
+    середину самого широкого просвета (:func:`_pairwise_valley`), но не
+    ниже 0,30.  Калибровать понижение перцентилями общей массы пар
+    (прежняя формула «p85 − 0,05») нельзя: на многоголосой записи «своих»
+    пар лишь ~1/k массы, p85 общей массы лежит в межспикерном
+    распределении, и порог опускается ниже долины — чужие голоса
+    склеиваются.
+
+    Если долины нет, понижение выполняется только для глубоко сжатых
+    записей (типичная пара дальше 0,05 от порога профиля — прежняя
+    формула).  Когда типичные пары почти дотягиваются до порога, запись не
+    настолько сжата, чтобы оправдать понижение: заниженный порог склеивает
+    голоса, потому что сэмплы чужого голоса лежат ближе к разросшемуся
+    центроиду, чем чужие сэмплы друг к другу.  Возвращает (эффективный
+    порог, был ли понижен).
     """
     count = len(embeddings)
-    if count < 20:
+    if count < 4:
+        # Мало регионов — перцентили непоказательны, порог не трогаем.
         return threshold, False
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     norms[norms == 0.0] = 1.0
     unit = embeddings / norms
     sims = unit @ unit.T
     vals = sims[np.triu_indices(count, k=1)]
-    if vals.size == 0 or float(np.percentile(vals, 95)) >= threshold:
+    if vals.size == 0:
         return threshold, False
-    lowered = max(0.30, float(np.percentile(vals, 85)) - 0.05)
+    typical = float(np.percentile(vals, 85))
+    if typical >= threshold:
+        return threshold, False
+    valley = _pairwise_valley(vals)
+    if valley is not None:
+        lowered = max(0.30, valley)
+        if lowered < threshold:
+            return lowered, True
+        # Долина не ниже порога профиля — понижение не требуется.
+        return threshold, False
+    if typical >= threshold - 0.05:
+        # Долины нет, а типичные пары почти дотягиваются до порога профиля:
+        # любое понижение утапливает порог в межспикерной массе.
+        return threshold, False
+    lowered = max(0.30, typical - 0.05)
     return lowered, True
 
 
@@ -766,9 +1069,12 @@ def _relabel_regions_by_voice(
     не ошибка стадии, а откат на цепочки слотов (с предупреждением в логе).
     """
     chains = {label for label, _start, _end in regions}
-    if len(chains) < 2:
-        # Один слот — один голос: кластеризация не нужна, модель эмбеддингов
-        # не скачивается и не грузится.
+    if len(chains) < 2 and len(regions) < 2:
+        # Один слот с одним регионом — один голос: кластеризация не нужна,
+        # модель эмбеддингов не скачивается и не грузится.  Единственная
+        # цепочка из нескольких регионов может скрывать разных людей: тихий
+        # overlap не дал PIT сигнала, и слот был переиспользован после
+        # паузы, — такие записи кластеризуются по тембру.
         return regions
 
     try:
