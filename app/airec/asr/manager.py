@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import threading
 import time
@@ -58,6 +59,9 @@ log = logging.getLogger(__name__)
 JOB_SCHEMA = 1
 MAX_INPUT_BYTES = 4 * 1024 * 1024 * 1024
 ACTIVE_STATUSES = {"queued", "running"}
+# Side-car отчёт режима проверки спикеров (data/results/<id>/…).
+REVIEW_FILE_NAME = "diarization_review.json"
+REVIEW_VERSION = 1
 
 Transcriber = Callable[..., TranscriptionResult]
 SummaryRunner = Callable[[str, Callable[[float, str], None]], dict[str, Any]]
@@ -69,6 +73,10 @@ class JobValidationError(ValueError):
 
 class JobCancelled(RuntimeError):
     """Raised inside a worker when the user cancels its job."""
+
+
+class JobNotFinished(ValueError):
+    """The requested result exists only for a finished job."""
 
 
 def utc_now() -> str:
@@ -438,6 +446,22 @@ class JobManager:
                 "Добавьте файл в очередь заново, чтобы повторить задачу."
             )
         raise FileNotFoundError(f"Исходный файл задачи не найден: {job.filename}")
+
+    def source_file(self, job_id: str) -> Path:
+        """Best available copy of the original file (for playback in review).
+
+        Raises ``FileNotFoundError`` when the job is unknown or its source is
+        gone — the API layer maps these to 404/409.
+        """
+        job = self.get(job_id)
+        if job is None:
+            raise FileNotFoundError(f"Задача {job_id} не найдена.")
+        source = self._stored_source(job)
+        if source is None:
+            raise FileNotFoundError(
+                f"Исходный файл задачи недоступен: {job.original_path or job.filename}"
+            )
+        return source
 
     def _purge_source_copies(self, job: Job) -> bool:
         """Удалить копию исходника из папки задачи (поведение до 0.4.4).
@@ -1324,7 +1348,9 @@ class JobManager:
             if job is None:
                 raise FileNotFoundError(f"Job {job_id} not found.")
             if job.status != "done":
-                raise ValueError(f"Job {job_id} is not finished (status={job.status}).")
+                raise JobNotFinished(
+                    f"Job {job_id} is not finished (status={job.status})."
+                )
             return job
 
     def _export_content(
@@ -1342,6 +1368,15 @@ class JobManager:
                     job.summary or {}, ensure_ascii=False, indent=2
                 )
             return format_summary(job.summary, title=job.filename)
+        if view == "review":
+            # Отчёт режима проверки — всегда JSON (формат отчёта фиксирован).
+            stored = self.load_review(job.id)
+            report = (
+                stored
+                if stored is not None
+                else self._review_report(job, [])
+            )
+            return json.dumps(report, ensure_ascii=False, indent=2)
         if view == "diarization":
             segments = [
                 {**segment, "speaker": segment.get("speaker") or "Спикер ?"}
@@ -1397,6 +1432,189 @@ class JobManager:
         target.write_text(content, encoding="utf-8", newline="\n")
         log.info("job %s saved as %s (%s)", job_id, target, EXPORT_DOWNLOAD_NAMES[format])
         return target
+
+    # ------------------------------------------------------------------ #
+    # Speaker review (диагностический режим проверки спикеров)
+    # ------------------------------------------------------------------ #
+    def review_path(self, job_id: str) -> Path:
+        return self._job_dir(job_id) / REVIEW_FILE_NAME
+
+    def load_review(self, job_id: str) -> dict[str, Any] | None:
+        """Stored review report, or ``None`` when the user has not saved one."""
+        self._finished_job(job_id)
+        path = self.review_path(job_id)
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            log.exception("cannot read review file for %s", job_id)
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def save_review(self, job_id: str, corrections: list[dict[str, Any]]) -> dict[str, Any]:
+        """Validate *corrections* against the job segments and store the report.
+
+        Принимаются только исправления ({index, correct, comment}); остальное
+        (исходная разметка, статистика, снимок настроек) досчитывается от
+        задачи — системная разметка в job.segments не меняется.
+        """
+        job = self._finished_job(job_id)
+        existing = self.load_review(job_id)
+        created_at = (
+            existing.get("created_at")
+            if isinstance(existing, dict) and existing.get("created_at")
+            else utc_now()
+        )
+        report = self._review_report(job, corrections)
+        report["created_at"] = created_at
+        report["updated_at"] = utc_now()
+
+        path = self.review_path(job_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+            newline="\n",
+        )
+        os.replace(tmp, path)
+        log.info(
+            "review saved for %s: %d correction(s)", job_id, len(report["corrections"])
+        )
+        return report
+
+    def _review_report(
+        self, job: Job, corrections: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Build the full report: system labels + user corrections + stats.
+
+        Фрагменты — сегменты с непустым текстом, в порядке задачи; *index*
+        в исправлении — позиция в этом списке (UI показывает тот же список).
+        """
+        fragments = [
+            (index, segment)
+            for index, segment in enumerate(job.segments)
+            if str(segment.get("text", "")).strip()
+        ]
+        labels: dict[int, str] = {}
+        for position, (_index, segment) in enumerate(fragments):
+            speaker = segment.get("speaker")
+            labels[position] = str(speaker) if speaker else ""
+
+        known = {label for label in labels.values() if label}
+
+        def _next_label(current: set[str]) -> str:
+            """Следующий свободный номер: «Спикер N+1» по максимуму введённого."""
+            numbers = [
+                int(match.group(1))
+                for label in current
+                if (match := re.fullmatch(r"Спикер (\d+)", label)) is not None
+            ]
+            return f"Спикер {max(numbers, default=0) + 1}"
+
+        validated: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for correction in corrections:
+            if not isinstance(correction, dict):
+                raise ValueError("Каждое исправление должно быть объектом.")
+            position = correction.get("index")
+            correct = str(correction.get("correct", "")).strip()
+            if not isinstance(position, int) or position < 0 or position >= len(fragments):
+                raise ValueError(f"Неизвестный номер фрагмента: {position!r}")
+            if position in seen:
+                raise ValueError(f"Фрагмент {position} указан дважды.")
+            seen.add(position)
+            if not correct:
+                raise ValueError("Не указан правильный спикер.")
+            if correct not in known and correct != _next_label(known):
+                raise ValueError(
+                    f"Спикер «{correct}» не входит в разметку задачи "
+                    f"(новым может быть только «{_next_label(known)}»)."
+                )
+            # Введённая метка сразу действительна и для следующих исправлений.
+            known.add(correct)
+            segment = fragments[position][1]
+            validated.append(
+                {
+                    "index": position,
+                    "start_s": segment.get("start_s"),
+                    "end_s": segment.get("end_s"),
+                    "text": str(segment.get("text", "")).strip(),
+                    "assigned": labels[position],
+                    "correct": correct,
+                    "comment": str(correction.get("comment", "")).strip(),
+                }
+            )
+
+        corrected_labels = dict(labels)
+        for correction in validated:
+            corrected_labels[correction["index"]] = correction["correct"]
+
+        def _counts(source: dict[int, str]) -> dict[str, int]:
+            counts: dict[str, int] = {}
+            for label in source.values():
+                if label:
+                    counts[label] = counts.get(label, 0) + 1
+            return dict(sorted(counts.items()))
+
+        return {
+            "version": REVIEW_VERSION,
+            "job": {
+                "id": job.id,
+                "filename": job.filename,
+                "audio_format": job.audio_format,
+                "duration_s": job.duration_s,
+                "model": job.model,
+                "diarize_profile": job.diarize_profile,
+            },
+            "settings": self._review_settings_snapshot(job),
+            "original_labels": [
+                {
+                    "index": position,
+                    "start_s": segment.get("start_s"),
+                    "end_s": segment.get("end_s"),
+                    "text": str(segment.get("text", "")).strip(),
+                    "speaker": labels[position],
+                }
+                for position, (_index, segment) in enumerate(fragments)
+            ],
+            "corrections": validated,
+            "stats": {
+                "fragments": len(fragments),
+                "corrected": len(validated),
+                "speaker_counts_original": _counts(labels),
+                "speaker_counts_corrected": _counts(corrected_labels),
+            },
+        }
+
+    def _review_settings_snapshot(self, job: Job) -> dict[str, Any]:
+        """Значения активной группы диаризации на момент сохранения отчёта.
+
+        Настройки могли измениться после запуска стадии, поэтому снимок —
+        «текущие значения», а не гарантированно те, что работали в задаче.
+        """
+        settings = self._settings()
+        engine = "pyannote" if settings.diarize_model == "pyannote-segmentation-3.0" else "wespeaker"
+        profile_id = job.diarize_profile or settings.diarize_profile
+        snapshot: dict[str, Any] = {
+            "engine": engine,
+            "diarize_model": settings.diarize_model,
+            "profile_id": profile_id,
+            "diarize_threshold": settings.diarize_threshold,
+        }
+        try:
+            profiles = load_diarization_profiles(self._paths.data)
+            group = (
+                profiles.pyannote_group(profile_id or None)
+                if engine == "pyannote"
+                else profiles.wespeaker_group(profile_id or None)
+            )
+            snapshot["group"] = group.model_dump()
+        except (KeyError, OSError):
+            log.warning("cannot snapshot diarization profile %r for review", profile_id)
+            snapshot["group"] = None
+        return snapshot
 
     # ------------------------------------------------------------------ #
     # Independent stages: recognition / diarization / summary

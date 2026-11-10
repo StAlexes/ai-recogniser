@@ -1008,6 +1008,141 @@ textarea {
   padding: 14px 16px 16px;
 }
 
+/* Режим проверки спикеров: аудиоплеер, тулбар и список фрагментов вместо
+   textarea.  Панель та же — список занимает её остаток высоты. */
+.transcript-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.review-pane {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  margin: 14px 16px 16px;
+}
+
+.review-audio {
+  width: 100%;
+}
+
+.review-hint {
+  margin: 0;
+  font-size: 13px;
+  color: var(--colorNeutralForeground3);
+}
+
+.review-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.review-count {
+  font-size: 13px;
+  color: var(--colorNeutralForeground2);
+}
+
+.review-toolbar-buttons {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.review-list {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow-y: auto;
+}
+
+.review-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--colorNeutralStroke2);
+  border-radius: 6px;
+}
+
+.review-item-edited {
+  border-color: var(--colorBrandStroke1);
+  background: var(--colorSubtleBackground);
+}
+
+.review-item-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.review-time {
+  min-width: 96px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--colorNeutralForeground2);
+}
+
+.review-play {
+  display: inline-flex;
+  padding: 2px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.review-play:hover:not(:disabled) {
+  color: var(--colorBrandForeground1);
+}
+
+.review-play:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.review-select {
+  max-width: 180px;
+  padding: 3px 6px;
+  border: 1px solid var(--colorNeutralStroke1);
+  border-radius: 4px;
+  background: var(--colorNeutralBackground1);
+  color: var(--colorNeutralForeground1);
+  font: inherit;
+  font-size: 13px;
+}
+
+.review-was {
+  font-size: 12px;
+  color: var(--colorNeutralForeground3);
+}
+
+.review-text {
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.review-comment {
+  padding: 4px 8px;
+  border: 1px solid var(--colorNeutralStroke1);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+}
+
 /* Профиль диаризации в карточке этапа: список не должен вываливаться
    за пределы карточки.  Фluent даёт Dropdown minWidth 250px — карточка уже,
    поэтому ширина ограничена контейнером, а длинная подпись обрезается. */

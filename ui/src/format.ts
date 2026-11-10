@@ -43,6 +43,19 @@ function plural(count: number, one: string, few: string, many: string): string {
   return many;
 }
 
+/** Секунды в mm:ss или h:mm:ss — таймкоды фрагментов в режиме проверки. */
+export function formatClock(seconds: number): string {
+  const total = Number.isFinite(seconds) ? Math.max(Math.round(seconds), 0) : 0;
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  const ss = String(secs).padStart(2, '0');
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${ss}`;
+  }
+  return `${minutes}:${ss}`;
+}
+
 export function pluralFiles(count: number): string {
   return `${count} ${plural(count, 'файл', 'файла', 'файлов')}`;
 }

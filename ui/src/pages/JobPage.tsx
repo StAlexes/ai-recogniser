@@ -26,10 +26,14 @@ import {
 } from '@fluentui/react-icons';
 import {
   AuthError,
+  ApiError,
   cancelJob,
+  fetchJobAudio,
   getDiarizationProfiles,
   getJob,
+  getJobReview,
   getSettings,
+  putJobReview,
   retryJob,
   revealJobFolder,
   revealJobSource,
@@ -41,12 +45,13 @@ import {
 import type {
   DiarizationProfilesResponse,
   JobDetail,
+  ReviewCorrection,
   StageAction,
   StageKey,
 } from '../api';
 import { PageHeader } from '../components/PageHeader';
 import { openResultFolder, revealSourceFile, saveResultAs } from '../desktop';
-import { formatBytes } from '../format';
+import { formatBytes, formatClock } from '../format';
 import {
   describeError,
   formatDate,
@@ -70,6 +75,19 @@ const RESULT_LABELS: Record<ResultView, string> = {
   diarization: 'Расшифровка с диаризацией',
   summary: 'Саммари',
 };
+
+/** Форматы, которые WebView2 (Chromium) воспроизводит без конвертации. */
+const PLAYABLE_AUDIO = new Set([
+  'mp3',
+  'm4a',
+  'mp4',
+  'wav',
+  'ogg',
+  'opus',
+  'flac',
+  'webm',
+  'mov',
+]);
 
 interface JobPageProps {
   jobId: string;
@@ -267,6 +285,20 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
   // a manual pick makes the selection sticky for this visit.
   const [view, setView] = useState<ResultView | null>(null);
   const [viewPicked, setViewPicked] = useState(false);
+  // Режим проверки спикеров: пользователь слушает фрагменты и указывает
+  // правильную метку; отчёт хранится отдельно от разметки задачи.
+  const [reviewMode, setReviewMode] = useState(false);
+  const [reviewBusy, setReviewBusy] = useState(false);
+  // Локальные правки: позиция фрагмента (в списке фрагментов с текстом,
+  // совпадает с original_labels отчёта) → правильный спикер.  До сохранения
+  // они живут только здесь.
+  const [reviewEdits, setReviewEdits] = useState<Map<number, string>>(new Map());
+  const [reviewComments, setReviewComments] = useState<Map<number, string>>(
+    new Map(),
+  );
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioFormat = job?.audio_format ?? '';
   // Какие ошибки этапов уже показаны верхним уведомлением — чтобы опрос не
   // дублировал одну и ту же плашку каждые пару секунд.
   const announcedStages = useRef(new Set<string>());
@@ -301,6 +333,10 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     setView(null);
     setViewPicked(false);
     setProfileDraft(null);
+    setReviewMode(false);
+    setReviewEdits(new Map());
+    setReviewComments(new Map());
+    setAudioUrl(null);
     announcedStages.current = new Set();
     void loadJob();
   }, [jobId]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -477,6 +513,163 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
   const speakerCount = new Set(
     (job?.segments ?? []).map((segment) => segment.speaker).filter(Boolean),
   ).size;
+
+  // Фрагменты с текстом — тот же список, что сервер кладёт в отчёт проверки
+  // (original_labels), поэтому позиции исправлений совпадают.
+  const reviewFragments = useMemo(() => {
+    if (job === null) {
+      return [];
+    }
+    return job.segments
+      .map((segment, index) => ({ ...segment, index }))
+      .filter((segment) => segment.text.trim() !== '');
+  }, [job]);
+
+  // Метки для выпадающих списков: исходные + уже введённые исправления +
+  // «следующий новый» (правило совпадает с серверной валидацией).
+  const reviewSpeakerOptions = useMemo(() => {
+    const labels = new Set<string>();
+    const numbers: number[] = [];
+    for (const fragment of reviewFragments) {
+      if (fragment.speaker !== null && fragment.speaker !== '') {
+        labels.add(fragment.speaker);
+      }
+    }
+    for (const value of reviewEdits.values()) {
+      labels.add(value);
+    }
+    for (const label of labels) {
+      const match = /Спикер (\d+)/.exec(label);
+      if (match !== null) {
+        numbers.push(Number(match[1]));
+      }
+    }
+    const sorted = [...labels].sort((a, b) => {
+      const na = /Спикер (\d+)/.exec(a);
+      const nb = /Спикер (\d+)/.exec(b);
+      const va = na === null ? Number.MAX_SAFE_INTEGER : Number(na[1]);
+      const vb = nb === null ? Number.MAX_SAFE_INTEGER : Number(nb[1]);
+      return va - vb || a.localeCompare(b);
+    });
+    sorted.push(`Спикер ${Math.max(0, ...numbers) + 1}`);
+    return sorted;
+  }, [reviewFragments, reviewEdits]);
+
+  // Аудио для прослушивания: Blob с токеном в заголовке → objectURL.
+  // При выходе из режима или смене задачи ссылка освобождается.
+  useEffect(() => {
+    if (!reviewMode || jobId === '') {
+      setAudioUrl(null);
+      return;
+    }
+    if (!PLAYABLE_AUDIO.has(audioFormat.toLowerCase())) {
+      setAudioUrl(null);
+      return;
+    }
+    let revoked = false;
+    let objectUrl: string | null = null;
+    const load = async (): Promise<void> => {
+      try {
+        const blob = await fetchJobAudio(jobId);
+        if (revoked) {
+          return;
+        }
+        objectUrl = URL.createObjectURL(blob);
+        setAudioUrl(objectUrl);
+      } catch (reason: unknown) {
+        if (reason instanceof AuthError) {
+          onAuthError();
+          return;
+        }
+        // Плеер необязателен: разметка по тексту и времени работает и без него.
+        setAudioUrl(null);
+      }
+    };
+    void load();
+    return () => {
+      revoked = true;
+      if (objectUrl !== null) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [reviewMode, jobId, audioFormat, onAuthError]);
+
+  const enterReview = useCallback(async (): Promise<void> => {
+    if (job === null) {
+      return;
+    }
+    setError(null);
+    // 404 — отчёта ещё нет: начинаем с пустых исправлений.
+    try {
+      const report = await getJobReview(job.id);
+      setReviewEdits(
+        new Map(report.corrections.map((item) => [item.index, item.correct])),
+      );
+      setReviewComments(
+        new Map(
+          report.corrections
+            .filter((item) => item.comment !== '')
+            .map((item) => [item.index, item.comment]),
+        ),
+      );
+    } catch (reason: unknown) {
+      if (reason instanceof AuthError) {
+        onAuthError();
+        return;
+      }
+      if (!(reason instanceof ApiError && reason.status === 404)) {
+        showError(describeError(reason));
+        return;
+      }
+      setReviewEdits(new Map());
+      setReviewComments(new Map());
+    }
+    setReviewMode(true);
+  }, [job, onAuthError, showError]);
+
+  const saveReview = useCallback(async (): Promise<void> => {
+    if (job === null) {
+      return;
+    }
+    setReviewBusy(true);
+    setError(null);
+    try {
+      const corrections: ReviewCorrection[] = [...reviewEdits.entries()].map(
+        ([index, correct]) => ({
+          index,
+          correct,
+          comment: reviewComments.get(index) ?? '',
+        }),
+      );
+      const report = await putJobReview(job.id, corrections);
+      setNotice(
+        `Отчёт проверки сохранён: исправлений — ${report.stats.corrected}.`,
+      );
+    } catch (reason: unknown) {
+      if (reason instanceof AuthError) {
+        onAuthError();
+        return;
+      }
+      showError(describeError(reason));
+    } finally {
+      setReviewBusy(false);
+    }
+  }, [job, reviewEdits, reviewComments, onAuthError, showError]);
+
+  const resetReview = (): void => {
+    setReviewEdits(new Map());
+    setReviewComments(new Map());
+  };
+
+  const playFragment = (startS: number): void => {
+    const audio = audioRef.current;
+    if (audio === null) {
+      return;
+    }
+    // Небольшой отступ влево: услышать начало слова, а не его середину.
+    audio.currentTime = Math.max(0, startS - 0.2);
+    void audio.play().catch(() => undefined);
+  };
 
   const handleOpenFolder = async (): Promise<void> => {
     if (job === null) {
@@ -1009,29 +1202,172 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                 </p>
               ) : null}
             </div>
-            {resultViews.views.length > 1 ? (
-              <Dropdown
-                aria-label="Результат разбора"
-                className="job-result-switch"
-                value={RESULT_LABELS[view]}
-                selectedOptions={[view]}
-                onOptionSelect={(_event, data) => {
-                  if (data.optionValue !== undefined) {
-                    setView(data.optionValue as ResultView);
-                    setViewPicked(true);
-                  }
-                }}
-              >
-                {resultViews.views.map((key) => (
-                  <Option key={key} value={key}>
-                    {RESULT_LABELS[key]}
-                  </Option>
-                ))}
-              </Dropdown>
-            ) : null}
+            <div className="transcript-head-actions">
+              {view === 'diarization' && job.segments.length > 0 ? (
+                <Button
+                  appearance={reviewMode ? 'primary' : 'secondary'}
+                  icon={<PlayRegular />}
+                  disabled={reviewBusy}
+                  onClick={() => void enterReview()}
+                >
+                  Проверить спикеров
+                </Button>
+              ) : null}
+              {resultViews.views.length > 1 ? (
+                <Dropdown
+                  aria-label="Результат разбора"
+                  className="job-result-switch"
+                  value={RESULT_LABELS[view]}
+                  selectedOptions={[view]}
+                  onOptionSelect={(_event, data) => {
+                    if (data.optionValue !== undefined) {
+                      setView(data.optionValue as ResultView);
+                      setViewPicked(true);
+                    }
+                  }}
+                >
+                  {resultViews.views.map((key) => (
+                    <Option key={key} value={key}>
+                      {RESULT_LABELS[key]}
+                    </Option>
+                  ))}
+                </Dropdown>
+              ) : null}
+            </div>
           </div>
           {view === 'summary' && job.summary !== null ? (
             <SummaryBody summary={job.summary} />
+          ) : reviewMode && view === 'diarization' ? (
+            <div className="review-pane">
+              {audioUrl !== null ? (
+                <audio
+                  ref={audioRef}
+                  className="review-audio"
+                  controls
+                  preload="metadata"
+                  src={audioUrl}
+                />
+              ) : (
+                <p className="review-hint">
+                  Прослушивание недоступно для этого формата — сверяйтесь по
+                  времени и тексту.
+                </p>
+              )}
+              <div className="review-toolbar">
+                <span className="review-count">
+                  Исправлено: {reviewEdits.size} из {reviewFragments.length}
+                </span>
+                <div className="review-toolbar-buttons">
+                  <Button
+                    appearance="primary"
+                    icon={<SaveRegular />}
+                    disabled={reviewBusy}
+                    onClick={() => void saveReview()}
+                  >
+                    Сохранить отчёт
+                  </Button>
+                  <Button
+                    icon={<ArrowClockwiseRegular />}
+                    disabled={reviewBusy || reviewEdits.size === 0}
+                    onClick={resetReview}
+                  >
+                    Сбросить
+                  </Button>
+                  <Button
+                    icon={<DismissRegular />}
+                    disabled={reviewBusy}
+                    onClick={() => setReviewMode(false)}
+                  >
+                    Готово
+                  </Button>
+                </div>
+              </div>
+              <ul className="review-list">
+                {reviewFragments.map((fragment, position) => {
+                  const original = fragment.speaker ?? '';
+                  const effective = reviewEdits.get(position) ?? original;
+                  const edited = reviewEdits.has(position);
+                  const rowOptions =
+                    original === '' || reviewSpeakerOptions.includes(original)
+                      ? reviewSpeakerOptions
+                      : [...reviewSpeakerOptions, original];
+                  return (
+                    <li
+                      key={position}
+                      className={
+                        edited ? 'review-item review-item-edited' : 'review-item'
+                      }
+                    >
+                      <div className="review-item-top">
+                        <button
+                          type="button"
+                          className="review-play"
+                          aria-label={`Прослушать фрагмент с ${formatClock(fragment.start_s)}`}
+                          disabled={audioUrl === null}
+                          onClick={() => playFragment(fragment.start_s)}
+                        >
+                          <PlayRegular />
+                        </button>
+                        <span className="review-time">
+                          {formatClock(fragment.start_s)}–
+                          {formatClock(fragment.end_s)}
+                        </span>
+                        <select
+                          className="review-select"
+                          value={effective}
+                          aria-label="Спикер фрагмента"
+                          onChange={(event) => {
+                            const value = event.target.value;
+                            setReviewEdits((prev) => {
+                              const next = new Map(prev);
+                              if (value === original) {
+                                next.delete(position);
+                              } else {
+                                next.set(position, value);
+                              }
+                              return next;
+                            });
+                          }}
+                        >
+                          {original === '' ? <option value="">—</option> : null}
+                          {rowOptions.map((option) => (
+                            <option key={option} value={option}>
+                              {option}
+                            </option>
+                          ))}
+                        </select>
+                        {edited ? (
+                          <span className="review-was">
+                            было: {original === '' ? '—' : original}
+                          </span>
+                        ) : null}
+                      </div>
+                      <div className="review-text">{fragment.text}</div>
+                      {edited ? (
+                        <input
+                          className="review-comment"
+                          type="text"
+                          placeholder="Комментарий (необязательно)"
+                          value={reviewComments.get(position) ?? ''}
+                          onChange={(event) => {
+                            const value = event.target.value;
+                            setReviewComments((prev) => {
+                              const next = new Map(prev);
+                              if (value === '') {
+                                next.delete(position);
+                              } else {
+                                next.set(position, value);
+                              }
+                              return next;
+                            });
+                          }}
+                        />
+                      ) : null}
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
           ) : (
             <Textarea
               className="job-transcript"

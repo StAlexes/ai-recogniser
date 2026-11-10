@@ -538,6 +538,106 @@ export function stageAction(
   );
 }
 
+// --------------------------------------------------------------------------- //
+// Режим проверки спикеров (диагностика диаризации)
+// --------------------------------------------------------------------------- //
+
+/** One user correction: fragment *index* gets the right speaker label. */
+export interface ReviewCorrection {
+  index: number;
+  correct: string;
+  comment: string;
+}
+
+/** Stored report of the speaker review (diarization_review.json). */
+export interface ReviewReport {
+  version: number;
+  created_at: string;
+  updated_at: string;
+  job: {
+    id: string;
+    filename: string;
+    audio_format: string;
+    duration_s: number | null;
+    model: string;
+    diarize_profile: string;
+  };
+  settings: {
+    engine: string;
+    diarize_model: string;
+    profile_id: string;
+    diarize_threshold: number;
+    group: Record<string, unknown> | null;
+  };
+  original_labels: Array<{
+    index: number;
+    start_s: number;
+    end_s: number;
+    text: string;
+    speaker: string;
+  }>;
+  corrections: Array<{
+    index: number;
+    start_s: number;
+    end_s: number;
+    text: string;
+    assigned: string;
+    correct: string;
+    comment: string;
+  }>;
+  stats: {
+    fragments: number;
+    corrected: number;
+    speaker_counts_original: Record<string, number>;
+    speaker_counts_corrected: Record<string, number>;
+  };
+}
+
+export function getJobReview(jobId: string): Promise<ReviewReport> {
+  return request<ReviewReport>(`/api/v1/jobs/${encodeURIComponent(jobId)}/review`);
+}
+
+export function putJobReview(
+  jobId: string,
+  corrections: ReviewCorrection[],
+): Promise<ReviewReport> {
+  return request<ReviewReport>(`/api/v1/jobs/${encodeURIComponent(jobId)}/review`, {
+    method: 'PUT',
+    body: { corrections },
+    timeoutMs: 15_000,
+  });
+}
+
+/** The original file as a Blob for the review player (auth by header). */
+export async function fetchJobAudio(jobId: string): Promise<Blob> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 120_000);
+  try {
+    const response = await fetch(
+      `${API_BASE}/api/v1/jobs/${encodeURIComponent(jobId)}/audio`,
+      {
+        headers: token !== null ? { Authorization: `Bearer ${token}` } : {},
+        credentials: 'same-origin',
+        cache: 'no-store',
+        signal: controller.signal,
+      },
+    );
+    if (response.status === 401) {
+      throw new AuthError();
+    }
+    if (!response.ok) {
+      const detail = await readErrorDetail(response);
+      throw new ApiError(
+        response.status,
+        detail ?? `Аудио недоступно (HTTP ${response.status}).`,
+      );
+    }
+    return await response.blob();
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 export function revealJobFolder(jobId: string): Promise<{ id: string; path: string }> {
   return request<{ id: string; path: string }>(
     `/api/v1/jobs/${encodeURIComponent(jobId)}/reveal`,

@@ -11,10 +11,15 @@ from typing import Annotated
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from airec.asr.audio import SUPPORTED_EXTENSIONS
-from airec.asr.manager import ACTIVE_STATUSES, JobManager, JobValidationError
+from airec.asr.manager import (
+    ACTIVE_STATUSES,
+    JobManager,
+    JobNotFinished,
+    JobValidationError,
+)
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
@@ -22,6 +27,20 @@ router = APIRouter(prefix="/api/v1/jobs", tags=["jobs"])
 EXPORT_FORMATS = {"txt", "srt", "vtt", "md", "json"}
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+# Media types for serving the original file in the review mode player.
+# Only what Chromium (WebView2) can play is listed; mkv/avi stay octet-stream.
+AUDIO_MEDIA_TYPES = {
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".mp4": "video/mp4",
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+}
 
 
 class SaveResultRequest(BaseModel):
@@ -42,6 +61,21 @@ class DiarizeProfileRequest(BaseModel):
     """Body of PUT /jobs/{id}/diarize_profile ("" = use the global profile)."""
 
     diarize_profile: str = ""
+
+
+class ReviewCorrection(BaseModel):
+    """One user correction: fragment *index* gets the right speaker."""
+
+    index: int = Field(ge=0)
+    correct: str = Field(min_length=1, max_length=64)
+    comment: str = ""
+
+
+class ReviewUpdateRequest(BaseModel):
+    """Body of PUT /jobs/{id}/review — only the corrections; the server
+    rebuilds labels, settings snapshot and stats from the job itself."""
+
+    corrections: list[ReviewCorrection] = Field(default_factory=list)
 
 
 def _manager(request: Request) -> JobManager:
@@ -187,6 +221,59 @@ def get_job(request: Request, job_id: str) -> dict[str, object]:
     if job is None:
         raise HTTPException(status_code=404, detail="Задача не найдена.")
     return job.detail()
+
+
+@router.get("/{job_id}/review")
+def get_review(request: Request, job_id: str) -> dict[str, object]:
+    """Stored speaker-review report (404 until the user saves one)."""
+    try:
+        report = _manager(request).load_review(job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except JobNotFinished as exc:
+        raise HTTPException(
+            status_code=409, detail="Задача ещё выполняется."
+        ) from exc
+    if report is None:
+        raise HTTPException(status_code=404, detail="Отчёт проверки ещё не сохранён.")
+    return report
+
+
+@router.put("/{job_id}/review")
+def put_review(
+    request: Request, job_id: str, payload: ReviewUpdateRequest
+) -> dict[str, object]:
+    """Save user corrections; the full report is rebuilt from the job."""
+    try:
+        return _manager(request).save_review(
+            job_id, [item.model_dump() for item in payload.corrections]
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except JobNotFinished as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{job_id}/audio")
+def get_job_audio(request: Request, job_id: str) -> FileResponse:
+    """Serve the original file for playback in the review mode.
+
+    Starlette's FileResponse honours Range requests, so the browser can seek
+    in long recordings.
+    """
+    manager = _manager(request)
+    if manager.get(job_id) is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена.")
+    try:
+        source = manager.source_file(job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=409, detail=f"Исходный файл задачи недоступен: {exc}"
+        ) from exc
+    media_type = AUDIO_MEDIA_TYPES.get(source.suffix.lower(), "application/octet-stream")
+    return FileResponse(source, media_type=media_type)
 
 
 @router.get("/{job_id}/result")
