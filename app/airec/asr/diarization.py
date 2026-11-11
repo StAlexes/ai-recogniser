@@ -1044,6 +1044,18 @@ def _adaptive_voice_threshold(
     return lowered, True
 
 
+# Регионы короче этого не основывают кластеры и не обновляют центроиды.
+# Эмбеддинг sub-second клипа шумный: на реальной записи 30 коротких вставок
+# (медиана 0,94 с) из четырёх разных голосов дали попарное сходство 0,375 —
+# ниже любого разумного порога, — но их было достаточно, чтобы выжить
+# «крупным» кластером и не приклеиться ни к кому (мусорный «Спикер 2»
+# в проверке пользователя).  Короткий регион присоединяется к кластеру
+# с лучшим средним
+# сходством по членам уже ПОСЛЕ кластеризации длинных: относительное
+# сравнение кластеров устойчиво даже на шумном векторе.
+SHORT_REGION_S = 1.2
+
+
 def _relabel_regions_by_voice(
     regions: list[tuple[str, float, float]],
     audio: np.ndarray,
@@ -1054,7 +1066,7 @@ def _relabel_regions_by_voice(
     min_cluster_size: int = 8,
     cancel: Callable[[], None] | None = None,
     progress: Callable[[float, str], None] | None = None,
-) -> list[tuple[str, float, float]]:
+) -> tuple[list[tuple[str, float, float]], Callable[[np.ndarray], str | None] | None]:
     """Разметить регионы pyannote реальными спикерами по тембру.
 
     Чистая сегментация pyannote — локальный акустический разметчик: связь
@@ -1065,7 +1077,15 @@ def _relabel_regions_by_voice(
     спикеров в одного).  Поэтому регионы сегментации эмбеддятся WeSpeaker и
     кластеризуются по тембру уже без лимита слотов: голос после паузы любой
     длины воссоединяется со своим кластером, а шесть или семь участников
-    совещания получают шесть-семь меток.  Недоступность модели эмбеддингов —
+    совещания получают шесть-семь меток.  Короткие регионы
+    (:data:`SHORT_REGION_S`) в кластеризации не участвуют — их шумные
+    эмбеддинги основывают мусорные кластеры; каждый присоединяется к
+    ближайшему кластеру по среднему сходству с членами.
+
+    Возвращает ``(размеченные регионы, ``assign_voice``)``.  ``assign_voice``
+    — колбэк «клип → ближайшая метка по тембру» для кусков речи, оставшихся
+    вне регионов pyannote; ``None`` — кластеризация не выполнялась (модель
+    недоступна, один регион и т.п.).  Недоступность модели эмбеддингов —
     не ошибка стадии, а откат на цепочки слотов (с предупреждением в логе).
     """
     chains = {label for label, _start, _end in regions}
@@ -1075,13 +1095,13 @@ def _relabel_regions_by_voice(
         # цепочка из нескольких регионов может скрывать разных людей: тихий
         # overlap не дал PIT сигнала, и слот был переиспользован после
         # паузы, — такие записи кластеризуются по тембру.
-        return regions
+        return regions, None
 
     try:
         se = load_se(cpu_threads, repo_id=DEFAULT_SE_REPO)
     except DiarizationError as exc:
         log.warning("voice clustering unavailable (%s); slot chains kept", exc)
-        return regions
+        return regions, None
 
     clips = []
     for _label, start_s, end_s in regions:
@@ -1103,7 +1123,7 @@ def _relabel_regions_by_voice(
         raise
     except Exception as exc:
         log.warning("voice clustering failed (%s); slot chains kept", exc)
-        return regions
+        return regions, None
 
     effective_threshold, adapted = _adaptive_voice_threshold(embeddings, threshold)
     if adapted:
@@ -1113,12 +1133,61 @@ def _relabel_regions_by_voice(
             threshold,
             effective_threshold,
         )
-    cluster_ids = _cluster_region_voices(embeddings, effective_threshold, min_cluster_size)
-    labels = [f"Спикер {cluster + 1}" for cluster in cluster_ids]
+
+    unit = embeddings / np.maximum(
+        np.linalg.norm(embeddings, axis=1, keepdims=True), 1e-12
+    )
+    long_positions = [
+        index
+        for index, (_label, start_s, end_s) in enumerate(regions)
+        if end_s - start_s >= SHORT_REGION_S
+    ]
+    if len(long_positions) < 2:
+        # Длинных регионов почти нет — кластеризуем все как раньше: выделять
+        # «короткие» не из чего, а кластер из одного вектора бессмыслен.
+        long_positions = list(range(len(regions)))
+    short_positions = [
+        index for index in range(len(regions)) if index not in set(long_positions)
+    ]
+
+    cluster_ids = [0] * len(regions)
+    long_clusters = _cluster_region_voices(
+        embeddings[long_positions], effective_threshold, min_cluster_size
+    )
+    members: dict[int, list[np.ndarray]] = {}
+    for position_in_long, cluster in enumerate(long_clusters):
+        original = long_positions[position_in_long]
+        cluster_ids[original] = cluster
+        members.setdefault(cluster, []).append(unit[original])
+
+    def _mean_similarity(vector: np.ndarray, cluster: int) -> float:
+        return float(np.mean([float(vector @ member) for member in members[cluster]]))
+
+    for index in short_positions:
+        # Аргмакс без порога: абсолютное сходство короткого клипа шумное,
+        # но сравнение кластеров между собой устойчиво.
+        cluster_ids[index] = max(
+            members, key=lambda cluster: _mean_similarity(unit[index], cluster)
+        )
+
+    label_of_cluster = {cluster: f"Спикер {cluster + 1}" for cluster in members}
+
+    def assign_voice(clip: np.ndarray) -> str | None:
+        """Ближайший кластер по тембру клипа (для кусков вне регионов)."""
+        vector = _embed_averaged(se, [clip], sample_rate=sample_rate)[0]
+        norm = float(np.linalg.norm(vector))
+        if norm <= 0.0:
+            return None
+        unit_vector = vector / norm
+        return label_of_cluster[
+            max(members, key=lambda cluster: _mean_similarity(unit_vector, cluster))
+        ]
+
+    labels = [label_of_cluster[cluster] for cluster in cluster_ids]
     return [
         (labels[position], region_start, region_end)
         for position, (_label, region_start, region_end) in enumerate(regions)
-    ]
+    ], assign_voice
 
 
 def diarize_segments(
@@ -1231,7 +1300,7 @@ def _diarize_with_pyannote(
     # Долгосрочная память тембра: регионы pyannote кластеризуются по тембру
     # WeSpeaker (схема pyannote.audio 3.x) — без лимита трёх слотов.  Если
     # модель эмбеддингов недоступна — откат на цепочки слотов с предупреждением.
-    regions = _relabel_regions_by_voice(
+    regions, assign_voice = _relabel_regions_by_voice(
         regions,
         audio.astype(np.float32, copy=False),
         sample_rate,
@@ -1277,6 +1346,14 @@ def _diarize_with_pyannote(
             if overlap > best_overlap:
                 best_overlap = overlap
                 best_label = label
+        if best_label is None and assign_voice is not None and segment.get("speaker") is None:
+            # Дыра: под этот кусок речи pyannote региона не дал (короткая
+            # вставка между регионами).  Вместо «продолжает предыдущего» —
+            # тембр самого фрагмента: вставка часто принадлежит другому
+            # голосу, и наследование метки гарантированно ошибается.
+            start_sample = int(start * sample_rate)
+            end_sample = max(int(end * sample_rate), start_sample + 1)
+            best_label = assign_voice(audio[start_sample:end_sample])
         segment["speaker"] = (
             segment.get("speaker") or best_label or previous_label or regions[0][0]
         )

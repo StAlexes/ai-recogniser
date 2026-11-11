@@ -1286,7 +1286,7 @@ def test_relabel_regions_by_voice_merges_fragmented_voice(monkeypatch) -> None:
     )
     audio = np.zeros(16 * SAMPLE_RATE, dtype=np.float32)
 
-    result = diarization._relabel_regions_by_voice(
+    result, _assigner = diarization._relabel_regions_by_voice(
         regions,
         audio,
         SAMPLE_RATE,
@@ -1298,6 +1298,130 @@ def test_relabel_regions_by_voice_merges_fragmented_voice(monkeypatch) -> None:
     assert len(set(labels[:8])) == 1
     assert len(set(labels[8:])) == 1
     assert labels[0] != labels[8]  # разные голоса не сливаются
+
+
+class NoisyShortSpeakerEmbedding:
+    """Длинные клипы — чистые векторы голосов, короткие — шум около них.
+
+    Голос A — [1, 0, 0], голос B — [0, 1, 0] (по знаку среднего клипа).
+    Короткий клип A даёт [1, 0.6, 0.8] (сходство с A 0,71), короткий B —
+    [0.6, 1, 0.8]: ниже порога, но argmax указывает на свой голос — как у
+    реальных коротких вставок (попарное сходство 0,375 на записи из проверки).
+    """
+
+    def __init__(self, sample_rate: int) -> None:
+        self._sample_rate = sample_rate
+
+    def embedding(self, waveform: object) -> np.ndarray:
+        clips = waveform if isinstance(waveform, list) else [waveform]
+        vectors = []
+        for clip in clips:
+            sign = 1.0 if float(np.mean(clip)) >= 0.0 else -1.0
+            long_clip = clip.size >= int(1.2 * self._sample_rate)
+            if long_clip:
+                base = [1.0, 0.0, 0.0] if sign > 0 else [0.0, 1.0, 0.0]
+            else:
+                base = [1.0, 0.6, 0.8] if sign > 0 else [0.6, 1.0, 0.8]
+            vectors.append(base)
+        return np.asarray(vectors, dtype=np.float32)
+
+
+def test_short_regions_do_not_found_junk_cluster(monkeypatch) -> None:
+    """Короткие вставки не основывают мусорный кластер.
+
+    На реальной записи 30 коротких вставок из четырёх голосов выжили как
+    «крупный» кластер (мусорный «Спикер 2»): их шумные эмбеддинги не дотягивали
+    до порога, но кластер был велик для приклейки.  Теперь короткий регион
+    присоединяется к лучшему кластеру по среднему сходству с членами, и
+    сторонних меток не появляется.
+    """
+    monkeypatch.setattr(
+        diarization,
+        "load_se",
+        lambda *_args, **_kwargs: NoisyShortSpeakerEmbedding(SAMPLE_RATE),
+    )
+    # 3 длинных региона голоса A (0-2, 4-6, 8-10), 3 голоса B (40-42, 44-46,
+    # 48-50) и по 3 коротких вставки каждого голоса (0,8 с).
+    regions = (
+        [("Спикер 1", float(start), float(start + 2)) for start in (0.0, 4.0, 8.0)]
+        + [("Спикер 1", float(start), float(start + 2)) for start in (40.0, 44.0, 48.0)]
+        + [("Спикер 1", float(start), float(start + 0.8)) for start in (12.0, 16.0, 20.0)]
+        + [("Спикер 1", float(start), float(start + 0.8)) for start in (52.0, 56.0, 60.0)]
+    )
+    audio = np.zeros(64 * SAMPLE_RATE, dtype=np.float32)
+    for start, end, level in [
+        (0.0, 2.0, 0.5), (4.0, 6.0, 0.5), (8.0, 10.0, 0.5),
+        (12.0, 12.8, 0.5), (16.0, 16.8, 0.5), (20.0, 20.8, 0.5),
+        (40.0, 42.0, -0.5), (44.0, 46.0, -0.5), (48.0, 50.0, -0.5),
+        (52.0, 52.8, -0.5), (56.0, 56.8, -0.5), (60.0, 60.8, -0.5),
+    ]:
+        audio[int(start * SAMPLE_RATE) : int(end * SAMPLE_RATE)] = level
+
+    result, assigner = diarization._relabel_regions_by_voice(
+        regions,
+        audio,
+        SAMPLE_RATE,
+        cpu_threads=0,
+        threshold=0.75,
+        min_cluster_size=3,
+    )
+    labels = [label for label, _start, _end in result]
+    voice_a = labels[0]
+    voice_b = labels[3]
+    assert voice_a != voice_b
+    assert len(set(labels)) == 2  # короткие вставки не завели третий спикер
+    # Короткие вставки присоединились к СВОИМ голосам, а не к одному мусорному.
+    assert labels[6] == labels[7] == labels[8] == voice_a
+    assert labels[9] == labels[10] == labels[11] == voice_b
+    # И тембр отдельного клипа вне регионов разрешается в метку голоса.
+    assert assigner is not None
+    gap_clip = np.zeros(int(1.0 * SAMPLE_RATE), dtype=np.float32)
+    assert assigner(gap_clip) == voice_a
+
+
+def test_gap_segment_gets_speaker_by_voice(monkeypatch) -> None:
+    """Фрагмент вне регионов pyannote получает спикера по тембру, а не
+    «продолжает предыдущего».
+
+    Голос B вставляет реплику в паузе между регионами голоса A: pyannote
+    региона под неё не дал, и прежний откат записывал её за предыдущим
+    спикером (A).  Эмбеддинг самого фрагмента указывает на голос B.
+    """
+
+    class GapPyannoteSession:
+        """Слоты активны 0-2.5 с и 4.5-7 с; 2.5-4.5 с — пауза без региона."""
+
+        def run(self, _outputs: object, _feeds: object) -> list[np.ndarray]:
+            frames = 20  # 10-с окно -> 0.5 с на фрейм
+            logits = np.full((1, frames, 7), -10.0, dtype=np.float32)
+            logits[:, 0:5, 2] = 0.0
+            logits[:, 9:14, 3] = 0.0
+            return [logits]
+
+    monkeypatch.setattr(
+        diarization,
+        "load_pyannote",
+        lambda *_args, **_kwargs: GapPyannoteSession(),
+    )
+    monkeypatch.setattr(
+        diarization, "load_se", lambda *_args, **_kwargs: FakeSpeakerEmbedding()
+    )
+    sample_rate = SAMPLE_RATE
+    audio = np.zeros(10 * sample_rate, dtype=np.float32)
+    audio[0 : int(2.5 * sample_rate)] = 0.5  # голос A
+    audio[int(2.5 * sample_rate) : int(4.5 * sample_rate)] = -0.5  # вставка B
+    audio[int(4.5 * sample_rate) : int(7.0 * sample_rate)] = -0.5  # голос B
+    segments = [{"start_s": 2.8, "end_s": 4.2, "text": "вставка"}]
+
+    result = diarization.diarize_segments(
+        segments,
+        audio,
+        sample_rate,
+        repo_id="onnx-community/pyannote-segmentation-3.0",
+    )
+
+    # Регионы покрывают 0-2.5 и 4.5-7.0; фрагмент 2.8-4.2 — дыра.
+    assert [segment["speaker"] for segment in result] == ["Спикер 2"]
 
 
 def test_end_to_end_chain_break_fragments_after_pause(monkeypatch) -> None:
