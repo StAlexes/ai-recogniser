@@ -45,13 +45,31 @@ def _format_clock(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+# Соседние реплики одного спикера с зазором не больше этого склеиваются в одну
+# строку с общим интервалом: пауза внутри монолога (VAD режет речь по коротким
+# паузам, стадия диаризации склеивает куски только при зазоре до 0,5 с) должна
+# читаться как одна реплика.  Длинная пауза (на реальных записях — 6–11 с)
+# остаётся видимой: строки не склеиваются, и скачок между интервалами показывает
+# молчание.  На 29-минутной записи порог 5 с склеивает 98% соседних пар.
+SPEAKER_LINE_MERGE_GAP_S = 5.0
+
+
+def _speaker_interval(start: float, end: float) -> str:
+    begin = _format_clock(start)
+    finish = _format_clock(end)
+    if finish == begin:
+        return begin
+    return f"{begin}–{finish}"
+
+
 def export_txt(segments: list[dict[str, Any]]) -> str:
     """Plain text.
 
     Without diarization the segments are joined into one paragraph.  When
-    speakers are present each segment gets its own line with a timestamp and
-    speaker label, otherwise the diarization result would be invisible in the
-    saved transcript.
+    speakers are present, each line carries a time interval and the speaker
+    label, and consecutive lines of the same speaker separated by a short
+    pause are merged into one line with a shared interval — otherwise a
+    dialogue transcript falls apart into dozens of fragment lines.
     """
     parts = [
         (segment, segment.get("text", "").strip())
@@ -60,12 +78,34 @@ def export_txt(segments: list[dict[str, Any]]) -> str:
     ]
     if not any(segment.get("speaker") for segment, _ in parts):
         return " ".join(text for _, text in parts).strip()
+
     lines: list[str] = []
+    group: dict[str, Any] | None = None  # {speaker, start, end, texts}
+
+    def flush() -> None:
+        if group is None:
+            return
+        interval = _speaker_interval(group["start"], group["end"])
+        speaker = group["speaker"]
+        prefix = f"[{interval}] {speaker}: " if speaker else f"[{interval}] "
+        lines.append(prefix + " ".join(group["texts"]))
+
     for segment, text in parts:
-        start = _format_clock(segment.get("start_s", 0.0))
         speaker = segment.get("speaker")
-        prefix = f"[{start}] {speaker}: " if speaker else f"[{start}] "
-        lines.append(prefix + text)
+        start = float(segment.get("start_s", 0.0))
+        end = max(float(segment.get("end_s", start)), start)
+        if (
+            group is not None
+            and speaker
+            and group["speaker"] == speaker
+            and start - group["end"] < SPEAKER_LINE_MERGE_GAP_S
+        ):
+            group["texts"].append(text)
+            group["end"] = end
+            continue
+        flush()
+        group = {"speaker": speaker, "start": start, "end": end, "texts": [text]}
+    flush()
     return "\n".join(lines).strip()
 
 

@@ -23,6 +23,39 @@ def test_export_txt() -> None:
     assert "А у тебя как?" in result
 
 
+def test_export_txt_speakers_get_intervals() -> None:
+    """Строка спикера несёт интервал [начало–конец], а не только начало."""
+    result = export_txt(SEGMENTS)
+    assert "[00:09–00:20] Спикер 1: Все хорошо, спасибо." in result
+    assert "[00:21–00:31] Спикер 2: А у тебя как?" in result
+
+
+def test_export_txt_merges_adjacent_same_speaker() -> None:
+    """Соседние реплики одного спикера с коротким зазором — одна строка.
+
+    Пауза внутри монолога (VAD режет речь по коротким паузам) читается как
+    одна реплика с общим интервалом; длинная пауза остаётся видимой —
+    строки не склеиваются.
+    """
+    segments = [
+        {"start_s": 0.0, "end_s": 2.0, "text": "Первая часть.", "speaker": "Спикер 1"},
+        {"start_s": 2.4, "end_s": 4.0, "text": "Вторая часть.", "speaker": "Спикер 1"},
+        {"start_s": 4.4, "end_s": 5.6, "text": "Реплика другого.", "speaker": "Спикер 2"},
+        {"start_s": 6.0, "end_s": 7.0, "text": "Продолжение.", "speaker": "Спикер 1"},
+        {"start_s": 20.0, "end_s": 21.0, "text": "После паузы.", "speaker": "Спикер 1"},
+    ]
+
+    result = export_txt(segments)
+
+    lines = result.splitlines()
+    assert lines == [
+        "[00:00–00:04] Спикер 1: Первая часть. Вторая часть.",
+        "[00:04–00:06] Спикер 2: Реплика другого.",
+        "[00:06–00:07] Спикер 1: Продолжение.",
+        "[00:20–00:21] Спикер 1: После паузы.",
+    ]
+
+
 def test_export_srt() -> None:
     result = export_srt(SEGMENTS)
     assert "00:00:00,000 --> 00:00:08,708" in result

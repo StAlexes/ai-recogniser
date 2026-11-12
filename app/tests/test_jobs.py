@@ -347,7 +347,7 @@ def test_stage_texts_saved_per_stage(
     # Stage 2: speaker-attributed transcript in its own file, and the
     # downloadable result now points at it.
     assert finished.text_speakers == (
-        "[00:00] Спикер 1: Привет, это\n[00:06] Спикер 2: тестовая расшифровка."
+        "[00:00–00:06] Спикер 1: Привет, это\n[00:06–00:12] Спикер 2: тестовая расшифровка."
     )
     speakers_file = job_dir / "transcript_speakers.txt"
     assert speakers_file.is_file()
@@ -387,7 +387,7 @@ def test_legacy_job_gets_stage_texts_backfilled(tmp_path: Path) -> None:
     restored = manager.get(job.id)
     assert restored is not None
     assert restored.text_plain == job.text
-    assert restored.text_speakers.startswith("[00:00] Спикер 1:")
+    assert restored.text_speakers.startswith("[00:00–00:06] Спикер 1:")
     assert "Краткое содержание встречи." in restored.summary_text
     # The rebuilt texts must survive a restart.
     manager.shutdown()
