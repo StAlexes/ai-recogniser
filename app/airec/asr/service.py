@@ -478,6 +478,10 @@ def diarize_transcription(
             item["end_s"],
             item["text"],
             speaker=item.get("speaker"),
+            # Токены проходят насквозь: менеджер хранит их в job.segments,
+            # и повторный запуск диаризации снова режет сегменты по спикерам.
+            token_times=tuple(item["token_times"]) if item.get("token_times") else None,
+            tokens=tuple(item["tokens"]) if item.get("tokens") else None,
         )
         for item in diarized
     )

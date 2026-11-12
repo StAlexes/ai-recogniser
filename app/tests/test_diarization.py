@@ -185,9 +185,54 @@ def test_pyannote_splits_segment_at_speaker_turn(monkeypatch) -> None:
     assert second["start_s"] == 3.5
     assert second["end_s"] == 5.0
     assert second["text"] == "как дела"
-    # Internal token fields must not leak into the result.
-    assert "token_times" not in first and "tokens" not in first
-    assert "token_times" not in second and "tokens" not in second
+    # Токены куска остаются на нём: повторный запуск диаризации снова режет
+    # сегменты по спикерам (в API их вырезает detail()).
+    assert first["tokens"] == ["привет", " ", "друг"]
+    assert first["token_times"] == [0.5, 1.0, 1.5]
+    assert second["tokens"] == [" как", " дела"]
+    assert second["token_times"] == [3.5, 4.2]
+
+
+def test_merge_same_speaker_segments_keeps_tokens() -> None:
+    """Склейка кусков одного спикера сохраняет токены, если декод сходится.
+
+    Повторный запуск диаризации снова режет сегменты по спикерам — для этого
+    куски должны нести tokens/token_times и после merge.
+    """
+    segments = [
+        {
+            "start_s": 0.0,
+            "end_s": 2.0,
+            "text": "привет друг",
+            "speaker": "Спикер 1",
+            "tokens": ["привет", " ", "друг"],
+            "token_times": [0.1, 0.5, 1.0],
+        },
+        {
+            "start_s": 2.2,
+            "end_s": 3.0,
+            "text": "как дела",
+            "speaker": "Спикер 1",
+            "tokens": [" как", " дела"],
+            "token_times": [2.3, 2.8],
+        },
+    ]
+
+    merged = diarization._merge_same_speaker_segments([dict(s) for s in segments])
+
+    assert len(merged) == 1
+    assert merged[0]["text"] == "привет друг как дела"
+    assert merged[0]["tokens"] == ["привет", " ", "друг", " как", " дела"]
+    assert merged[0]["token_times"] == [0.1, 0.5, 1.0, 2.3, 2.8]
+
+    # Декод конкатенации не совпал (кусок без ведущего пробела) — токены
+    # роняются, слитный текст не ломается.
+    segments[1]["tokens"] = ["как", " дела"]
+    merged = diarization._merge_same_speaker_segments([dict(s) for s in segments])
+    assert len(merged) == 1
+    assert merged[0]["text"] == "привет друг как дела"
+    assert "tokens" not in merged[0]
+    assert "token_times" not in merged[0]
 
 
 def test_pyannote_keeps_segment_without_tokens(monkeypatch) -> None:

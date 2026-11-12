@@ -1429,6 +1429,29 @@ def _merge_same_speaker_segments(
                 f"{str(segment.get('text') or '').strip()}".strip()
             )
             previous["end_s"] = end
+            # Токены склеенного куска остаются годными для повторных запусков
+            # диаризации, если декод конкатенации совпадает со слитным текстом:
+            # стык обычно несёт ведущий-пробельный токен, но кусок может
+            # начинаться и с середины слова — тогда токены роняются.
+            previous_tokens = previous.get("tokens")
+            segment_tokens = segment.get("tokens")
+            if previous_tokens and segment_tokens:
+                merged_tokens = [*previous_tokens, *segment_tokens]
+                merged_times = [
+                    *(previous.get("token_times") or []),
+                    *(segment.get("token_times") or []),
+                ]
+                if len(merged_times) == len(merged_tokens) and _decode_tokens(
+                    merged_tokens
+                ).strip() == previous["text"].strip():
+                    previous["tokens"] = merged_tokens
+                    previous["token_times"] = merged_times
+                else:
+                    previous.pop("tokens", None)
+                    previous.pop("token_times", None)
+            else:
+                previous.pop("tokens", None)
+                previous.pop("token_times", None)
             continue
         merged.append(segment)
     return merged
@@ -1636,9 +1659,10 @@ def _split_at_speaker_turns(
             else:
                 next_first = words[stable_runs[run_position + 1][0]][0]
                 piece_end = max(_token_midpoint(times, next_first, end), piece_start)
-            piece_tokens = [
-                tokens[index] for word_position in run for index in words[word_position]
+            piece_indices = [
+                index for word_position in run for index in words[word_position]
             ]
+            piece_tokens = [tokens[index] for index in piece_indices]
             pieces.append(
                 {
                     **segment,
@@ -1646,6 +1670,12 @@ def _split_at_speaker_turns(
                     "end_s": piece_end,
                     "speaker": word_labels[run[0]],
                     "text": _decode_tokens(piece_tokens),
+                    # Токены куска остаются на нём: повторный запуск диаризации
+                    # снова режет сегменты по спикерам (регионы от прогона к
+                    # прогону меняются), и без таймингов токенов он этого не
+                    # может.  В API их вырезает detail(), наружу они не текут.
+                    "tokens": piece_tokens,
+                    "token_times": [times[index] for index in piece_indices],
                 }
             )
             if not is_last:
@@ -1661,10 +1691,6 @@ def _split_at_speaker_turns(
         else:
             for piece in pieces:
                 piece["text"] = piece["text"].strip() or "…"
-        for piece in pieces:
-            # Token data has done its job and must not leak further.
-            piece.pop("token_times", None)
-            piece.pop("tokens", None)
         result.extend(pieces)
     return result
 
