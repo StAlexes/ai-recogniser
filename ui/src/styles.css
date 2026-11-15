@@ -1058,14 +1058,52 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 10px 12px;
   border: 1px solid var(--colorNeutralStroke2);
   border-radius: 6px;
 }
 
+/* Свернутая панель — одна строка над списком фрагментов; развернутая
+   держит собственную прокрутку и не съедает место списка. */
+.review-speakers-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.review-speakers-toggle:hover {
+  background: var(--colorSubtleBackgroundHover);
+}
+
 .review-speakers-title {
+  font-size: 13px;
+  color: var(--colorNeutralForeground2);
+  white-space: nowrap;
+}
+
+.review-speakers-hint {
+  margin-left: auto;
   font-size: 12px;
   color: var(--colorNeutralForeground3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.review-speakers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 40vh;
+  overflow-y: auto;
+  padding: 2px 12px 10px;
 }
 
 .review-speaker-row {
@@ -1078,10 +1116,6 @@ textarea {
   min-width: 88px;
   font-size: 13px;
   color: var(--colorNeutralForeground2);
-}
-
-.review-speaker-name {
-  color: var(--colorNeutralForeground1);
 }
 
 .review-list {
@@ -1108,6 +1142,13 @@ textarea {
 .review-item-edited {
   border-color: var(--colorBrandStroke1);
   background: var(--colorSubtleBackground);
+}
+
+/* Отрывок, звучащий в плейлисте спикера. */
+.review-item-playing {
+  border-color: var(--colorBrandStroke1);
+  background-color: var(--colorBrandBackground2, rgba(15, 108, 189, 0.12));
+  box-shadow: inset 3px 0 0 var(--colorBrandBackground, #0f6cbd);
 }
 
 .review-item-top {
