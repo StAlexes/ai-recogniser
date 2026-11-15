@@ -732,6 +732,43 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     setReviewComments(new Map());
   };
 
+  // Один человек размебился на две метки («Игорь» и «Игорь2»): все отрывки
+  // источника переклеиваются на цель.  Если отрывок был целевой меткой, а
+  // исправление уводило его в источник — исправление просто снимается.
+  // Имя источника переезжает к цели, если у той ещё нет своего.
+  const mergeSpeaker = (source: string, target: string): void => {
+    if (source === target) {
+      return;
+    }
+    setReviewEdits((prev) => {
+      const next = new Map(prev);
+      reviewFragments.forEach((fragment, position) => {
+        const effective = next.get(position) ?? fragment.speaker ?? '';
+        if (effective !== source) {
+          return;
+        }
+        if (fragment.speaker === target && next.get(position) === source) {
+          next.delete(position);
+        } else {
+          next.set(position, target);
+        }
+      });
+      return next;
+    });
+    setSpeakerNames((prev) => {
+      const name = prev.get(source)?.trim();
+      if (!name) {
+        return prev;
+      }
+      const next = new Map(prev);
+      next.delete(source);
+      if (!next.get(target)?.trim()) {
+        next.set(target, name);
+      }
+      return next;
+    });
+  };
+
   const stopPlaylist = useCallback((): void => {
     playlistRef.current = null;
     setPlaylist(null);
@@ -1494,6 +1531,30 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                               });
                             }}
                           />
+                          <select
+                            className="review-merge"
+                            value=""
+                            aria-label={`Объединить ${item.label} с другим спикером`}
+                            title="Один человек размебился на две метки — выбрать, с кем объединить"
+                            onChange={(event) => {
+                              const target = event.target.value;
+                              if (target !== '') {
+                                mergeSpeaker(item.label, target);
+                              }
+                            }}
+                          >
+                            <option value="">объединить с…</option>
+                            {reviewSpeakers
+                              .filter((other) => other.label !== item.label)
+                              .map((other) => {
+                                const name = speakerNames.get(other.label)?.trim();
+                                return (
+                                  <option key={other.label} value={other.label}>
+                                    {name ? `${name} (${other.label})` : other.label}
+                                  </option>
+                                );
+                              })}
+                          </select>
                         </div>
                       ))}
                     </div>
