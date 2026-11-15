@@ -1298,7 +1298,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
           ) : null}
         </div>
 
-        {job !== null ? (
+        {job !== null && !reviewMode ? (
           <div className="job-stage-controls" aria-label="Управление этапами">
             <StageControl
               name="recognition"
