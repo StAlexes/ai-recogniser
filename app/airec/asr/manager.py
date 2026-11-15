@@ -1452,12 +1452,19 @@ class JobManager:
             return None
         return payload if isinstance(payload, dict) else None
 
-    def save_review(self, job_id: str, corrections: list[dict[str, Any]]) -> dict[str, Any]:
-        """Validate *corrections* against the job segments and store the report.
+    def save_review(
+        self,
+        job_id: str,
+        corrections: list[dict[str, Any]],
+        speaker_names: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Validate *corrections*/*speaker_names* against the job and store it.
 
-        Принимаются только исправления ({index, correct, comment}); остальное
-        (исходная разметка, статистика, снимок настроек) досчитывается от
-        задачи — системная разметка в job.segments не меняется.
+        Принимаются только исправления ({index, correct, comment}) и имена
+        спикеров ({метка: имя}); остальное (исходная разметка, статистика,
+        снимок настроек) досчитывается от задачи — системная разметка в
+        job.segments не меняется.  ``speaker_names=None`` оставляет прежние
+        имена, словарь — заменяет (пустое значение убирает имя).
         """
         job = self._finished_job(job_id)
         existing = self.load_review(job_id)
@@ -1466,7 +1473,12 @@ class JobManager:
             if isinstance(existing, dict) and existing.get("created_at")
             else utc_now()
         )
-        report = self._review_report(job, corrections)
+        previous_names = (
+            existing.get("speaker_names")
+            if isinstance(existing, dict) and isinstance(existing.get("speaker_names"), dict)
+            else {}
+        )
+        report = self._review_report(job, corrections, speaker_names, previous_names)
         report["created_at"] = created_at
         report["updated_at"] = utc_now()
 
@@ -1480,12 +1492,57 @@ class JobManager:
         )
         os.replace(tmp, path)
         log.info(
-            "review saved for %s: %d correction(s)", job_id, len(report["corrections"])
+            "review saved for %s: %d correction(s), %d name(s)",
+            job_id,
+            len(report["corrections"]),
+            len(report["speaker_names"]),
         )
+        if report["speaker_names"] != (previous_names or {}):
+            self._apply_speaker_names(job_id, report["speaker_names"])
         return report
 
+    def _apply_speaker_names(self, job_id: str, names: dict[str, str]) -> None:
+        """Перерисовать текст с диаризацией под именами и сбросить саммари.
+
+        Имена — слой отображения поверх системных меток: сегменты не трогаем,
+        но text_speakers, transcript_speakers.txt и вход саммаризации меняются.
+        """
+        with self._lock:
+            current = self._jobs.get(job_id)
+            if current is None or current.status != "done":
+                return
+            speakers = {s.get("speaker") for s in current.segments if s.get("speaker")}
+            speakers_text = (
+                export_txt(current.segments, speaker_names=names) if speakers else ""
+            )
+            current.text_speakers = speakers_text if speakers else ""
+            if speakers:
+                speakers_path = self._stage_file_path(job_id, "transcript_speakers.txt")
+                speakers_path.parent.mkdir(parents=True, exist_ok=True)
+                speakers_path.write_text(speakers_text + "\n", encoding="utf-8", newline="\n")
+            if current.summary is not None:
+                # Вход саммаризации изменился — старое саммари устарело.
+                self._invalidate_summary(current)
+                settings = self._settings()
+                if settings.summarize_enabled and current.text.strip():
+                    self._set_stage(
+                        current,
+                        "summary",
+                        status=STAGE_PENDING,
+                        phase="Ожидает запуска",
+                        progress=0.0,
+                    )
+            try:
+                self._persist(current)
+            except OSError:
+                log.exception("cannot persist speaker names for %s", job_id)
+
     def _review_report(
-        self, job: Job, corrections: list[dict[str, Any]]
+        self,
+        job: Job,
+        corrections: list[dict[str, Any]],
+        speaker_names: dict[str, str] | None = None,
+        previous_names: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build the full report: system labels + user corrections + stats.
 
@@ -1551,6 +1608,27 @@ class JobManager:
         for correction in validated:
             corrected_labels[correction["index"]] = correction["correct"]
 
+        # Имена спикеров: слой отображения поверх меток.  Ключ — метка,
+        # присутствующая в разметке задачи или введённая исправлениями;
+        # пустое значение убирает имя.  None = оставить прежние имена.
+        allowed_labels = {
+            label for label in labels.values() if label
+        } | {correction["correct"] for correction in validated}
+        merged_names: dict[str, str] = {}
+        source_names = (
+            dict(previous_names or {}) if speaker_names is None else dict(speaker_names)
+        )
+        for key, value in source_names.items():
+            label = str(key).strip()
+            name = str(value).strip()
+            if not name:
+                continue
+            if label not in allowed_labels:
+                raise ValueError(f"Неизвестный спикер: {label!r}")
+            if len(name) > 64:
+                raise ValueError(f"Имя спикера слишком длинное: {name[:20]}…")
+            merged_names[label] = name
+
         def _counts(source: dict[int, str]) -> dict[str, int]:
             counts: dict[str, int] = {}
             for label in source.values():
@@ -1569,6 +1647,7 @@ class JobManager:
                 "diarize_profile": job.diarize_profile,
             },
             "settings": self._review_settings_snapshot(job),
+            "speaker_names": merged_names,
             "original_labels": [
                 {
                     "index": position,

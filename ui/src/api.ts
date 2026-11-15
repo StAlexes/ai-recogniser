@@ -569,6 +569,8 @@ export interface ReviewReport {
     diarize_threshold: number;
     group: Record<string, unknown> | null;
   };
+  /** Имена спикеров пользователя: метка «Спикер 3» → «Елена Михайловна». */
+  speaker_names: Record<string, string>;
   original_labels: Array<{
     index: number;
     start_s: number;
@@ -600,10 +602,14 @@ export function getJobReview(jobId: string): Promise<ReviewReport> {
 export function putJobReview(
   jobId: string,
   corrections: ReviewCorrection[],
+  speakerNames?: Record<string, string>,
 ): Promise<ReviewReport> {
   return request<ReviewReport>(`/api/v1/jobs/${encodeURIComponent(jobId)}/review`, {
     method: 'PUT',
-    body: { corrections },
+    body:
+      speakerNames === undefined
+        ? { corrections }
+        : { corrections, speaker_names: speakerNames },
     timeoutMs: 15_000,
   });
 }

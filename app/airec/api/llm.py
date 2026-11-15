@@ -168,7 +168,13 @@ def make_summary_runner(app: Any) -> Any:
     def runner(job_id: str, progress: Any) -> dict[str, Any]:
         manager: JobManager = app.state.jobs
         job = manager.get(job_id)
-        if job is None or not job.text.strip():
+        if job is None:
+            raise ValueError("Транскрипт пуст.")
+        # Диаризованный текст информативнее для саммари, чем сплошной
+        # транскрипт: реплики подписаны спикерами, а после проверки — их
+        # именами из отчёта (имена вшиты в text_speakers при сохранении).
+        text = job.text_speakers.strip() or job.text
+        if not text.strip():
             raise ValueError("Транскрипт пуст.")
         settings = app.state.settings
         kind = settings.llm_provider
@@ -189,8 +195,8 @@ def make_summary_runner(app: Any) -> Any:
             def summary_progress(value: float, phase: str) -> None:
                 progress(0.22 + 0.78 * max(0.0, min(value, 1.0)), phase)
 
-            return _summarize_text(app, job.text, summary_progress)
-        return _summarize_text(app, job.text, progress)
+            return _summarize_text(app, text, summary_progress)
+        return _summarize_text(app, text, progress)
 
     return runner
 

@@ -30,6 +30,23 @@ def test_export_txt_speakers_get_intervals() -> None:
     assert "[00:21–00:31] Спикер 2: А у тебя как?" in result
 
 
+def test_export_txt_with_speaker_names() -> None:
+    """Имена из отчёта проверки заменяют метки «Спикер N» в строках."""
+    segments = [
+        {"start_s": 0.0, "end_s": 2.0, "text": "Первая часть.", "speaker": "Спикер 1"},
+        {"start_s": 2.4, "end_s": 4.0, "text": "Вторая часть.", "speaker": "Спикер 1"},
+        {"start_s": 4.4, "end_s": 5.6, "text": "Реплика другого.", "speaker": "Спикер 2"},
+    ]
+
+    result = export_txt(segments, speaker_names={"Спикер 1": "Елена Михайловна"})
+
+    lines = result.splitlines()
+    assert lines == [
+        "[00:00–00:04] Елена Михайловна: Первая часть. Вторая часть.",
+        "[00:04–00:06] Спикер 2: Реплика другого.",
+    ]
+
+
 def test_export_txt_merges_adjacent_same_speaker() -> None:
     """Соседние реплики одного спикера с коротким зазором — одна строка.
 

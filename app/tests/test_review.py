@@ -130,6 +130,68 @@ def test_review_roundtrip(client: tuple[TestClient, Path]) -> None:
     assert loaded.json() == report
 
 
+def test_review_speaker_names_roundtrip(client: tuple[TestClient, Path]) -> None:
+    """Имена спикеров сохраняются в отчёте и попадают в текст с диаризацией.
+
+    Сценарий пользователя: послушал отрывки спикера, написал имя — имя
+    подставляется в text_speakers/transcript_speakers.txt и уходит в саммари.
+    """
+    test_client, tmp_path = client
+    job_id = "20260101-000000-review1"
+    url = f"/api/v1/jobs/{job_id}/review"
+
+    saved = test_client.put(
+        url,
+        headers=HEADERS,
+        json={
+            "corrections": [],
+            "speaker_names": {"Спикер 2": "Елена Михайловна"},
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    report = saved.json()
+    assert report["speaker_names"] == {"Спикер 2": "Елена Михайловна"}
+
+    loaded = test_client.get(url, headers=HEADERS)
+    assert loaded.status_code == 200
+    assert loaded.json()["speaker_names"] == {"Спикер 2": "Елена Михайловна"}
+
+    # Имя подставлено в отображаемый текст (метка системной разметки не тронута).
+    detail = test_client.get(f"/api/v1/jobs/{job_id}", headers=HEADERS).json()
+    assert "Елена Михайловна" in detail["text_speakers"]
+    assert "[00:06" in detail["text_speakers"]
+
+    # Файл результата перезаписан с именем.
+    speakers_file = tmp_path / "results" / job_id / "transcript_speakers.txt"
+    assert "Елена Михайловна" in speakers_file.read_text(encoding="utf-8")
+
+    # Повторное сохранение только исправлений не стирает имена.
+    again = test_client.put(
+        url,
+        headers=HEADERS,
+        json={"corrections": [{"index": 0, "correct": "Спикер 2"}]},
+    )
+    assert again.status_code == 200
+    assert again.json()["speaker_names"] == {"Спикер 2": "Елена Михайловна"}
+
+    # Имя неизвестного спикера отклоняется.
+    bad = test_client.put(
+        url,
+        headers=HEADERS,
+        json={"corrections": [], "speaker_names": {"Спикер 9": "Кто-то"}},
+    )
+    assert bad.status_code == 400
+
+    # Пустое значение убирает имя.
+    cleared = test_client.put(
+        url,
+        headers=HEADERS,
+        json={"corrections": [], "speaker_names": {"Спикер 2": ""}},
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["speaker_names"] == {}
+
+
 def test_review_created_at_stable_across_saves(
     client: tuple[TestClient, Path],
 ) -> None:

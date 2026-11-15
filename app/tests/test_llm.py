@@ -28,7 +28,7 @@ from airec.llm.summary import MAX_BLOCK_CHARS, Summarizer, _split_into_blocks
 def test_summary_runner_uses_custom_llama_server_without_download(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    job = SimpleNamespace(text="Текст встречи.")
+    job = SimpleNamespace(text="Текст встречи.", text_speakers="")
     app = SimpleNamespace(
         state=SimpleNamespace(
             jobs=SimpleNamespace(get=lambda _job_id: job),

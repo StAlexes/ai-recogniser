@@ -72,10 +72,12 @@ class ReviewCorrection(BaseModel):
 
 
 class ReviewUpdateRequest(BaseModel):
-    """Body of PUT /jobs/{id}/review — only the corrections; the server
-    rebuilds labels, settings snapshot and stats from the job itself."""
+    """Body of PUT /jobs/{id}/review — only the corrections and speaker
+    names; the server rebuilds labels, settings snapshot and stats from the
+    job itself.  ``speaker_names=None`` keeps the stored names."""
 
     corrections: list[ReviewCorrection] = Field(default_factory=list)
+    speaker_names: dict[str, str] | None = None
 
 
 def _manager(request: Request) -> JobManager:
@@ -246,7 +248,9 @@ def put_review(
     """Save user corrections; the full report is rebuilt from the job."""
     try:
         return _manager(request).save_review(
-            job_id, [item.model_dump() for item in payload.corrections]
+            job_id,
+            [item.model_dump() for item in payload.corrections],
+            payload.speaker_names,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

@@ -296,6 +296,11 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
   const [reviewComments, setReviewComments] = useState<Map<number, string>>(
     new Map(),
   );
+  // Имена спикеров (метка → «Елена Михайловна»): слой отображения поверх
+  // меток; сохраняются вместе с отчётом и попадают в текст и саммари.
+  const [speakerNames, setSpeakerNames] = useState<Map<string, string>>(
+    new Map(),
+  );
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioFormat = job?.audio_format ?? '';
@@ -336,6 +341,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     setReviewMode(false);
     setReviewEdits(new Map());
     setReviewComments(new Map());
+    setSpeakerNames(new Map());
     setAudioUrl(null);
     announcedStages.current = new Set();
     void loadJob();
@@ -594,6 +600,51 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     };
   }, [reviewMode, jobId, audioFormat, onAuthError]);
 
+  // Список спикеров для панели имён: метки из фрагментов и исправлений,
+  // для каждого — самый длинный фрагмент как образец голоса для прослушивания.
+  const reviewSpeakers = useMemo(() => {
+    const sampleStart = new Map<string, number>();
+    const sampleDuration = new Map<string, number>();
+    const order: string[] = [];
+    const seen = new Set<string>();
+    const add = (label: string | null, start: number, duration: number): void => {
+      if (!label) {
+        return;
+      }
+      if (!seen.has(label)) {
+        seen.add(label);
+        order.push(label);
+        sampleStart.set(label, start);
+        sampleDuration.set(label, duration);
+        return;
+      }
+      if (duration > (sampleDuration.get(label) ?? 0)) {
+        sampleDuration.set(label, duration);
+        sampleStart.set(label, start);
+      }
+    };
+    for (const fragment of reviewFragments) {
+      add(fragment.speaker, fragment.start_s, fragment.end_s - fragment.start_s);
+    }
+    for (const [index, label] of reviewEdits) {
+      const fragment = reviewFragments[index];
+      if (fragment) {
+        add(label, fragment.start_s, fragment.end_s - fragment.start_s);
+      }
+    }
+    order.sort((a, b) => {
+      const na = /Спикер (\d+)/.exec(a);
+      const nb = /Спикер (\d+)/.exec(b);
+      const va = na === null ? Number.MAX_SAFE_INTEGER : Number(na[1]);
+      const vb = nb === null ? Number.MAX_SAFE_INTEGER : Number(nb[1]);
+      return va - vb || a.localeCompare(b);
+    });
+    return order.map((label) => ({
+      label,
+      sampleStart: sampleStart.get(label) ?? 0,
+    }));
+  }, [reviewFragments, reviewEdits]);
+
   const enterReview = useCallback(async (): Promise<void> => {
     if (job === null) {
       return;
@@ -612,6 +663,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
             .map((item) => [item.index, item.comment]),
         ),
       );
+      setSpeakerNames(new Map(Object.entries(report.speaker_names ?? {})));
     } catch (reason: unknown) {
       if (reason instanceof AuthError) {
         onAuthError();
@@ -623,6 +675,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
       }
       setReviewEdits(new Map());
       setReviewComments(new Map());
+      setSpeakerNames(new Map());
     }
     setReviewMode(true);
   }, [job, onAuthError, showError]);
@@ -641,9 +694,18 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
           comment: reviewComments.get(index) ?? '',
         }),
       );
-      const report = await putJobReview(job.id, corrections);
+      const names = Object.fromEntries(
+        [...speakerNames.entries()]
+          .map(([label, name]) => [label, name.trim()])
+          .filter(([, name]) => name !== ''),
+      );
+      const report = await putJobReview(job.id, corrections, names);
       setNotice(
-        `Отчёт проверки сохранён: исправлений — ${report.stats.corrected}.`,
+        `Отчёт проверки сохранён: исправлений — ${report.stats.corrected}${
+          Object.keys(names).length > 0
+            ? `, имён — ${Object.keys(names).length}`
+            : ''
+        }.`,
       );
     } catch (reason: unknown) {
       if (reason instanceof AuthError) {
@@ -654,7 +716,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     } finally {
       setReviewBusy(false);
     }
-  }, [job, reviewEdits, reviewComments, onAuthError, showError]);
+  }, [job, reviewEdits, reviewComments, speakerNames, onAuthError, showError]);
 
   const resetReview = (): void => {
     setReviewEdits(new Map());
@@ -1282,6 +1344,54 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                   </Button>
                 </div>
               </div>
+              {reviewSpeakers.length > 0 ? (
+                <div className="review-speakers">
+                  <div className="review-speakers-title">
+                    Спикеры — слушайте образец голоса и пишите имя; имя
+                    подставится в расшифровку и саммари
+                  </div>
+                  {reviewSpeakers.map((item) => (
+                    <div key={item.label} className="review-speaker-row">
+                      <button
+                        type="button"
+                        className="review-play"
+                        aria-label={`Прослушать образец голоса: ${item.label}`}
+                        disabled={audioUrl === null}
+                        onClick={() => playFragment(item.sampleStart)}
+                      >
+                        <PlayRegular />
+                      </button>
+                      <span className="review-speaker-label">
+                        {item.label}
+                        {speakerNames.get(item.label)?.trim() ? (
+                          <span className="review-speaker-name">
+                            {' '}
+                            · {speakerNames.get(item.label)?.trim()}
+                          </span>
+                        ) : null}
+                      </span>
+                      <input
+                        className="review-comment"
+                        type="text"
+                        placeholder="Имя спикера"
+                        value={speakerNames.get(item.label) ?? ''}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          setSpeakerNames((prev) => {
+                            const next = new Map(prev);
+                            if (value.trim() === '') {
+                              next.delete(item.label);
+                            } else {
+                              next.set(item.label, value);
+                            }
+                            return next;
+                          });
+                        }}
+                      />
+                    </div>
+                  ))}
+                </div>
+              ) : null}
               <ul className="review-list">
                 {reviewFragments.map((fragment, position) => {
                   const original = fragment.speaker ?? '';
@@ -1330,11 +1440,14 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                           }}
                         >
                           {original === '' ? <option value="">—</option> : null}
-                          {rowOptions.map((option) => (
-                            <option key={option} value={option}>
-                              {option}
-                            </option>
-                          ))}
+                          {rowOptions.map((option) => {
+                            const name = speakerNames.get(option)?.trim();
+                            return (
+                              <option key={option} value={option}>
+                                {name ? `${name} (${option})` : option}
+                              </option>
+                            );
+                          })}
                         </select>
                         {edited ? (
                           <span className="review-was">

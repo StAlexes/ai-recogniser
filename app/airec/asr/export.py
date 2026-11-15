@@ -62,7 +62,11 @@ def _speaker_interval(start: float, end: float) -> str:
     return f"{begin}–{finish}"
 
 
-def export_txt(segments: list[dict[str, Any]]) -> str:
+def export_txt(
+    segments: list[dict[str, Any]],
+    *,
+    speaker_names: dict[str, str] | None = None,
+) -> str:
     """Plain text.
 
     Without diarization the segments are joined into one paragraph.  When
@@ -70,6 +74,8 @@ def export_txt(segments: list[dict[str, Any]]) -> str:
     label, and consecutive lines of the same speaker separated by a short
     pause are merged into one line with a shared interval — otherwise a
     dialogue transcript falls apart into dozens of fragment lines.
+    *speaker_names* — подписи пользователя из отчёта проверки: метка
+    «Спикер 3» отображается заданным именем.
     """
     parts = [
         (segment, segment.get("text", "").strip())
@@ -79,6 +85,7 @@ def export_txt(segments: list[dict[str, Any]]) -> str:
     if not any(segment.get("speaker") for segment, _ in parts):
         return " ".join(text for _, text in parts).strip()
 
+    names = speaker_names or {}
     lines: list[str] = []
     group: dict[str, Any] | None = None  # {speaker, start, end, texts}
 
@@ -87,7 +94,8 @@ def export_txt(segments: list[dict[str, Any]]) -> str:
             return
         interval = _speaker_interval(group["start"], group["end"])
         speaker = group["speaker"]
-        prefix = f"[{interval}] {speaker}: " if speaker else f"[{interval}] "
+        display = names.get(speaker, speaker) if speaker else speaker
+        prefix = f"[{interval}] {display}: " if display else f"[{interval}] "
         lines.append(prefix + " ".join(group["texts"]))
 
     for segment, text in parts:
