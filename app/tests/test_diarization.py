@@ -1814,3 +1814,32 @@ def test_cap_exhaustion_absorbs_thirteenth_voice_into_foreign_cluster() -> None:
     assert len(set(clusters)) == 13, sorted(set(clusters))
     # ...и 13-й голос не должен оказаться в чужом кластере.
     assert set(clusters[36:39]).isdisjoint(set(clusters[:36])), clusters[36:39]
+
+
+def test_normalize_clip_level_targets_rms() -> None:
+    """Тихие клипы усиливаются до целевого уровня, громкие — ограничиваются.
+
+    Эмбеддинг тихого спикера (далёкий микрофон) шумный: соседние куски
+    непрерывной речи одного голоса расходятся по сходству, и кластеризация
+    рвёт его на две метки (запись заседания: Игорь = Спикер 3 + Спикер 5).
+    Нормализация уровня перед моделью убирает зависимость вектора от громкости.
+    """
+    rng = np.random.default_rng(7)
+    loud = (rng.standard_normal(16_000) * 0.2).astype(np.float32)
+    quiet = (loud * 0.01).astype(np.float32)  # на 40 дБ тише
+
+    target = 10.0 ** (diarization.EMBED_TARGET_RMS_DB / 20.0)
+    normalized = diarization._normalize_clip_level(quiet)
+    rms = float(np.sqrt(np.mean(normalized.astype(np.float64) ** 2)))
+    assert abs(rms - target) < target * 0.05
+    # Форма волны не искажается: тот же сигнал, другой множитель.
+    assert abs(float(normalized[100]) / float(quiet[100])) > 0.0
+
+    loud_normalized = diarization._normalize_clip_level(loud)
+    assert float(np.max(np.abs(loud_normalized))) <= 0.99  # пик ограничен
+    loud_rms = float(np.sqrt(np.mean(loud_normalized.astype(np.float64) ** 2)))
+    assert abs(loud_rms - target) < target * 0.05
+
+    # Тишина не усиливается до шума.
+    silence = np.zeros(1000, dtype=np.float32)
+    assert np.array_equal(diarization._normalize_clip_level(silence), silence)
