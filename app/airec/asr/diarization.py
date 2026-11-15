@@ -1055,6 +1055,16 @@ def _adaptive_voice_threshold(
 # сравнение кластеров устойчиво даже на шумном векторе.
 SHORT_REGION_S = 1.2
 
+# Регион, перекрытый чужими слотами на эту долю собственной длины и больше, —
+# бленд (в клипе слышны два голоса): эмбеддинг — смесь, и такой регион не
+# основывает кластер и не тянет центроид.  На записи с перебивками бленды
+# основывали третий «мусорный» спикер (36 из 51 исправления пользователя)
+# и стягивали к себе короткие вставки по argmax.  Бленды, как и короткие
+# регионы, присоединяются ПОСЛЕ кластеризации чистых — по соседям во времени:
+# осколок чужого предложения и перебивание относятся к голосам вокруг, а не
+# к «усреднённой смеси».
+OVERLAP_REGION_FRACTION = 0.5
+
 
 def _relabel_regions_by_voice(
     regions: list[tuple[str, float, float]],
@@ -1077,10 +1087,12 @@ def _relabel_regions_by_voice(
     спикеров в одного).  Поэтому регионы сегментации эмбеддятся WeSpeaker и
     кластеризуются по тембру уже без лимита слотов: голос после паузы любой
     длины воссоединяется со своим кластером, а шесть или семь участников
-    совещания получают шесть-семь меток.  Короткие регионы
-    (:data:`SHORT_REGION_S`) в кластеризации не участвуют — их шумные
-    эмбеддинги основывают мусорные кластеры; каждый присоединяется к
-    ближайшему кластеру по среднему сходству с членами.
+    совещания получают шесть-семь меток.  Ненадёжные регионы — короткие
+    (:data:`SHORT_REGION_S`, шумный эмбеддинг sub-second клипа) и бленды
+    (:data:`OVERLAP_REGION_FRACTION`, в клипе слышны два голоса) — в
+    кластеризации не участвуют: они основывают мусорные кластеры и стягивают
+    к себе такие же ненадёжные.  Каждый присоединяется к кластеру соседнего
+    во времени «чистого» региона с лучшим средним сходством по членам.
 
     Возвращает ``(размеченные регионы, ``assign_voice``)``.  ``assign_voice``
     — колбэк «клип → ближайшая метка по тембру» для кусков речи, оставшихся
@@ -1137,37 +1149,65 @@ def _relabel_regions_by_voice(
     unit = embeddings / np.maximum(
         np.linalg.norm(embeddings, axis=1, keepdims=True), 1e-12
     )
-    long_positions = [
+
+    def _foreign_overlap_fraction(index: int) -> float:
+        """Доля региона, покрытая чужими слотами (бленд = смесь голосов)."""
+        label, start_s, end_s = regions[index]
+        covered = 0.0
+        for other_label, other_start, other_end in regions:
+            if other_label == label:
+                continue
+            covered += max(0.0, min(end_s, other_end) - max(start_s, other_start))
+        return min(covered / max(end_s - start_s, 1e-9), 1.0)
+
+    overlap_fractions = [
+        _foreign_overlap_fraction(index) for index in range(len(regions))
+    ]
+    core_positions = [
         index
         for index, (_label, start_s, end_s) in enumerate(regions)
         if end_s - start_s >= SHORT_REGION_S
+        and overlap_fractions[index] < OVERLAP_REGION_FRACTION
     ]
-    if len(long_positions) < 2:
-        # Длинных регионов почти нет — кластеризуем все как раньше: выделять
-        # «короткие» не из чего, а кластер из одного вектора бессмыслен.
-        long_positions = list(range(len(regions)))
-    short_positions = [
-        index for index in range(len(regions)) if index not in set(long_positions)
+    if len(core_positions) < 2:
+        # «Чистых» регионов почти нет — кластеризуем все как раньше: выделять
+        # ненадёжные не из чего, а кластер из одного вектора бессмыслен.
+        core_positions = list(range(len(regions)))
+    unreliable_positions = [
+        index for index in range(len(regions)) if index not in set(core_positions)
     ]
 
     cluster_ids = [0] * len(regions)
-    long_clusters = _cluster_region_voices(
-        embeddings[long_positions], effective_threshold, min_cluster_size
+    core_clusters = _cluster_region_voices(
+        embeddings[core_positions], effective_threshold, min_cluster_size
     )
     members: dict[int, list[np.ndarray]] = {}
-    for position_in_long, cluster in enumerate(long_clusters):
-        original = long_positions[position_in_long]
+    for position_in_core, cluster in enumerate(core_clusters):
+        original = core_positions[position_in_core]
         cluster_ids[original] = cluster
         members.setdefault(cluster, []).append(unit[original])
 
     def _mean_similarity(vector: np.ndarray, cluster: int) -> float:
         return float(np.mean([float(vector @ member) for member in members[cluster]]))
 
-    for index in short_positions:
-        # Аргмакс без порога: абсолютное сходство короткого клипа шумное,
-        # но сравнение кластеров между собой устойчиво.
+    for index in unreliable_positions:
+        # Аргмакс без порога: абсолютное сходство ненадёжного клипа шумное,
+        # но сравнение кластеров между собой устойчиво.  Кандидаты — кластеры
+        # соседних «чистых» регионов во времени: осколок чужого предложения и
+        # перебивание принадлежат одному из голосов вокруг, а не «усреднённой
+        # смеси», которая иначе стягивает такие куски в мусорный кластер.
+        _label, start_s, end_s = regions[index]
+        before = [i for i in core_positions if regions[i][2] <= start_s]
+        after = [i for i in core_positions if regions[i][1] >= end_s]
+        candidates: set[int] = set()
+        if before:
+            candidates.add(cluster_ids[max(before, key=lambda i: regions[i][2])])
+        if after:
+            candidates.add(cluster_ids[min(after, key=lambda i: regions[i][1])])
+        if not candidates:
+            candidates = set(members)
         cluster_ids[index] = max(
-            members, key=lambda cluster: _mean_similarity(unit[index], cluster)
+            candidates, key=lambda cluster: _mean_similarity(unit[index], cluster)
         )
 
     label_of_cluster = {cluster: f"Спикер {cluster + 1}" for cluster in members}

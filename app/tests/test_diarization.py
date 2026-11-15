@@ -1424,6 +1424,62 @@ def test_short_regions_do_not_found_junk_cluster(monkeypatch) -> None:
     assert assigner(gap_clip) == voice_a
 
 
+def test_overlap_regions_do_not_found_junk_cluster(monkeypatch) -> None:
+    """Бленды (регионы, перекрытые чужим слотом) не основывают кластер.
+
+    На записи с перебивками бленды основывали третий «мусорный» спикер
+    (36 из 51 исправления пользователя) и стягивали к себе короткие вставки.
+    Теперь бленд, как и короткий регион, присоединяется к кластеру соседнего
+    во времени «чистого» региона: перебивание и осколок чужого предложения
+    относятся к голосам вокруг, а не к «усреднённой смеси».
+    """
+    vectors = np.asarray(
+        [
+            [1.0, 0.0, 0.0],  # A1
+            [1.0, 0.0, 0.0],  # A2
+            [1.0, 0.6, 0.8],  # бленд: вектор-смесь ниже порога до обоих голосов
+            [1.0, 0.0, 0.0],  # A3
+            [0.6, 1.0, 0.8],  # короткий осколок голоса B
+            [0.0, 1.0, 0.0],  # B1
+            [0.0, 1.0, 0.0],  # B2
+            [0.0, 1.0, 0.0],  # B3
+        ],
+        dtype=np.float32,
+    )
+    monkeypatch.setattr(
+        diarization,
+        "load_se",
+        lambda *_args, **_kwargs: QueueSpeakerEmbedding(vectors),
+    )
+    regions = [
+        ("Спикер 1", 0.0, 2.0),
+        ("Спикер 1", 4.0, 6.0),
+        ("Спикер 3", 4.5, 6.5),  # бленд: 1.5 из 2.0 с перекрыты чужим слотом
+        ("Спикер 1", 8.0, 10.0),
+        ("Спикер 3", 12.0, 12.8),  # короткий осколок
+        ("Спикер 2", 40.0, 42.0),
+        ("Спикер 2", 44.0, 46.0),
+        ("Спикер 2", 48.0, 50.0),
+    ]
+    audio = np.zeros(52 * SAMPLE_RATE, dtype=np.float32)
+
+    result, _assigner = diarization._relabel_regions_by_voice(
+        regions,
+        audio,
+        SAMPLE_RATE,
+        cpu_threads=0,
+        threshold=0.75,
+        min_cluster_size=3,
+    )
+    labels = [label for label, _start, _end in result]
+    voice_a = labels[0]
+    voice_b = labels[5]
+    assert voice_a != voice_b
+    assert len(set(labels)) == 2  # бленд не завёл третий спикер
+    assert labels[2] == voice_a  # бленд отошёл соседнему голосу A
+    assert labels[4] == voice_b  # короткий осколок — соседнему голосу B
+
+
 def test_gap_segment_gets_speaker_by_voice(monkeypatch) -> None:
     """Фрагмент вне регионов pyannote получает спикера по тембру, а не
     «продолжает предыдущего».
