@@ -15,6 +15,8 @@ import {
 import {
   ArrowClockwiseRegular,
   ArrowLeftRegular,
+  ArrowNextRegular,
+  ArrowPreviousRegular,
   ChevronDownRegular,
   ChevronRightRegular,
   CopyRegular,
@@ -803,6 +805,39 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     setPlaylist({ label: item.label, position: first });
   };
 
+  // Предыдущий/следующий отрывок спикера.  Если плейлист не запущен,
+  // «следующий» начинает его с первого отрывка, «предыдущий» — с последнего.
+  const stepSpeaker = (item: (typeof reviewSpeakers)[number], delta: 1 | -1): void => {
+    const audio = audioRef.current;
+    if (audio === null) {
+      return;
+    }
+    const active = playlistRef.current;
+    let positions: number[];
+    let cursor: number;
+    if (active === null || active.label !== item.label) {
+      if (item.positions.length === 0) {
+        return;
+      }
+      positions = item.positions;
+      cursor = delta > 0 ? 0 : positions.length - 1;
+    } else {
+      positions = active.positions;
+      const next = active.cursor + delta;
+      if (next < 0 || next >= positions.length) {
+        return;
+      }
+      cursor = next;
+    }
+    const target = positions[cursor];
+    if (target === undefined) {
+      return;
+    }
+    playFragment(reviewFragments[target]?.start_s ?? 0);
+    playlistRef.current = { label: item.label, positions, cursor };
+    setPlaylist({ label: item.label, position: target });
+  };
+
   // Плейлист спикера: по окончании отрывка плеер прыгает к следующему
   // отрывку того же спикера; на конце списка или ручной паузе — стоп.
   const handleAudioTimeUpdate = (): void => {
@@ -1497,66 +1532,174 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                   </button>
                   {speakersOpen ? (
                     <div className="review-speakers-list">
-                      {reviewSpeakers.map((item) => (
-                        <div key={item.label} className="review-speaker-row">
-                          <button
-                            type="button"
-                            className="review-play"
-                            aria-label={`Прослушать отрывки спикера: ${item.label}`}
-                            disabled={audioUrl === null}
-                            onClick={() => playSpeaker(item)}
-                          >
-                            {playlist?.label === item.label ? (
-                              <PauseRegular />
-                            ) : (
-                              <PlayRegular />
-                            )}
-                          </button>
-                          <span className="review-speaker-label">{item.label}</span>
-                          <input
-                            className="review-comment"
-                            type="text"
-                            placeholder="Имя спикера"
-                            value={speakerNames.get(item.label) ?? ''}
-                            onChange={(event) => {
-                              const value = event.target.value;
-                              setSpeakerNames((prev) => {
-                                const next = new Map(prev);
-                                if (value.trim() === '') {
-                                  next.delete(item.label);
-                                } else {
-                                  next.set(item.label, value);
-                                }
-                                return next;
-                              });
-                            }}
-                          />
-                          <select
-                            className="review-merge"
-                            value=""
-                            aria-label={`Объединить ${item.label} с другим спикером`}
-                            title="Один человек размебился на две метки — выбрать, с кем объединить"
-                            onChange={(event) => {
-                              const target = event.target.value;
-                              if (target !== '') {
-                                mergeSpeaker(item.label, target);
-                              }
-                            }}
-                          >
-                            <option value="">объединить с…</option>
-                            {reviewSpeakers
-                              .filter((other) => other.label !== item.label)
-                              .map((other) => {
-                                const name = speakerNames.get(other.label)?.trim();
-                                return (
-                                  <option key={other.label} value={other.label}>
-                                    {name ? `${name} (${other.label})` : other.label}
-                                  </option>
-                                );
-                              })}
-                          </select>
-                        </div>
-                      ))}
+                      {reviewSpeakers.map((item) => {
+                        const nowPosition =
+                          playlist?.label === item.label ? playlist.position : undefined;
+                        const nowFragment =
+                          nowPosition === undefined
+                            ? undefined
+                            : reviewFragments[nowPosition];
+                        const nowOriginal = nowFragment?.speaker ?? '';
+                        const nowEffective =
+                          nowPosition === undefined
+                            ? ''
+                            : (reviewEdits.get(nowPosition) ?? nowOriginal);
+                        const nowEdited = nowPosition !== undefined && reviewEdits.has(nowPosition);
+                        const nowOptions =
+                          nowOriginal === '' ||
+                          reviewSpeakerOptions.includes(nowOriginal)
+                            ? reviewSpeakerOptions
+                            : [...reviewSpeakerOptions, nowOriginal];
+                        const nowIndex =
+                          nowPosition === undefined
+                            ? -1
+                            : item.positions.indexOf(nowPosition);
+                        return (
+                          <div key={item.label} className="review-speaker-block">
+                            <div className="review-speaker-row">
+                              <button
+                                type="button"
+                                className="review-play"
+                                aria-label={`Предыдущий отрывок спикера: ${item.label}`}
+                                disabled={audioUrl === null}
+                                onClick={() => stepSpeaker(item, -1)}
+                              >
+                                <ArrowPreviousRegular />
+                              </button>
+                              <button
+                                type="button"
+                                className="review-play"
+                                aria-label={`Прослушать отрывки спикера: ${item.label}`}
+                                disabled={audioUrl === null}
+                                onClick={() => playSpeaker(item)}
+                              >
+                                {playlist?.label === item.label ? (
+                                  <PauseRegular />
+                                ) : (
+                                  <PlayRegular />
+                                )}
+                              </button>
+                              <button
+                                type="button"
+                                className="review-play"
+                                aria-label={`Следующий отрывок спикера: ${item.label}`}
+                                disabled={audioUrl === null}
+                                onClick={() => stepSpeaker(item, 1)}
+                              >
+                                <ArrowNextRegular />
+                              </button>
+                              <span className="review-speaker-label">{item.label}</span>
+                              <input
+                                className="review-comment"
+                                type="text"
+                                placeholder="Имя спикера"
+                                value={speakerNames.get(item.label) ?? ''}
+                                onChange={(event) => {
+                                  const value = event.target.value;
+                                  setSpeakerNames((prev) => {
+                                    const next = new Map(prev);
+                                    if (value.trim() === '') {
+                                      next.delete(item.label);
+                                    } else {
+                                      next.set(item.label, value);
+                                    }
+                                    return next;
+                                  });
+                                }}
+                              />
+                              <select
+                                className="review-merge"
+                                value=""
+                                aria-label={`Объединить ${item.label} с другим спикером`}
+                                title="Один человек размебился на две метки — выбрать, с кем объединить"
+                                onChange={(event) => {
+                                  const target = event.target.value;
+                                  if (target !== '') {
+                                    mergeSpeaker(item.label, target);
+                                  }
+                                }}
+                              >
+                                <option value="">объединить с…</option>
+                                {reviewSpeakers
+                                  .filter((other) => other.label !== item.label)
+                                  .map((other) => {
+                                    const name = speakerNames.get(other.label)?.trim();
+                                    return (
+                                      <option key={other.label} value={other.label}>
+                                        {name ? `${name} (${other.label})` : other.label}
+                                      </option>
+                                    );
+                                  })}
+                              </select>
+                            </div>
+                            {nowFragment !== undefined && nowPosition !== undefined ? (
+                              <div className="review-now">
+                                <div className="review-now-head">
+                                  <span className="review-time">
+                                    {formatClock(nowFragment.start_s)}–
+                                    {formatClock(nowFragment.end_s)}
+                                  </span>
+                                  {nowIndex >= 0 ? (
+                                    <span className="review-now-count">
+                                      {nowIndex + 1} из {item.positions.length}
+                                    </span>
+                                  ) : null}
+                                  <select
+                                    className="review-select"
+                                    value={nowEffective}
+                                    aria-label="Спикер фрагмента"
+                                    onChange={(event) => {
+                                      const value = event.target.value;
+                                      setReviewEdits((prev) => {
+                                        const next = new Map(prev);
+                                        if (value === nowOriginal) {
+                                          next.delete(nowPosition);
+                                        } else {
+                                          next.set(nowPosition, value);
+                                        }
+                                        return next;
+                                      });
+                                    }}
+                                  >
+                                    {nowOriginal === '' ? (
+                                      <option value="">—</option>
+                                    ) : null}
+                                    {nowOptions.map((option) => {
+                                      const name = speakerNames.get(option)?.trim();
+                                      return (
+                                        <option key={option} value={option}>
+                                          {name ? `${name} (${option})` : option}
+                                        </option>
+                                      );
+                                    })}
+                                  </select>
+                                </div>
+                                <div className="review-text">{nowFragment.text}</div>
+                                {nowEdited ? (
+                                  <input
+                                    className="review-comment"
+                                    type="text"
+                                    placeholder="Комментарий (необязательно)"
+                                    value={reviewComments.get(nowPosition) ?? ''}
+                                    onChange={(event) => {
+                                      const value = event.target.value;
+                                      setReviewComments((prev) => {
+                                        const next = new Map(prev);
+                                        if (value === '') {
+                                          next.delete(nowPosition);
+                                        } else {
+                                          next.set(nowPosition, value);
+                                        }
+                                        return next;
+                                      });
+                                    }}
+                                  />
+                                ) : null}
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })}
                     </div>
                   ) : null}
                 </div>

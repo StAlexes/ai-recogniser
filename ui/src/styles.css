@@ -1106,10 +1106,42 @@ textarea {
   padding: 2px 12px 10px;
 }
 
+.review-speaker-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
 .review-speaker-row {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+/* Карточка играющего отрывка: текст, метка и комментарий под рукой —
+   правка не требует поиска фрагмента в общем списке. */
+.review-now {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-left: 78px;
+  padding: 8px 10px;
+  border: 1px solid var(--colorBrandStroke1);
+  border-radius: 6px;
+  background: var(--colorBrandBackground2, rgba(15, 108, 189, 0.12));
+}
+
+.review-now-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.review-now-count {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--colorNeutralForeground3);
 }
 
 .review-speaker-label {
