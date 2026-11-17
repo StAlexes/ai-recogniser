@@ -312,6 +312,14 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
   // Панель спикеров сворачивается: по умолчанию сложена, чтобы список
   // фрагментов получал почти всё место.
   const [speakersOpen, setSpeakersOpen] = useState(false);
+  // Раскладка проверки: карточки по спикерам или общий список отрывков.
+  const [reviewLayout, setReviewLayout] = useState<'speakers' | 'list'>('speakers');
+  // Фокус участника: под ним показывается карточка отрывков.  Для каждого
+  // участника помним, на каком отрывке остановились (label → позиция).
+  const [focusSpeaker, setFocusSpeaker] = useState<string | null>(null);
+  const [focusPositions, setFocusPositions] = useState<Map<string, number>>(
+    new Map(),
+  );
   // Плейлист спикера: ▶ в панели спикеров перескакивает между его отрывками.
   // Состояние — для подсветки текущего отрывка, ref — чтобы обработчик
   // timeupdate не пересоздавался на каждый тик.
@@ -363,6 +371,9 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     setReviewComments(new Map());
     setSpeakerNames(new Map());
     setAudioUrl(null);
+    setReviewLayout('speakers');
+    setFocusSpeaker(null);
+    setFocusPositions(new Map());
     playlistRef.current = null;
     announcedStages.current = new Set();
     void loadJob();
@@ -691,9 +702,9 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     setReviewMode(true);
   }, [job, onAuthError, showError]);
 
-  const saveReview = useCallback(async (): Promise<void> => {
+  const saveReview = useCallback(async (): Promise<boolean> => {
     if (job === null) {
-      return;
+      return false;
     }
     setReviewBusy(true);
     setError(null);
@@ -716,18 +727,30 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
           Object.keys(names).length > 0
             ? `, имён — ${Object.keys(names).length}`
             : ''
-        }.`,
+        }. Имена подставлены в расшифровку и саммари.`,
       );
+      return true;
     } catch (reason: unknown) {
       if (reason instanceof AuthError) {
         onAuthError();
-        return;
+        return false;
       }
       showError(describeError(reason));
+      return false;
     } finally {
       setReviewBusy(false);
     }
   }, [job, reviewEdits, reviewComments, speakerNames, onAuthError, showError]);
+
+  // «Готово» сохраняет отчёт: имена спикеров обязаны попасть в текст и
+  // саммари даже без отдельного нажатия «Сохранить отчёт».  При ошибке
+  // сохранения остаёмся в режиме, чтобы правки не потерялись.
+  const exitReview = useCallback(async (): Promise<void> => {
+    const saved = await saveReview();
+    if (saved) {
+      setReviewMode(false);
+    }
+  }, [saveReview]);
 
   const resetReview = (): void => {
     setReviewEdits(new Map());
@@ -788,54 +811,104 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     void audio.play().catch(() => undefined);
   };
 
-  const playSpeaker = (item: (typeof reviewSpeakers)[number]): void => {
-    const audio = audioRef.current;
-    const first = item.positions[0];
-    if (audio === null || first === undefined) {
-      return;
+  // Текущая плашка сфокусированного участника: запомненная позиция, а если
+  // её отрывок переклеен другому — ближайший следующий по списку.
+  const cardPosition = (label: string): number | undefined => {
+    const item = reviewSpeakers.find((entry) => entry.label === label);
+    if (item === undefined || item.positions.length === 0) {
+      return undefined;
     }
-    if (playlistRef.current?.label === item.label) {
-      // Повторный клик по тому же спикеру — остановить перескок.
-      audio.pause();
-      stopPlaylist();
-      return;
+    const stored = focusPositions.get(label);
+    if (stored !== undefined && item.positions.includes(stored)) {
+      return stored;
     }
-    playFragment(reviewFragments[first]?.start_s ?? 0);
-    playlistRef.current = { label: item.label, positions: item.positions, cursor: 0 };
-    setPlaylist({ label: item.label, position: first });
+    if (stored === undefined) {
+      return item.positions[0];
+    }
+    return (
+      item.positions.find((position) => position > stored) ??
+      item.positions[item.positions.length - 1]
+    );
   };
 
-  // Предыдущий/следующий отрывок спикера.  Если плейлист не запущен,
-  // «следующий» начинает его с первого отрывка, «предыдущий» — с последнего.
-  const stepSpeaker = (item: (typeof reviewSpeakers)[number], delta: 1 | -1): void => {
+  const toggleFocus = (label: string): void => {
+    if (focusSpeaker === label) {
+      setFocusSpeaker(null);
+      return;
+    }
+    setFocusSpeaker(label);
+    if (!focusPositions.has(label)) {
+      const first = reviewSpeakers.find((entry) => entry.label === label)?.positions[0];
+      if (first !== undefined) {
+        setFocusPositions((prev) => new Map(prev).set(label, first));
+      }
+    }
+  };
+
+  // Предыдущий/следующий отрывок сфокусированного участника.  Если его
+  // плейлист играет — аудио прыгает на выбранный отрывок и продолжает.
+  const stepCard = (label: string, delta: 1 | -1): void => {
+    const item = reviewSpeakers.find((entry) => entry.label === label);
+    const current = cardPosition(label);
+    if (item === undefined || current === undefined) {
+      return;
+    }
+    const index = item.positions.indexOf(current);
+    const target =
+      index === -1
+        ? delta > 0
+          ? item.positions[0]
+          : item.positions[item.positions.length - 1]
+        : item.positions[index + delta];
+    if (target === undefined) {
+      return;
+    }
+    setFocusPositions((prev) => new Map(prev).set(label, target));
+    if (playlist?.label === label) {
+      playFragment(reviewFragments[target]?.start_s ?? 0);
+      playlistRef.current = {
+        label,
+        positions: item.positions,
+        cursor: item.positions.indexOf(target),
+      };
+      setPlaylist({ label, position: target });
+    }
+  };
+
+  // Плей/пауза карточки.  Пауза внутри отрывка запоминается: следующий плей
+  // продолжает с места остановки, а не с начала отрывка.
+  const togglePlayCard = (label: string): void => {
     const audio = audioRef.current;
     if (audio === null) {
       return;
     }
-    const active = playlistRef.current;
-    let positions: number[];
-    let cursor: number;
-    if (active === null || active.label !== item.label) {
-      if (item.positions.length === 0) {
-        return;
-      }
-      positions = item.positions;
-      cursor = delta > 0 ? 0 : positions.length - 1;
-    } else {
-      positions = active.positions;
-      const next = active.cursor + delta;
-      if (next < 0 || next >= positions.length) {
-        return;
-      }
-      cursor = next;
-    }
-    const target = positions[cursor];
-    if (target === undefined) {
+    if (playlist?.label === label) {
+      audio.pause();
       return;
     }
-    playFragment(reviewFragments[target]?.start_s ?? 0);
-    playlistRef.current = { label: item.label, positions, cursor };
-    setPlaylist({ label: item.label, position: target });
+    const position = cardPosition(label);
+    const item = reviewSpeakers.find((entry) => entry.label === label);
+    const fragment = position === undefined ? undefined : reviewFragments[position];
+    if (position === undefined || item === undefined || fragment === undefined) {
+      return;
+    }
+    const resume =
+      audio.paused &&
+      playlist === null &&
+      audio.currentTime >= fragment.start_s - 0.3 &&
+      audio.currentTime < fragment.end_s - 0.05;
+    if (!resume) {
+      playFragment(fragment.start_s);
+    }
+    playlistRef.current = {
+      label,
+      positions: item.positions,
+      cursor: item.positions.indexOf(position),
+    };
+    setPlaylist({ label, position });
+    if (resume) {
+      void audio.play().catch(() => undefined);
+    }
   };
 
   // Плейлист спикера: по окончании отрывка плеер прыгает к следующему
@@ -867,6 +940,8 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     }
     active.cursor = cursor;
     setPlaylist({ label: active.label, position: nextPosition });
+    // Карточка сфокусированного участника следует за воспроизведением.
+    setFocusPositions((prev) => new Map(prev).set(active.label, nextPosition));
     audio.currentTime = Math.max(0, nextFragment.start_s - 0.2);
   };
 
@@ -1485,6 +1560,22 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                 <span className="review-count">
                   Исправлено: {reviewEdits.size} из {reviewFragments.length}
                 </span>
+                <div className="review-layout-switch" role="group" aria-label="Режим проверки">
+                  <Button
+                    size="small"
+                    appearance={reviewLayout === 'speakers' ? 'primary' : 'secondary'}
+                    onClick={() => setReviewLayout('speakers')}
+                  >
+                    По спикерам
+                  </Button>
+                  <Button
+                    size="small"
+                    appearance={reviewLayout === 'list' ? 'primary' : 'secondary'}
+                    onClick={() => setReviewLayout('list')}
+                  >
+                    Список отрывков
+                  </Button>
+                </div>
                 <div className="review-toolbar-buttons">
                   <Button
                     appearance="primary"
@@ -1504,37 +1595,67 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                   <Button
                     icon={<DismissRegular />}
                     disabled={reviewBusy}
-                    onClick={() => setReviewMode(false)}
+                    onClick={() => void exitReview()}
                   >
-                    Готово
+                    Сохранить и выйти
                   </Button>
                 </div>
               </div>
               {reviewSpeakers.length > 0 ? (
-                <div className="review-speakers">
-                  <button
-                    type="button"
-                    className="review-speakers-toggle"
-                    aria-expanded={speakersOpen}
-                    onClick={() => setSpeakersOpen((prev) => !prev)}
-                  >
-                    {speakersOpen ? <ChevronDownRegular /> : <ChevronRightRegular />}
-                    <span className="review-speakers-title">
-                      Спикеры: {reviewSpeakers.length}
-                      {namedSpeakerCount > 0
-                        ? ` · имён записано: ${namedSpeakerCount}`
-                        : ''}
-                    </span>
-                    <span className="review-speakers-hint">
-                      ▶ играет отрывки спикера подряд; имя — в расшифровку и
-                      саммари
-                    </span>
-                  </button>
-                  {speakersOpen ? (
-                    <div className="review-speakers-list">
+                <div
+                  className={
+                    reviewLayout === 'speakers'
+                      ? 'review-speakers review-speakers-main'
+                      : 'review-speakers'
+                  }
+                >
+                  {reviewLayout === 'list' ? (
+                    <button
+                      type="button"
+                      className="review-speakers-toggle"
+                      aria-expanded={speakersOpen}
+                      onClick={() => setSpeakersOpen((prev) => !prev)}
+                    >
+                      {speakersOpen ? <ChevronDownRegular /> : <ChevronRightRegular />}
+                      <span className="review-speakers-title">
+                        Спикеры: {reviewSpeakers.length}
+                        {namedSpeakerCount > 0
+                          ? ` · имён записано: ${namedSpeakerCount}`
+                          : ''}
+                      </span>
+                      <span className="review-speakers-hint">
+                        имя — в расшифровку и саммари; «объединить с…» клеит
+                        две метки одного голоса
+                      </span>
+                    </button>
+                  ) : (
+                    <div className="review-speakers-toggle">
+                      <span className="review-speakers-title">
+                        Спикеры: {reviewSpeakers.length}
+                        {namedSpeakerCount > 0
+                          ? ` · имён записано: ${namedSpeakerCount}`
+                          : ''}
+                      </span>
+                      <span className="review-speakers-hint">
+                        нажмите на спикера — под ним карточка его отрывков:
+                        слушайте, правьте метку и комментарий
+                      </span>
+                    </div>
+                  )}
+                  {reviewLayout === 'speakers' || speakersOpen ? (
+                    <div
+                      className={
+                        reviewLayout === 'speakers'
+                          ? 'review-speakers-list review-speakers-list-main'
+                          : 'review-speakers-list'
+                      }
+                    >
                       {reviewSpeakers.map((item) => {
-                        const nowPosition =
-                          playlist?.label === item.label ? playlist.position : undefined;
+                        const focused = focusSpeaker === item.label;
+                        const nowPosition = focused
+                          ? cardPosition(item.label)
+                          : undefined;
+                        const playing = playlist?.label === item.label;
                         const nowFragment =
                           nowPosition === undefined
                             ? undefined
@@ -1544,7 +1665,8 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                           nowPosition === undefined
                             ? ''
                             : (reviewEdits.get(nowPosition) ?? nowOriginal);
-                        const nowEdited = nowPosition !== undefined && reviewEdits.has(nowPosition);
+                        const nowEdited =
+                          nowPosition !== undefined && reviewEdits.has(nowPosition);
                         const nowOptions =
                           nowOriginal === '' ||
                           reviewSpeakerOptions.includes(nowOriginal)
@@ -1556,39 +1678,27 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                             : item.positions.indexOf(nowPosition);
                         return (
                           <div key={item.label} className="review-speaker-block">
-                            <div className="review-speaker-row">
+                            <div
+                              className={
+                                focused
+                                  ? 'review-speaker-row review-speaker-focused'
+                                  : 'review-speaker-row'
+                              }
+                            >
                               <button
                                 type="button"
-                                className="review-play"
-                                aria-label={`Предыдущий отрывок спикера: ${item.label}`}
-                                disabled={audioUrl === null}
-                                onClick={() => stepSpeaker(item, -1)}
+                                className="review-speaker-focus"
+                                aria-expanded={focused}
+                                title="Показать отрывки этого спикера"
+                                onClick={() => toggleFocus(item.label)}
                               >
-                                <ArrowPreviousRegular />
-                              </button>
-                              <button
-                                type="button"
-                                className="review-play"
-                                aria-label={`Прослушать отрывки спикера: ${item.label}`}
-                                disabled={audioUrl === null}
-                                onClick={() => playSpeaker(item)}
-                              >
-                                {playlist?.label === item.label ? (
-                                  <PauseRegular />
+                                {focused ? (
+                                  <ChevronDownRegular />
                                 ) : (
-                                  <PlayRegular />
+                                  <ChevronRightRegular />
                                 )}
+                                {item.label}
                               </button>
-                              <button
-                                type="button"
-                                className="review-play"
-                                aria-label={`Следующий отрывок спикера: ${item.label}`}
-                                disabled={audioUrl === null}
-                                onClick={() => stepSpeaker(item, 1)}
-                              >
-                                <ArrowNextRegular />
-                              </button>
-                              <span className="review-speaker-label">{item.label}</span>
                               <input
                                 className="review-comment"
                                 type="text"
@@ -1632,69 +1742,104 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                                   })}
                               </select>
                             </div>
-                            {nowFragment !== undefined && nowPosition !== undefined ? (
+                            {focused &&
+                            nowFragment !== undefined &&
+                            nowPosition !== undefined ? (
                               <div className="review-now">
-                                <div className="review-now-head">
-                                  <span className="review-time">
-                                    {formatClock(nowFragment.start_s)}–
-                                    {formatClock(nowFragment.end_s)}
-                                  </span>
-                                  {nowIndex >= 0 ? (
-                                    <span className="review-now-count">
-                                      {nowIndex + 1} из {item.positions.length}
-                                    </span>
-                                  ) : null}
-                                  <select
-                                    className="review-select"
-                                    value={nowEffective}
-                                    aria-label="Спикер фрагмента"
-                                    onChange={(event) => {
-                                      const value = event.target.value;
-                                      setReviewEdits((prev) => {
-                                        const next = new Map(prev);
-                                        if (value === nowOriginal) {
-                                          next.delete(nowPosition);
-                                        } else {
-                                          next.set(nowPosition, value);
-                                        }
-                                        return next;
-                                      });
-                                    }}
+                                <div className="review-now-controls">
+                                  <button
+                                    type="button"
+                                    className="review-play"
+                                    aria-label={`Предыдущий отрывок: ${item.label}`}
+                                    disabled={audioUrl === null}
+                                    onClick={() => stepCard(item.label, -1)}
                                   >
-                                    {nowOriginal === '' ? (
-                                      <option value="">—</option>
-                                    ) : null}
-                                    {nowOptions.map((option) => {
-                                      const name = speakerNames.get(option)?.trim();
-                                      return (
-                                        <option key={option} value={option}>
-                                          {name ? `${name} (${option})` : option}
-                                        </option>
-                                      );
-                                    })}
-                                  </select>
+                                    <ArrowPreviousRegular />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="review-play"
+                                    aria-label={
+                                      playing ? 'Пауза' : `Прослушать отрывки: ${item.label}`
+                                    }
+                                    disabled={audioUrl === null}
+                                    onClick={() => togglePlayCard(item.label)}
+                                  >
+                                    {playing ? <PauseRegular /> : <PlayRegular />}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="review-play"
+                                    aria-label={`Следующий отрывок: ${item.label}`}
+                                    disabled={audioUrl === null}
+                                    onClick={() => stepCard(item.label, 1)}
+                                  >
+                                    <ArrowNextRegular />
+                                  </button>
                                 </div>
-                                <div className="review-text">{nowFragment.text}</div>
-                                {nowEdited ? (
-                                  <input
-                                    className="review-comment"
-                                    type="text"
-                                    placeholder="Комментарий (необязательно)"
-                                    value={reviewComments.get(nowPosition) ?? ''}
-                                    onChange={(event) => {
-                                      const value = event.target.value;
-                                      setReviewComments((prev) => {
-                                        const next = new Map(prev);
-                                        if (value === '') {
-                                          next.delete(nowPosition);
-                                        } else {
-                                          next.set(nowPosition, value);
-                                        }
-                                        return next;
-                                      });
-                                    }}
-                                  />
-                                ) : null}
+                                <div className="review-now-body">
+                                  <div className="review-now-head">
+                                    <span className="review-time">
+                                      {formatClock(nowFragment.start_s)}–
+                                      {formatClock(nowFragment.end_s)}
+                                    </span>
+                                    {nowIndex >= 0 ? (
+                                      <span className="review-now-count">
+                                        {nowIndex + 1} из {item.positions.length}
+                                      </span>
+                                    ) : null}
+                                    <select
+                                      className="review-select"
+                                      value={nowEffective}
+                                      aria-label="Спикер фрагмента"
+                                      onChange={(event) => {
+                                        const value = event.target.value;
+                                        setReviewEdits((prev) => {
+                                          const next = new Map(prev);
+                                          if (value === nowOriginal) {
+                                            next.delete(nowPosition);
+                                          } else {
+                                            next.set(nowPosition, value);
+                                          }
+                                          return next;
+                                        });
+                                      }}
+                                    >
+                                      {nowOriginal === '' ? (
+                                        <option value="">—</option>
+                                      ) : null}
+                                      {nowOptions.map((option) => {
+                                        const name = speakerNames.get(option)?.trim();
+                                        return (
+                                          <option key={option} value={option}>
+                                            {name ? `${name} (${option})` : option}
+                                          </option>
+                                        );
+                                      })}
+                                    </select>
+                                  </div>
+                                  <div className="review-text">{nowFragment.text}</div>
+                                  {nowEdited ? (
+                                    <input
+                                      className="review-comment"
+                                      type="text"
+                                      placeholder="Комментарий (необязательно)"
+                                      value={reviewComments.get(nowPosition) ?? ''}
+                                      onChange={(event) => {
+                                        const value = event.target.value;
+                                        setReviewComments((prev) => {
+                                          const next = new Map(prev);
+                                          if (value === '') {
+                                            next.delete(nowPosition);
+                                          } else {
+                                            next.set(nowPosition, value);
+                                          }
+                                          return next;
+                                        });
+                                      }}
+                                    />
+                                  ) : null}
+                                </div>
                               </div>
                             ) : null}
                           </div>
@@ -1704,6 +1849,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                   ) : null}
                 </div>
               ) : null}
+              {reviewLayout === 'list' ? (
               <ul className="review-list" ref={reviewListRef}>
                 {reviewFragments.map((fragment, position) => {
                   const original = fragment.speaker ?? '';
@@ -1798,6 +1944,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                   );
                 })}
               </ul>
+              ) : null}
             </div>
           ) : (
             <Textarea
