@@ -180,7 +180,8 @@ class TestWeSpeakerGroup:
         # min_cluster_size=2 он приклеивается к ближайшему крупному,
         # нумерация остаётся плотной, без дыр.
         profiles = diarization_profiles._profiles_from_payload(None)
-        profiles.wespeaker[2].min_cluster_size = 2  # группа conference
+        conference = next(p for p in profiles.wespeaker if p.id == "conference")
+        conference.min_cluster_size = 2
         fake = FakeEmbedding(cluster_size=5)
         monkeypatch.setattr(diarization, "load_se", lambda *args, **kwargs: fake)
         engine = diarization.WeSpeakerResNetEngine(profiles=profiles, profile_id="conference")

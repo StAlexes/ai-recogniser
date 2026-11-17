@@ -1843,3 +1843,61 @@ def test_normalize_clip_level_targets_rms() -> None:
     # Тишина не усиливается до шума.
     silence = np.zeros(1000, dtype=np.float32)
     assert np.array_equal(diarization._normalize_clip_level(silence), silence)
+
+
+def test_unreliable_region_follows_clear_own_voice(monkeypatch) -> None:
+    """Короткая вставка между A и B уходит голосу C, если он заметно ближе.
+
+    Соседи во времени остаются выбором по умолчанию (абсолютное сходство
+    sub-second клипа шумное), но если собственный голос вставки обходит
+    оба соседних кластера на UNRELIABLE_VOICE_MARGIN, берём его: встречная
+    реплика третьего участника не должна прилипать к окружающим.
+    """
+    vectors = np.asarray(
+        [
+            [1.0, 0.0, 0.0],  # A1
+            [1.0, 0.0, 0.0],  # A2
+            [1.0, 0.0, 0.0],  # A3
+            [0.0, 1.0, 0.0],  # вставка: голос C (0.5 с, между A и B)
+            [0.0, 0.0, 1.0],  # B1
+            [0.0, 0.0, 1.0],  # B2
+            [0.0, 0.0, 1.0],  # B3
+            [0.0, 1.0, 0.0],  # C1
+            [0.0, 1.0, 0.0],  # C2
+            [0.0, 1.0, 0.0],  # C3
+        ],
+        dtype=np.float32,
+    )
+    monkeypatch.setattr(
+        diarization,
+        "load_se",
+        lambda *_args, **_kwargs: QueueSpeakerEmbedding(vectors),
+    )
+    regions = [
+        ("Спикер 1", 0.0, 2.0),
+        ("Спикер 1", 4.0, 6.0),
+        ("Спикер 1", 8.0, 10.0),
+        ("Спикер 3", 11.0, 11.5),  # ненадёжная вставка голоса C
+        ("Спикер 2", 40.0, 42.0),
+        ("Спикер 2", 44.0, 46.0),
+        ("Спикер 2", 48.0, 50.0),
+        ("Спикер 4", 60.0, 62.0),
+        ("Спикер 4", 64.0, 66.0),
+        ("Спикер 4", 68.0, 70.0),
+    ]
+    audio = np.zeros(72 * SAMPLE_RATE, dtype=np.float32)
+
+    result, _assigner = diarization._relabel_regions_by_voice(
+        regions,
+        audio,
+        SAMPLE_RATE,
+        cpu_threads=0,
+        threshold=0.75,
+        min_cluster_size=3,
+    )
+    labels = [label for label, _start, _end in result]
+    voice_c = labels[7]
+    # Вставка не основала собственный кластер и не прилипла к соседям A/B:
+    # её голос (сходство 1.0 к C против 0.0 к соседям) обходит их с запасом.
+    assert len(set(labels)) == 3, sorted(set(labels))
+    assert labels[3] == voice_c

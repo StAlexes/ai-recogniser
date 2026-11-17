@@ -1103,6 +1103,13 @@ SHORT_REGION_S = 1.2
 # к «усреднённой смеси».
 OVERLAP_REGION_FRACTION = 0.5
 
+# На сколько собственный голос ненадёжного региона должен обходить лучший
+# соседний кластер, чтобы решение соседей было перебито: короткая вставка
+# может принадлежать голосу, который не звучит ни до, ни после (встречная
+# реплика третьего участника).  Абсолютное сходство sub-second клипа шумное,
+# поэтому решение соседей меняется только при заметном отрыве.
+UNRELIABLE_VOICE_MARGIN = 0.05
+
 
 def _relabel_regions_by_voice(
     regions: list[tuple[str, float, float]],
@@ -1244,9 +1251,25 @@ def _relabel_regions_by_voice(
             candidates.add(cluster_ids[min(after, key=lambda i: regions[i][1])])
         if not candidates:
             candidates = set(members)
-        cluster_ids[index] = max(
+        best_neighbor = max(
             candidates, key=lambda cluster: _mean_similarity(unit[index], cluster)
         )
+        # Собственный голос клипа может быть заметно ближе, чем оба соседних
+        # кластера: короткая вставка часто принадлежит голосу, который не
+        # звучит ни до, ни после (встречная реплика третьего участника).
+        # Соседи остаются выбором по умолчанию — абсолютное сходство
+        # sub-second клипа шумное, — поэтому перебиваем решение соседей
+        # только при заметном отрыве (:data:`UNRELIABLE_VOICE_MARGIN`).
+        best_voice = max(
+            members, key=lambda cluster: _mean_similarity(unit[index], cluster)
+        )
+        if best_voice is not best_neighbor and (
+            _mean_similarity(unit[index], best_voice)
+            > _mean_similarity(unit[index], best_neighbor) + UNRELIABLE_VOICE_MARGIN
+        ):
+            cluster_ids[index] = best_voice
+        else:
+            cluster_ids[index] = best_neighbor
 
     label_of_cluster = {cluster: f"Спикер {cluster + 1}" for cluster in members}
 
