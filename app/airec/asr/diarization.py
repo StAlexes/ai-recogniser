@@ -1088,21 +1088,6 @@ SHORT_REGION_S = 1.2
 # к «усреднённой смеси».
 OVERLAP_REGION_FRACTION = 0.5
 
-# Сигнатура мечущегося слота тихого голоса (см. склейку в
-# _relabel_regions_by_voice): чередования меток X<->Y считаются соседними
-# при паузе не больше этой; всплеск — столько чередований в окне; у
-# разорванного голоса всплеск покрывает не менее этой доли всех
-# чередований пары (у диалоговой пары чередования размазаны по записи).
-SLOT_FLIP_GAP_S = 1.0
-SLOT_FLIP_BURST_WINDOW_S = 120.0
-SLOT_FLIP_MIN_BURST = 5
-SLOT_FLIP_MIN_CONCENTRATION = 0.8
-# Быстрый диалог двух РАЗНЫХ голосов выглядит так же, как мечущийся слот
-# (серия чередований подряд); от такого слияния предохраняет нижняя граница
-# поперечного сходства: куски одного разорванного голоса всё же похожи
-# (0.2+), ортогональные голоса быстрого диалога — нет.
-SLOT_FLIP_MIN_SIMILARITY = 0.15
-
 
 def _relabel_regions_by_voice(
     regions: list[tuple[str, float, float]],
@@ -1131,11 +1116,6 @@ def _relabel_regions_by_voice(
     кластеризации не участвуют: они основывают мусорные кластеры и стягивают
     к себе такие же ненадёжные.  Каждый присоединяется к кластеру соседнего
     во времени «чистого» региона с лучшим средним сходством по членам.
-    Наконец, метки, между которыми прошёл ВСПЛЕСК чередований
-    (:data:`SLOT_FLIP_MIN_BURST` и дальше по :data:`SLOT_FLIP_*`), склеиваются:
-    pyannote мечется между слотами на тихом голосе и рвёт одного человека
-    на две-три метки без мостовых блендов — попарное сходство их кусков
-    низкое, и только серия быстрых чередований выдаёт разорванность.
 
     Возвращает ``(размеченные регионы, ``assign_voice``)``.  ``assign_voice``
     — колбэк «клип → ближайшая метка по тембру» для кусков речи, оставшихся
@@ -1252,86 +1232,6 @@ def _relabel_regions_by_voice(
         cluster_ids[index] = max(
             candidates, key=lambda cluster: _mean_similarity(unit[index], cluster)
         )
-
-    # Склейка мечущихся слотов тихого голоса.  pyannote переключает слот
-    # каждые пару секунд, когда голос слаб (тихий спикер, дальний микрофон),
-    # и кластеризация получает два куска одного человека без мостовых
-    # блендов: поперечное сходство низкое, никакой порог их не соединит.
-    # Сигнатура такой разорванности — ВСПЛЕСК чередований: серия подряд
-    # идущих смен меток X<->Y (пауза <= SLOT_FLIP_GAP_S, третьи метки между
-    # ними не вклиниваются).  Реальный диалог тоже чередуется, но размазано
-    # по записи; у разорванного голоса почти все чередования пары лежат в
-    # одном коротком отрезке.  На записи заседания тихий Игорь (RMS
-    # -32..-38 дБFS) был разорван на две-три метки: 6 чередований подряд
-    # в пределах минуты при поперечном сходстве 0.21.
-    alternation_times: dict[tuple[int, int], list[float]] = {}
-    ordered = sorted(range(len(regions)), key=lambda i: regions[i][1])
-    for left, right in itertools.pairwise(ordered):
-        if regions[right][1] - regions[left][2] > SLOT_FLIP_GAP_S:
-            continue
-        left_cluster, right_cluster = cluster_ids[left], cluster_ids[right]
-        if left_cluster == right_cluster:
-            continue
-        key = (min(left_cluster, right_cluster), max(left_cluster, right_cluster))
-        alternation_times.setdefault(key, []).append(regions[right][1])
-
-    merge_into: dict[int, int] = {}
-    positions_by_cluster: dict[int, list[int]] = {}
-    for index, cluster in enumerate(cluster_ids):
-        positions_by_cluster.setdefault(cluster, []).append(index)
-
-    def _resolve(cluster: int) -> int:
-        while cluster in merge_into:
-            cluster = merge_into[cluster]
-        return cluster
-
-    for (left, right), times in sorted(
-        alternation_times.items(), key=lambda item: -len(item[1])
-    ):
-        left, right = _resolve(left), _resolve(right)
-        if left == right:
-            continue
-        best_burst = 1
-        for position, moment in enumerate(times):
-            burst = 1
-            for following in times[position + 1 :]:
-                if following - moment > SLOT_FLIP_BURST_WINDOW_S:
-                    break
-                burst += 1
-            best_burst = max(best_burst, burst)
-        if best_burst < SLOT_FLIP_MIN_BURST:
-            continue
-        if best_burst < SLOT_FLIP_MIN_CONCENTRATION * len(times):
-            continue
-        # Быстрый диалог двух РАЗНЫХ голосов даёт тот же всплеск; слияние
-        # допускается только для похожих кусков (у разорванного голоса
-        # поперечное сходство низкое, но положительное).
-        cross_mean = float(
-            np.mean(
-                [
-                    float(unit[a] @ unit[b])
-                    for a in positions_by_cluster[left]
-                    for b in positions_by_cluster[right]
-                ]
-            )
-        )
-        if cross_mean < SLOT_FLIP_MIN_SIMILARITY:
-            continue
-        # Сливаем в кластер с большим числом регионов; цепочки разрешаются
-        # через _resolve, поэтому повторные всплески не создают циклов.
-        if len(positions_by_cluster[left]) >= len(positions_by_cluster[right]):
-            merge_into[right] = left
-            positions_by_cluster[left].extend(positions_by_cluster[right])
-        else:
-            merge_into[left] = right
-            positions_by_cluster[right].extend(positions_by_cluster[left])
-
-    if merge_into:
-        merged_members: dict[int, list[np.ndarray]] = {}
-        for cluster, vectors in members.items():
-            merged_members.setdefault(_resolve(cluster), []).extend(vectors)
-        members = merged_members
-        cluster_ids = [_resolve(cluster) for cluster in cluster_ids]
 
     label_of_cluster = {cluster: f"Спикер {cluster + 1}" for cluster in members}
 
