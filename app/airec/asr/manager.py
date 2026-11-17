@@ -1499,21 +1499,54 @@ class JobManager:
         )
         if report["speaker_names"] != (previous_names or {}):
             self._apply_speaker_names(job_id, report["speaker_names"])
+        else:
+            # Имена не менялись, но исправления могли измениться: текст с
+            # диаризацией обязан отражать и их (иначе правки живут только
+            # в отчёте, а расшифровка показывает исходную разметку).
+            self._apply_speaker_names(
+                job_id,
+                report["speaker_names"],
+                {c["index"]: c["correct"] for c in report["corrections"]},
+            )
         return report
 
-    def _apply_speaker_names(self, job_id: str, names: dict[str, str]) -> None:
-        """Перерисовать текст с диаризацией под именами и сбросить саммари.
+    def _apply_speaker_names(
+        self,
+        job_id: str,
+        names: dict[str, str],
+        corrections: dict[int, str] | None = None,
+    ) -> None:
+        """Перерисовать текст с диаризацией под правкой и сбросить саммари.
 
-        Имена — слой отображения поверх системных меток: сегменты не трогаем,
-        но text_speakers, transcript_speakers.txt и вход саммаризации меняются.
+        Имена и исправления — слой отображения поверх системных меток:
+        сегменты не трогаем, но text_speakers, transcript_speakers.txt и
+        вход саммаризации меняются.  *corrections* — позиция фрагмента с
+        текстом (та же нумерация, что в отчёте проверки) → правильная метка.
         """
         with self._lock:
             current = self._jobs.get(job_id)
             if current is None or current.status != "done":
                 return
-            speakers = {s.get("speaker") for s in current.segments if s.get("speaker")}
+            # Позиции фрагментов с текстом — тот же список, что в отчёте.
+            fragment_indices = [
+                index
+                for index, segment in enumerate(current.segments)
+                if str(segment.get("text", "")).strip()
+            ]
+            overrides = {
+                fragment_indices[position]: correct
+                for position, correct in (corrections or {}).items()
+                if 0 <= position < len(fragment_indices)
+            }
+            display = [
+                dict(segment, speaker=overrides[index])
+                if index in overrides
+                else segment
+                for index, segment in enumerate(current.segments)
+            ]
+            speakers = {s.get("speaker") for s in display if s.get("speaker")}
             speakers_text = (
-                export_txt(current.segments, speaker_names=names) if speakers else ""
+                export_txt(display, speaker_names=names) if speakers else ""
             )
             current.text_speakers = speakers_text if speakers else ""
             if speakers:
@@ -1821,8 +1854,24 @@ class JobManager:
                         "cannot persist restart of stage %s for %s", stage, job_id
                     )
         if stage == "diarization":
+            # Разметка изменится: отчёт проверки (исправления и имена)
+            # описывал старые фрагменты — оставлять его значит подсунуть
+            # новые индексы под старые правки.  Начинаем проверку заново.
+            self._reset_review(job_id)
             return self._start_diarization(job_id)
         return self._start_summary(job_id)
+
+    def _reset_review(self, job_id: str) -> None:
+        """Удалить отчёт проверки (создаётся заново после перезапуска)."""
+        path = self.review_path(job_id)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        except OSError:
+            log.exception("cannot reset review for %s", job_id)
+            return
+        log.info("review reset for %s (diarization restart)", job_id)
 
     def restart_recognition(self, job_id: str) -> Job:
         """Reset and re-run recognition in place, preserving the job id."""

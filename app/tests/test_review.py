@@ -373,3 +373,45 @@ def test_review_requires_finished_job(tmp_path: Path) -> None:
             test_client.get(f"/api/v1/jobs/{job.id}/audio", headers=HEADERS).status_code
             == 200
         )
+
+
+def test_review_corrections_reach_text_speakers(
+    client: tuple[TestClient, Path],
+) -> None:
+    """Исправления (не только имена) попадают в text_speakers.
+
+    Правка «фрагмент два — Спикер 1» переставляет реплику в тексте: метки
+    в отчёте — слой отображения, и расшифровка обязана её отражать.
+    """
+    test_client, _tmp_path = client
+    job_id = "20260101-000000-review1"
+    saved = test_client.put(
+        f"/api/v1/jobs/{job_id}/review",
+        headers=HEADERS,
+        json={"corrections": [{"index": 1, "correct": "Спикер 1"}]},
+    )
+    assert saved.status_code == 200, saved.text
+
+    detail = test_client.get(f"/api/v1/jobs/{job_id}", headers=HEADERS).json()
+    text = detail["text_speakers"]
+    assert "Фрагмент один" in text and "Фрагмент два" in text
+    # Метка «Спикер 2» исчезла: единственный её фрагмент переклеен.
+    assert "Спикер 2" not in text
+    # Реплики одного спикера склеились в одну строку с общим интервалом.
+    assert "Фрагмент один Фрагмент два Фрагмент три" in text
+
+
+def test_review_reset_on_diarization_restart(
+    client: tuple[TestClient, Path],
+) -> None:
+    """Перезапуск диаризации сбрасывает отчёт: индексы правок были
+    привязаны к старым фрагментам и на новой разметке врали бы."""
+    test_client, _tmp_path = client
+    job_id = "20260101-000000-review1"
+    test_client.put(
+        f"/api/v1/jobs/{job_id}/review", headers=HEADERS, json={"corrections": []}
+    )
+    manager = test_client.app.state.jobs
+    assert manager.load_review(job_id) is not None
+    manager._reset_review(job_id)
+    assert manager.load_review(job_id) is None

@@ -945,16 +945,31 @@ def _cluster_region_voices(
         # к чужому голосу нельзя.  Приклейка — ЦЕЛИКОМ, по сходству центроидов:
         # по-регионное назначение разъезжает мелкий кластер между двумя
         # крупными, и регионы одного человека получают разные метки.
+        # Мелкий кластер из 2+ регионов клеится к ближайшему крупному, только
+        # если он ближе к цели, чем к самому себе: иначе это самостоятельный
+        # малоречивый голос, а не шум (Фархад основал свой кластер из 4
+        # регионов, и приклейка возвращала его к ближайшему крупному —
+        # кластеру Игоря, собрав одного человека из двух).  Одиночки клеятся
+        # как раньше: их связность с самим собой не определена.
         glue_cap = max(1, min_cluster_size // 2)
-        small_clusters = [
-            index for index in range(len(centroids)) if sizes[index] <= glue_cap
-        ]
-        targets = {
-            cluster: max(
+        targets: dict[int, int] = {}
+        for cluster in range(len(centroids)):
+            if sizes[cluster] > glue_cap:
+                continue
+            target = max(
                 large, key=lambda index: float(centroids[cluster] @ centroids[index])
             )
-            for cluster in small_clusters
-        }
+            if sizes[cluster] >= 2:
+                positions = cluster_positions[cluster]
+                vectors = unit[np.asarray(positions, dtype=np.intp)]
+                piece_sims = vectors @ vectors.T
+                piece_size = len(positions)
+                own = (
+                    float(piece_sims.sum()) - piece_size
+                ) / (piece_size * (piece_size - 1))
+                if float(centroids[cluster] @ centroids[target]) < own:
+                    continue
+            targets[cluster] = target
         for cluster, target in targets.items():
             for position, assigned in enumerate(assignment):
                 if assigned == cluster:
