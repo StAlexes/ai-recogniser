@@ -81,6 +81,11 @@ const RESULT_LABELS: Record<ResultView, string> = {
   summary: 'Саммари',
 };
 
+/** Псевдоспикер: реплика — не отдельный человек, а шум рядом с речью.
+ * В тексте с диаризацией прицепляется к ближайшему соседнему спикеру
+ * (правило совпадает с серверным export_txt). */
+const NOISE_LABEL = 'Шум';
+
 /** Форматы, которые WebView2 (Chromium) воспроизводит без конвертации. */
 const PLAYABLE_AUDIO = new Set([
   'mp3',
@@ -568,6 +573,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
   const reviewSpeakerOptions = useMemo(() => {
     const labels = new Set<string>();
     const numbers: number[] = [];
+    labels.add(NOISE_LABEL);
     for (const fragment of reviewFragments) {
       if (fragment.speaker !== null && fragment.speaker !== '') {
         labels.add(fragment.speaker);
@@ -794,6 +800,38 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
       if (!next.get(target)?.trim()) {
         next.set(target, name);
       }
+      return next;
+    });
+  };
+
+  // Весь блок спикера — шум: это не человек, а прилипшие к разговору
+  // реплики (поддакивания, перекрёстная речь).  В тексте они уйдут к
+  // соседним спикерам, поэтому имя метки теряет смысл — снимаем его.
+  const markSpeakerNoise = (source: string): void => {
+    if (source === NOISE_LABEL) {
+      return;
+    }
+    setReviewEdits((prev) => {
+      const next = new Map(prev);
+      reviewFragments.forEach((fragment, position) => {
+        const effective = next.get(position) ?? fragment.speaker ?? '';
+        if (effective !== source) {
+          return;
+        }
+        if (fragment.speaker === NOISE_LABEL && next.get(position) === source) {
+          next.delete(position);
+        } else {
+          next.set(position, NOISE_LABEL);
+        }
+      });
+      return next;
+    });
+    setSpeakerNames((prev) => {
+      if (!prev.get(source)?.trim()) {
+        return prev;
+      }
+      const next = new Map(prev);
+      next.delete(source);
       return next;
     });
   };
@@ -1703,24 +1741,26 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                                 )}
                                 {item.label}
                               </button>
-                              <input
-                                className="review-comment"
-                                type="text"
-                                placeholder="Имя спикера"
-                                value={speakerNames.get(item.label) ?? ''}
-                                onChange={(event) => {
-                                  const value = event.target.value;
-                                  setSpeakerNames((prev) => {
-                                    const next = new Map(prev);
-                                    if (value.trim() === '') {
-                                      next.delete(item.label);
-                                    } else {
-                                      next.set(item.label, value);
-                                    }
-                                    return next;
-                                  });
-                                }}
-                              />
+                              {item.label !== NOISE_LABEL ? (
+                                <input
+                                  className="review-comment"
+                                  type="text"
+                                  placeholder="Имя спикера"
+                                  value={speakerNames.get(item.label) ?? ''}
+                                  onChange={(event) => {
+                                    const value = event.target.value;
+                                    setSpeakerNames((prev) => {
+                                      const next = new Map(prev);
+                                      if (value.trim() === '') {
+                                        next.delete(item.label);
+                                      } else {
+                                        next.set(item.label, value);
+                                      }
+                                      return next;
+                                    });
+                                  }}
+                                />
+                              ) : null}
                               <select
                                 className="review-merge"
                                 value=""
@@ -1745,6 +1785,17 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
                                     );
                                   })}
                               </select>
+                              {item.label !== NOISE_LABEL ? (
+                                <button
+                                  type="button"
+                                  className="review-noise"
+                                  aria-label={`Пометить все отрывки ${item.label} как шум`}
+                                  title="Это не спикер: реплики прицепятся к соседним спикерам в тексте"
+                                  onClick={() => markSpeakerNoise(item.label)}
+                                >
+                                  Шум
+                                </button>
+                              ) : null}
                             </div>
                             {focused &&
                             nowFragment !== undefined &&

@@ -115,3 +115,53 @@ def test_export_unknown_format_raises() -> None:
         assert "Неизвестный формат экспорта" in str(exc)
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_export_txt_noise_attaches_to_nearest_neighbor() -> None:
+    """«Шум» — не спикер: текст реплики уходит к ближайшему соседу.
+
+    Зазор до предыдущей строки меньше, чем до следующей, — реплика
+    прицепляется к предыдущей; своей строки у шума нет.
+    """
+    segments = [
+        {"start_s": 0.0, "end_s": 2.0, "text": "Реплика первая.", "speaker": "Спикер 1"},
+        {"start_s": 2.5, "end_s": 3.0, "text": "К примеру.", "speaker": "Шум"},
+        {"start_s": 5.0, "end_s": 7.0, "text": "Реплика вторая.", "speaker": "Спикер 2"},
+    ]
+
+    result = export_txt(segments)
+
+    lines = result.splitlines()
+    assert lines == [
+        "[00:00–00:02] Спикер 1: Реплика первая. К примеру.",
+        "[00:05–00:07] Спикер 2: Реплика вторая.",
+    ]
+
+
+def test_export_txt_noise_tie_attaches_to_previous() -> None:
+    """Равные зазоры до обоих соседей — шум прицепляется к предыдущему."""
+    segments = [
+        {"start_s": 0.0, "end_s": 2.0, "text": "Реплика первая.", "speaker": "Спикер 1"},
+        {"start_s": 3.0, "end_s": 3.5, "text": "Ага.", "speaker": "Шум"},
+        {"start_s": 4.5, "end_s": 7.0, "text": "Реплика вторая.", "speaker": "Спикер 2"},
+    ]
+
+    result = export_txt(segments)
+
+    lines = result.splitlines()
+    assert lines == [
+        "[00:00–00:02] Спикер 1: Реплика первая. Ага.",
+        "[00:04–00:07] Спикер 2: Реплика вторая.",
+    ]
+
+
+def test_export_txt_all_noise_has_no_labels() -> None:
+    """Если вся разметка — шум, метки не выводятся: остаётся сплошной текст."""
+    segments = [
+        {"start_s": 0.0, "end_s": 2.0, "text": "Обрывок один.", "speaker": "Шум"},
+        {"start_s": 2.5, "end_s": 4.0, "text": "Обрывок два.", "speaker": "Шум"},
+    ]
+
+    result = export_txt(segments)
+
+    assert result == "Обрывок один. Обрывок два."

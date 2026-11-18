@@ -53,6 +53,16 @@ def _format_clock(seconds: float) -> str:
 # молчание.  На 29-минутной записи порог 5 с склеивает 98% соседних пар.
 SPEAKER_LINE_MERGE_GAP_S = 5.0
 
+# Псевдоспикер из режима проверки: реплика помечена как шум — это не
+# отдельный человек, а обрывок, который надо привязать к соседним спикерам.
+# В тексте с диаризацией такие реплики не образуют своих строк.
+NOISE_LABEL = "Шум"
+
+
+def _segment_bounds(segment: dict[str, Any]) -> tuple[float, float]:
+    start = float(segment.get("start_s", 0.0))
+    return start, max(float(segment.get("end_s", start)), start)
+
 
 def _speaker_interval(start: float, end: float) -> str:
     begin = _format_clock(start)
@@ -75,7 +85,10 @@ def export_txt(
     pause are merged into one line with a shared interval — otherwise a
     dialogue transcript falls apart into dozens of fragment lines.
     *speaker_names* — подписи пользователя из отчёта проверки: метка
-    «Спикер 3» отображается заданным именем.
+    «Спикер 3» отображается заданным именем.  Реплики с меткой
+    ``NOISE_LABEL`` («Шум») — не спикер: их текст прицепляется к ближайшей
+    по времени строке соседнего спикера (при равных зазорах — к предыдущей),
+    сами они строк не образуют.
     """
     parts = [
         (segment, segment.get("text", "").strip())
@@ -84,6 +97,45 @@ def export_txt(
     ]
     if not any(segment.get("speaker") for segment, _ in parts):
         return " ".join(text for _, text in parts).strip()
+
+    noise_indices = [
+        index
+        for index, (segment, _text) in enumerate(parts)
+        if segment.get("speaker") == NOISE_LABEL
+    ]
+    if noise_indices:
+        voiced_indices = [
+            index
+            for index, (segment, _text) in enumerate(parts)
+            if segment.get("speaker") != NOISE_LABEL
+        ]
+        if not voiced_indices:
+            return " ".join(text for _, text in parts).strip()
+        texts = [text for _segment, text in parts]
+        for index in noise_indices:
+            segment, text = parts[index]
+            start, end = _segment_bounds(segment)
+            before = [
+                i for i in voiced_indices if _segment_bounds(parts[i][0])[1] <= start
+            ]
+            after = [
+                i for i in voiced_indices if _segment_bounds(parts[i][0])[0] >= end
+            ]
+            if before and (
+                not after
+                or start - _segment_bounds(parts[before[-1]][0])[1]
+                <= _segment_bounds(parts[after[0]][0])[0] - end
+            ):
+                texts[before[-1]] = f"{texts[before[-1]]} {text}".strip()
+            elif after:
+                texts[after[0]] = f"{text} {texts[after[0]]}".strip()
+            # Оба списка пусты: шум перекрыт речью всех соседей — текст
+            # остаётся только в сплошном транскрипте.
+        parts = [
+            (segment, texts[index])
+            for index, (segment, _text) in enumerate(parts)
+            if segment.get("speaker") != NOISE_LABEL
+        ]
 
     names = speaker_names or {}
     lines: list[str] = []

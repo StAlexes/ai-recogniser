@@ -39,6 +39,7 @@ from airec.asr.export import (
     EXPORT_CONTENT_TYPES,
     EXPORT_DOWNLOAD_NAMES,
     EXPORT_EXTENSIONS,
+    NOISE_LABEL,
     export_txt,
     format_summary,
 )
@@ -1620,7 +1621,13 @@ class JobManager:
             seen.add(position)
             if not correct:
                 raise ValueError("Не указан правильный спикер.")
-            if correct not in known and correct != _next_label(known):
+            # «Шум» — псевдоспикер из режима проверки: реплика не принадлежит
+            # отдельному человеку и в тексте прицепится к соседним спикерам.
+            if (
+                correct not in known
+                and correct != _next_label(known)
+                and correct != NOISE_LABEL
+            ):
                 raise ValueError(
                     f"Спикер «{correct}» не входит в разметку задачи "
                     f"(новым может быть только «{_next_label(known)}»)."

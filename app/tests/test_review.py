@@ -433,6 +433,37 @@ def test_review_names_and_corrections_apply_together(
     assert "Фрагмент один Фрагмент два Фрагмент три" in text
 
 
+def test_review_noise_mark_reaches_text(
+    client: tuple[TestClient, Path],
+) -> None:
+    """Пометка «Шум» — псевдоспикер: реплика прицепляется к соседям.
+
+    Средний фрагмент помечен шумом; зазоры до обоих соседей равны, поэтому
+    его текст уходит к предыдущей строке и дальше склеивается с ней в одну
+    реплику.  Строки «Шум» в тексте нет.
+    """
+    test_client, _tmp_path = client
+    job_id = "20260101-000000-review1"
+    saved = test_client.put(
+        f"/api/v1/jobs/{job_id}/review",
+        headers=HEADERS,
+        json={"corrections": [{"index": 1, "correct": "Шум"}]},
+    )
+    assert saved.status_code == 200, saved.text
+
+    report = saved.json()
+    assert report["stats"]["speaker_counts_corrected"]["Шум"] == 1
+
+    detail = test_client.get(f"/api/v1/jobs/{job_id}", headers=HEADERS).json()
+    text = detail["text_speakers"]
+    lines = text.splitlines()
+    # Шум прицепился к предыдущей строке (зазоры равны — побеждает
+    # предыдущий сосед); «Фрагмент три» отстоит на 6 с — отдельная строка.
+    assert lines[0].endswith("Фрагмент один Фрагмент два")
+    assert "Фрагмент три" in lines[1]
+    assert "Шум" not in text
+
+
 def test_review_reset_on_diarization_restart(
     client: tuple[TestClient, Path],
 ) -> None:
