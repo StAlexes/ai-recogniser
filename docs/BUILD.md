@@ -218,8 +218,8 @@ CDP только на loopback. В обычном запуске порт не �
 
 ## Ограничения текущей сборки
 
-- **ASR:** GigaAM v3 e2e CTC int8 на CPU, Silero VAD для длинных записей. Таймкодов в
-  `transcript.txt` и диаризации пока нет; сегменты сохраняются в `job.json` для будущего экспорта.
+- **ASR:** GigaAM v3 e2e CTC int8 на CPU, Silero VAD для длинных записей. Диаризация и
+  экспорт с тайм-кодами (TXT/SRT/VTT/Markdown/JSON) доступны в приложении и через API.
 - **Очередь:** in-memory, один worker; состояние задач в SQLite WAL
   (`data/airec_jobs.sqlite`), выживает при перезапуске. Отмена и повтор доступны через
   API `POST /api/v1/jobs/{id}/cancel` и `POST /api/v1/jobs/{id}/retry`. Исходный файл
