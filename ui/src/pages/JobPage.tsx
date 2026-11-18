@@ -722,6 +722,10 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
           .filter(([, name]) => name !== ''),
       );
       const report = await putJobReview(job.id, corrections, names);
+      // Бэкенд пересобрал текст с диаризацией (исходная разметка +
+      // объединения реплик + имена) и перезапустил саммари на нём:
+      // перечитываем задачу, чтобы расшифровка сразу показала новую версию.
+      void loadJob(true);
       setNotice(
         `Отчёт проверки сохранён: исправлений — ${report.stats.corrected}${
           Object.keys(names).length > 0
@@ -740,7 +744,7 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
     } finally {
       setReviewBusy(false);
     }
-  }, [job, reviewEdits, reviewComments, speakerNames, onAuthError, showError]);
+  }, [job, reviewEdits, reviewComments, speakerNames, loadJob, onAuthError, showError]);
 
   // «Готово» сохраняет отчёт: имена спикеров обязаны попасть в текст и
   // саммари даже без отдельного нажатия «Сохранить отчёт».  При ошибке

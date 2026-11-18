@@ -1497,17 +1497,16 @@ class JobManager:
             len(report["corrections"]),
             len(report["speaker_names"]),
         )
-        if report["speaker_names"] != (previous_names or {}):
-            self._apply_speaker_names(job_id, report["speaker_names"])
-        else:
-            # Имена не менялись, но исправления могли измениться: текст с
-            # диаризацией обязан отражать и их (иначе правки живут только
-            # в отчёте, а расшифровка показывает исходную разметку).
-            self._apply_speaker_names(
-                job_id,
-                report["speaker_names"],
-                {c["index"]: c["correct"] for c in report["corrections"]},
-            )
+        # Имена и исправления применяются атомарно: текст с диаризацией
+        # строится заново из исходной разметки + исправлений (объединения
+        # реплик) + имён.  Раньше ветка изменившихся имён пересобирала
+        # текст без исправлений — объединённые реплики оставались под
+        # старой меткой, и выглядело это как «имена не применились».
+        self._apply_speaker_names(
+            job_id,
+            report["speaker_names"],
+            {c["index"]: c["correct"] for c in report["corrections"]},
+        )
         return report
 
     def _apply_speaker_names(
@@ -1569,6 +1568,10 @@ class JobManager:
                 self._persist(current)
             except OSError:
                 log.exception("cannot persist speaker names for %s", job_id)
+        # Текст обновлён — саммаризация, поставленная в очередь этим же
+        # сохранением, обязана перезапуститься на этой версии; иначе она
+        # навсегда остаётся в «Ожидает запуска».
+        self._maybe_auto_summary(job_id)
 
     def _review_report(
         self,

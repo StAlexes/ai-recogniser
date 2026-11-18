@@ -401,6 +401,38 @@ def test_review_corrections_reach_text_speakers(
     assert "Фрагмент один Фрагмент два Фрагмент три" in text
 
 
+def test_review_names_and_corrections_apply_together(
+    client: tuple[TestClient, Path],
+) -> None:
+    """Имена и объединения реплик применяются одним сохранением.
+
+    Раньше ветка изменившихся имён пересобирала текст без исправлений:
+    объединённые реплики оставались под старой меткой и выглядели как
+    «имена не применились».  Текст обязан строиться из исходной
+    разметки + исправлений + имён.
+    """
+    test_client, _tmp_path = client
+    job_id = "20260101-000000-review1"
+    saved = test_client.put(
+        f"/api/v1/jobs/{job_id}/review",
+        headers=HEADERS,
+        json={
+            "corrections": [{"index": 1, "correct": "Спикер 1"}],
+            "speaker_names": {"Спикер 1": "Игорь"},
+        },
+    )
+    assert saved.status_code == 200, saved.text
+
+    detail = test_client.get(f"/api/v1/jobs/{job_id}", headers=HEADERS).json()
+    text = detail["text_speakers"]
+    # Имя подставлено вместо метки, метки в тексте больше нет.
+    assert "Игорь:" in text
+    assert "Спикер" not in text
+    # Объединение реплик применилось тем же сохранением: три фрагмента
+    # одного спикера — одна строка с общим интервалом.
+    assert "Фрагмент один Фрагмент два Фрагмент три" in text
+
+
 def test_review_reset_on_diarization_restart(
     client: tuple[TestClient, Path],
 ) -> None:
