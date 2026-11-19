@@ -143,7 +143,18 @@ export function stageElapsedSeconds(stage: JobStage, now: number): number | null
   return null;
 }
 
-export function StageProgress({ name, stage, now }: { name: StageKey; stage: JobStage; now?: number }) {
+export function StageProgress({
+  name,
+  stage,
+  now,
+  showElapsed = true,
+}: {
+  name: StageKey;
+  stage: JobStage;
+  now?: number;
+  /** В списке очереди показываем только процент: время этапа видно в карточке. */
+  showElapsed?: boolean;
+}) {
   const percent = Math.round(Math.max(0, Math.min(stage.progress, 1)) * 100);
   const live = stage.status === 'running';
   const elapsed = now !== undefined ? stageElapsedSeconds(stage, now) : null;
@@ -159,9 +170,9 @@ export function StageProgress({ name, stage, now }: { name: StageKey; stage: Job
       <span className="job-stage-value" title={stageStatusText(stage)}>
         {stage.status === 'skipped'
           ? '—'
-          : live && elapsed !== null
-            ? `${percent}% · ${formatDuration(elapsed)}`
-            : stage.status === 'done' && elapsed !== null
+          : live
+            ? `${percent}%`
+            : showElapsed && stage.status === 'done' && elapsed !== null
               ? formatDuration(elapsed)
               : `${percent}%`}
       </span>

@@ -1308,9 +1308,13 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
           ) : null
         }
         actions={
-          <Button icon={<ArrowLeftRegular />} onClick={onBack}>
-            К очереди
-          </Button>
+          // В режиме проверки «К очереди» не нужен: выход через «Готово»,
+          // который сохраняет отчёт, — лишняя кнопка только мешает.
+          reviewMode ? null : (
+            <Button icon={<ArrowLeftRegular />} onClick={onBack}>
+              К очереди
+            </Button>
+          )
         }
       />
 
@@ -1424,6 +1428,26 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
           >
             Копировать
           </Button>
+          {job !== null ? (
+            <span className="job-profile-inline" aria-label="Группа параметров диаризации">
+              <span className="job-profile-label">Группа параметров:</span>
+              <Dropdown
+                aria-label="Группа параметров диаризации для этой задачи"
+                value={profileLabel}
+                selectedOptions={[profileValue]}
+                disabled={stageBusy !== null || profileOptions.length <= 1}
+                onOptionSelect={(_event, data) => {
+                  void handleProfileSelect(data.optionValue);
+                }}
+              >
+                {profileOptions.map((option) => (
+                  <Option key={option.value} value={option.value}>
+                    {option.label}
+                  </Option>
+                ))}
+              </Dropdown>
+            </span>
+          ) : null}
           {job !== null && isActive(job.status) ? (
             <Button
               appearance="subtle"
@@ -1487,30 +1511,10 @@ export function JobPage({ jobId, onBack, onAuthError }: JobPageProps) {
           </div>
         ) : null}
 
-        {job !== null ? (
-          <div className="job-profile-row" aria-label="Группа параметров диаризации">
-            <span className="job-profile-label">Группа параметров:</span>
-            <Dropdown
-              aria-label="Группа параметров диаризации для этой задачи"
-              value={profileLabel}
-              selectedOptions={[profileValue]}
-              disabled={stageBusy !== null || profileOptions.length <= 1}
-              onOptionSelect={(_event, data) => {
-                void handleProfileSelect(data.optionValue);
-              }}
-            >
-              {profileOptions.map((option) => (
-                <Option key={option.value} value={option.value}>
-                  {option.label}
-                </Option>
-              ))}
-            </Dropdown>
-            {effectiveProfile === '' ? (
-              <span className="job-stage-profile-hint">
-                Глобальная группа: {globalGroupLabel}
-              </span>
-            ) : null}
-          </div>
+        {job !== null && effectiveProfile === '' ? (
+          <span className="job-stage-profile-hint">
+            Глобальная группа: {globalGroupLabel}
+          </span>
         ) : null}
       </section>
 

@@ -100,6 +100,12 @@ class Settings(BaseModel):
     # user clicks "Распознать".
     recognize_immediately: bool = True
 
+    # Очередь выполняет задачи в порядке добавления; сколько из них может
+    # работать одновременно — эта настройка.  По умолчанию 1: строго по
+    # очереди.  Больше 1 имеет смысл на быстрых CPU (каждая задача держит
+    # свой ASR-воркер).
+    max_concurrent_jobs: int = Field(default=1, ge=1, le=4)
+
     @model_validator(mode="after")
     def _migrate_legacy_diarization_path(self) -> Settings:
         """Old configs only had ``diarize_model_path``; keep them working."""

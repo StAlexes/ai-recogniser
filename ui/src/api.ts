@@ -47,6 +47,7 @@ export interface Settings {
   diarize_model_path: string;
   diarize_profile: string;
   recognize_immediately: boolean;
+  max_concurrent_jobs: number;
   rag_enabled: boolean;
   rag_url: string;
   rag_k: number;

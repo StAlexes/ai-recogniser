@@ -118,3 +118,24 @@ def show_queued_toast(
     return _show_toast_xml(
         _queued_toast_xml(filenames, count), "queued files"
     )
+
+
+def _tray_hint_toast_xml() -> str:
+    """Свернули в трей: клик по уведомлению открывает окно обратно.
+
+    ``launch`` с ``activationType="protocol"`` — весь тост кликабелен, а не
+    только кнопки (кнопок здесь нет вовсе).
+    """
+    return """<toast launch="airec://open" activationType="protocol">
+  <visual>
+    <binding template="ToastGeneric">
+      <text>AI Recogniser</text>
+      <text>Приложение продолжает работать в трее</text>
+    </binding>
+  </visual>
+</toast>"""
+
+
+def show_tray_hint_toast() -> bool:
+    """Clickable «works in tray» hint. Click restores the window. Never raises."""
+    return _show_toast_xml(_tray_hint_toast_xml(), "tray hint")

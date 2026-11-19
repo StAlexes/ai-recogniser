@@ -23,6 +23,9 @@ def put_settings(payload: Settings, request: Request) -> Settings:
     previous = request.app.state.settings
     save_settings(paths.config_file, payload)
     request.app.state.settings = payload
+    if previous.max_concurrent_jobs != payload.max_concurrent_jobs:
+        # Лимит очереди изменился: свободные слоты можно занять прямо сейчас.
+        request.app.state.jobs.dispatch_queue()
     if previous.context_menu_enabled != payload.context_menu_enabled:
         from airec.integrations.windows import (
             register_context_menu,

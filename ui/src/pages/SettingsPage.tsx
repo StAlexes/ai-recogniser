@@ -563,6 +563,31 @@ export function SettingsPage({
 
               <div className="settings-row">
                 <div className="settings-row-text">
+                  <span className="settings-label">Одновременно выполняемых задач</span>
+                  <span className="settings-hint">
+                    Очередь запускает задачи по порядку; это число — сколько из них
+                    может работать в один момент (1 — строго по очереди).
+                  </span>
+                </div>
+                <div className="settings-control settings-control-rag-k">
+                  <Input
+                    type="number"
+                    min={1}
+                    max={4}
+                    aria-label="Одновременно выполняемых задач"
+                    value={String(settings.max_concurrent_jobs)}
+                    onChange={(_event, data) => {
+                      const parsed = Number.parseInt(data.value, 10);
+                      if (Number.isFinite(parsed)) {
+                        update({ max_concurrent_jobs: Math.min(4, Math.max(1, parsed)) });
+                      }
+                    }}
+                  />
+                </div>
+              </div>
+
+              <div className="settings-row">
+                <div className="settings-row-text">
                   <span className="settings-label">
                     Пункт «Распознать в AI Recogniser» в контекстном меню
                   </span>

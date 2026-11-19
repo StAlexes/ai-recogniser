@@ -132,7 +132,9 @@ def handle_protocol_uri(paths: AppPaths, uri: str) -> tuple[str | None, bool]:
     """Parse ``airec://result/<id>`` / ``airec://folder/<id>``.
 
     Returns ``(job_id, handled)``.  Folder requests are handled immediately
-    (Explorer opens even when the app is not running).
+    (Explorer opens even when the app is not running).  Ссылка без задачи
+    (``airec://open`` — клик по уведомлению о сворачивании в трей) просто
+    поднимает окно уже запущенного приложения.
     """
     parsed = urlsplit(uri)
     if parsed.scheme != "airec":
@@ -140,12 +142,15 @@ def handle_protocol_uri(paths: AppPaths, uri: str) -> tuple[str | None, bool]:
         return None, False
     action = parsed.netloc.lower()
     job_id = parsed.path.strip("/").split("/")[0]
-    if not job_id:
-        LOG.warning("protocol URI has no job id: %s", uri)
-        return None, False
     if action == "folder":
+        if not job_id:
+            LOG.warning("protocol URI has no job id: %s", uri)
+            return None, False
         return job_id, open_result_folder(paths, job_id)
     if action in {"result", "open", "job"}:
+        if not job_id:
+            activate_existing_window()
+            return None, True
         request_navigation(paths, job_id)
         return job_id, False
     LOG.warning("unknown protocol action %r in %s", action, uri)
@@ -1007,7 +1012,12 @@ class ShellApp:
             self.window.hide()
         if not self._tray_hint_shown:
             self._tray_hint_shown = True
-            self.tray.notify("Приложение продолжает работать в трее")
+            # Кликабельный тост вместо шарика pystray: клик по нему
+            # открывает окно обратно (airec://open -> activate_existing_window).
+            from airec.notify.windows_toast import show_tray_hint_toast
+
+            if not show_tray_hint_toast():
+                self.tray.notify("Приложение продолжает работать в трее")
         return False
 
     def request_quit(self) -> None:

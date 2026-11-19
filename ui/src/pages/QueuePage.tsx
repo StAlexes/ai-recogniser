@@ -9,7 +9,6 @@ import {
   Spinner,
 } from '@fluentui/react-components';
 import {
-  AddRegular,
   DismissRegular,
   FolderOpenRegular,
   HistoryRegular,
@@ -434,9 +433,6 @@ export function QueuePage({ onAuthError, onOpenJob }: QueuePageProps) {
         subtitle="Локальное распознавание аудио и видео"
         actions={
           <div className="queue-actions">
-            <Button icon={<AddRegular />} onClick={openPicker} disabled={uploading}>
-              Добавить файлы
-            </Button>
             {!recognizeImmediately || files.length > 0 ? (
               <Button
                 appearance="primary"
@@ -593,6 +589,9 @@ export function QueuePage({ onAuthError, onOpenJob }: QueuePageProps) {
                       <span className="job-meta">
                         {formatDate(job.created_at)} · {job.audio_format.toUpperCase()} ·{' '}
                         {formatBytes(job.size_bytes)}
+                        {job.duration_s !== null
+                          ? ` · аудио ${formatDuration(job.duration_s)}`
+                          : ''}
                         {job.status !== 'queued' ? ` · время выполнения: ${elapsed}` : ''}
                         {job.status !== 'queued' ? ` · ${percent}%` : ''}
                       </span>
@@ -603,9 +602,24 @@ export function QueuePage({ onAuthError, onOpenJob }: QueuePageProps) {
                   </button>
 
                   <div className="job-stages" aria-label={`Этапы задачи ${job.filename}`}>
-                    <StageProgress name="recognition" stage={job.stages.recognition} now={now} />
-                    <StageProgress name="diarization" stage={job.stages.diarization} now={now} />
-                    <StageProgress name="summary" stage={job.stages.summary} now={now} />
+                    <StageProgress
+                      name="recognition"
+                      stage={job.stages.recognition}
+                      now={now}
+                      showElapsed={false}
+                    />
+                    <StageProgress
+                      name="diarization"
+                      stage={job.stages.diarization}
+                      now={now}
+                      showElapsed={false}
+                    />
+                    <StageProgress
+                      name="summary"
+                      stage={job.stages.summary}
+                      now={now}
+                      showElapsed={false}
+                    />
                   </div>
 
                   <div className="job-actions">

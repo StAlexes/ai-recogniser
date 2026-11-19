@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -28,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from airec.asr import ffmpeg_runtime
-from airec.asr.audio import SUPPORTED_EXTENSIONS, AudioError
+from airec.asr.audio import SUPPORTED_EXTENSIONS, AudioError, wav_duration
 from airec.asr.diarization import DiarizationCancelled, DiarizationError
 from airec.asr.diarization_profiles import (
     DiarizationProfiles,
@@ -60,6 +61,8 @@ log = logging.getLogger(__name__)
 JOB_SCHEMA = 1
 MAX_INPUT_BYTES = 4 * 1024 * 1024 * 1024
 ACTIVE_STATUSES = {"queued", "running"}
+# subprocess без мигающего окна консоли (Windows).
+CREATE_NO_WINDOW = 0x08000000
 # Side-car отчёт режима проверки спикеров (data/results/<id>/…).
 REVIEW_FILE_NAME = "diarization_review.json"
 REVIEW_VERSION = 1
@@ -268,7 +271,10 @@ class JobManager:
         self._stage_events: dict[tuple[str, str], threading.Event] = {}
         self._run_seq = 0
         self._lock = threading.RLock()
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="airec-asr")
+        # Один пул на распознавание и диаризацию; сколько задач реально
+        # выполняется одновременно, решает диспетчер очереди
+        # (настройка ``max_concurrent_jobs``), а не размер пула.
+        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="airec-asr")
         self._summary_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="airec-summary"
         )
@@ -368,9 +374,22 @@ class JobManager:
         token = self._run_seq
         self._run_tokens[job_id] = token
         self._cancel_events[job_id] = threading.Event()
-        future = self._executor.submit(self._run, job_id, source, work_dir, token)
+        future = self._executor.submit(
+            self._run_and_dispatch, job_id, source, work_dir, token
+        )
         self._futures[job_id] = future
         return future
+
+    def _run_and_dispatch(
+        self, job_id: str, source: Path, work_dir: Path, token: int
+    ) -> None:
+        """Run the job, then let the queue fill the freed slot."""
+        try:
+            self._run(job_id, source, work_dir, token)
+        finally:
+            with self._lock:
+                self._futures.pop(job_id, None)
+            self.dispatch_queue()
 
     def _token_current(self, job_id: str, token: int) -> bool:
         return self._run_tokens.get(job_id) == token
@@ -571,7 +590,7 @@ class JobManager:
             job = self._jobs.get(job_id)
             if job is None:
                 return
-            if token is not None and not self._token_current(job_id, token):
+            if token is not None and not self._stage_token_current(job_id, stage, token):
                 return
             self._set_stage(
                 job,
@@ -836,15 +855,101 @@ class JobManager:
                 self._persist(job)
             except OSError:
                 log.exception("cannot persist new job %s", job.id)
-            if not job.paused:
-                self._begin_run(job.id, source, work_dir)
+        if not job.paused:
+            # Задача встаёт в общую очередь: диспетчер запустит её, когда
+            # освободится слот (настройка ``max_concurrent_jobs``).
+            self.dispatch_queue()
+        # Длительность известна почти сразу (заголовок WAV или ffmpeg-метаданные),
+        # а не только после распознавания — щупаем в фоне, чтобы не тормозить add.
+        threading.Thread(
+            target=self._probe_duration,
+            args=(job.id, source),
+            daemon=True,
+            name=f"duration-{job.id}",
+        ).start()
         return job
+
+    def _probe_duration(self, job_id: str, source: Path) -> None:
+        """Заполнить ``duration_s`` сразу после добавления файла.
+
+        WAV — из заголовка, остальное — из метаданных ffmpeg (быстрое чтение,
+        без конвертации).  Фон в фоне: неудача или недоступный ffmpeg не
+        ломают добавление — длительность появится после распознавания, как
+        раньше.
+        """
+        duration = None
+        if source.suffix.lower() == ".wav":
+            duration = wav_duration(source)
+        if duration is None:
+            duration = self._probe_duration_ffmpeg(source)
+        if duration is None or duration <= 0:
+            return
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.duration_s is not None:
+                return
+            job.duration_s = round(duration, 3)
+            try:
+                self._persist(job)
+            except OSError:
+                log.exception("cannot persist duration for %s", job_id)
+
+    def _probe_duration_ffmpeg(self, source: Path) -> float | None:
+        """Длительность из метаданных ffmpeg (``Duration: HH:MM:SS.ms``)."""
+        found = ffmpeg_runtime.find_ffmpeg(self._paths)
+        if found is None:
+            return None
+        try:
+            completed = subprocess.run(
+                [
+                    str(found),
+                    "-nostdin",
+                    "-hide_banner",
+                    "-i",
+                    str(source),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                creationflags=CREATE_NO_WINDOW,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            log.warning("cannot probe duration of %s", source, exc_info=True)
+            return None
+        match = re.search(
+            r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)",
+            completed.stderr.decode("utf-8", errors="replace"),
+        )
+        if match is None:
+            return None
+        hours, minutes, seconds = match.groups()
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+    def _prepare_run_source(self, job: Job) -> tuple[Path, Path]:
+        """Вернуть ``(исходник, рабочая папка)`` для запуска задачи."""
+        work_dir = self._paths.temp / "jobs" / job.id
+        work_dir.mkdir(parents=True, exist_ok=True)
+        candidates = [path for path in work_dir.glob("input.*") if path.is_file()]
+        if candidates:
+            return candidates[0], work_dir
+        stored = self._stored_source(job)
+        if stored is None:
+            hint = job.original_path or job.filename
+            raise FileNotFoundError(
+                f"Исходный файл перемещён или удалён: {hint}. "
+                "Добавьте файл в очередь заново."
+            )
+        source = work_dir / f"input{stored.suffix}"
+        shutil.copy2(stored, source)
+        return source, work_dir
 
     def start(self, job_id: str) -> Job:
         """Start a job that was queued but not auto-started.
 
         Jobs are paused when ``recognize_immediately`` is disabled.  Calling
-        this for a job that is already scheduled is a no-op.
+        this for a job that is already scheduled is a no-op.  Задача встаёт
+        в общую очередь: слот освобождается — диспетчер её запускает.
         """
         with self._lock:
             job = self._jobs.get(job_id) or self.get(job_id)
@@ -857,31 +962,79 @@ class JobManager:
             if not job.paused:
                 return job
 
-            work_dir = self._paths.temp / "jobs" / job_id
-            work_dir.mkdir(parents=True, exist_ok=True)
-            candidates = [path for path in work_dir.glob("input.*") if path.is_file()]
-            if candidates:
-                source = candidates[0]
-            else:
-                stored = self._stored_source(job)
-                if stored is None:
-                    hint = job.original_path or job.filename
-                    raise FileNotFoundError(
-                        f"Исходный файл перемещён или удалён: {hint}. "
-                        "Добавьте файл в очередь заново."
-                    )
-                source = work_dir / f"input{stored.suffix}"
-                shutil.copy2(stored, source)
-
+            # Подготовка здесь — и валидация (нет исходника — понятная ошибка),
+            # и прогрев: диспетчер найдёт уже скопированный input.* и не будет
+            # копировать файл второй раз.
+            self._prepare_run_source(job)
             job.paused = False
             job.phase = "В очереди"
             try:
                 self._persist(job)
             except OSError:
                 log.exception("cannot persist started job %s", job.id)
-            self._begin_run(job.id, source, work_dir)
-            log.info("job %s started manually", job_id)
-            return job
+        self.dispatch_queue()
+        log.info("job %s started manually", job_id)
+        return job
+
+    def dispatch_queue(self) -> None:
+        """Запустить ожидающие задачи в порядке очереди в пределах лимита.
+
+        Лимит — настройка ``max_concurrent_jobs`` (по умолчанию 1: задачи
+        выполняются строго по одной).  Занятый слот — задача со статусом
+        ``running`` либо уже поставленная воркеру (future в ``_futures``):
+        между постановкой и стартом воркера статус ещё ``queued``.
+        """
+        try:
+            limit = max(1, int(self._settings().max_concurrent_jobs))
+        except Exception:  # settings provider is user code; never break the queue
+            log.exception("cannot read max_concurrent_jobs; assuming 1")
+            limit = 1
+        started = 0
+        while True:
+            with self._lock:
+                busy = sum(
+                    1
+                    for job_id, job in self._jobs.items()
+                    if job.status == "running"
+                    or (
+                        job.status == "queued"
+                        and not job.paused
+                        and job_id in self._futures
+                    )
+                )
+                if busy >= limit:
+                    break
+                job = min(
+                    (
+                        item
+                        for item in self._jobs.values()
+                        if item.status == "queued"
+                        and not item.paused
+                        and item.id not in self._futures
+                    ),
+                    key=lambda item: (item.created_at, item.id),
+                    default=None,
+                )
+                if job is None:
+                    break
+                try:
+                    source, work_dir = self._prepare_run_source(job)
+                except Exception as exc:
+                    log.exception("cannot prepare source for %s", job.id)
+                    job.status = "error"
+                    job.phase = "Ошибка"
+                    job.error = str(exc)
+                    job.finished_at = utc_now()
+                    try:
+                        self._persist(job)
+                    except OSError:
+                        log.exception("cannot persist failed job %s", job.id)
+                    continue
+                job.paused = False
+                self._begin_run(job.id, source, work_dir)
+            started += 1
+        if started:
+            log.info("queue dispatched %d job(s) (limit %d)", started, limit)
 
     # ------------------------------------------------------------------ #
     # Cancel / retry
@@ -945,6 +1098,8 @@ class JobManager:
                 for work_dir in jobs_temp.glob(f"{job_id}*"):
                     if work_dir.is_dir():
                         self._cleanup_source(work_dir)
+        # Слот освободился — очередь продолжает работу.
+        self.dispatch_queue()
 
     def retry(self, job_id: str) -> Job:
         """Restart the *same* task after an error or cancellation.
@@ -1918,7 +2073,7 @@ class JobManager:
             job.phase = "В очереди"
             job.started_at = None
             job.finished_at = None
-            job.duration_s = None
+            # duration_s не сбрасываем: файл тот же, длительность уже известна.
             job.elapsed_s = None
             job.rtf = None
             job.text = ""

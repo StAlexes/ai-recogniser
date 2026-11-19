@@ -946,3 +946,141 @@ def test_stage_action_endpoint(tmp_path: Path) -> None:
             time.sleep(0.02)
         assert detail["stages"]["summary"]["status"] == "done", detail
         assert detail["summary"]["tl_dr"] == f"Саммари для {job_id}"
+
+
+def test_update_stage_accepts_stage_token(tmp_path: Path) -> None:
+    """Промежуточные проценты этапов доходят до stages.
+
+    Раньше ``_update_stage`` сверял токен этапа с токеном ЗАДАЧИ и молча
+    отбрасывал все тики прогресса диаризации/саммаризации — на экране
+    оставались только 2% и 100%.
+    """
+    paths = paths_for(tmp_path)
+    manager = JobManager(
+        paths, lambda: Settings(recognize_immediately=False), transcriber=fake_transcriber
+    )
+    upload = tmp_path / "meeting.wav"
+    upload.write_bytes(b"RIFF....WAVEfmt ")
+    job = manager.submit(upload, "meeting.wav", "gigaam-v3-e2e-ctc")
+
+    token = manager._new_stage_token(job.id, "diarization")
+    manager._update_stage(
+        job.id,
+        "diarization",
+        status="running",
+        progress=0.45,
+        phase="Эмбеддинги спикеров",
+        token=token,
+    )
+    stage = manager.get(job.id).stages["diarization"]
+    assert stage["progress"] == 0.45
+    assert stage["phase"] == "Эмбеддинги спикеров"
+    manager.shutdown()
+
+
+def test_queue_runs_one_job_at_a_time(tmp_path: Path) -> None:
+    """Очередь — очередь: вторая задача ждёт freed слота (лимит 1 по умолчанию)."""
+    paths = paths_for(tmp_path)
+    gate = threading.Event()
+    lock = threading.Lock()
+    running: list[str] = []
+
+    def gating_transcriber(source: Path, **kwargs: object) -> TranscriptionResult:
+        with lock:
+            running.append(source.parent.name)
+        gate.wait(5)
+        with lock:
+            running.remove(source.parent.name)
+        return TranscriptionResult(
+            text="ок", model_id="m", duration_s=1.0, elapsed_s=0.1, rtf=1.0
+        )
+
+    manager = JobManager(paths, lambda: Settings(), transcriber=gating_transcriber)
+    a = tmp_path / "a.wav"
+    a.write_bytes(b"RIFF....WAVEfmt ")
+    b = tmp_path / "b.wav"
+    b.write_bytes(b"RIFF....WAVEfmt ")
+    job_a = manager.submit(a, "a.wav", "m", move_uploaded=False)
+    job_b = manager.submit(b, "b.wav", "m", move_uploaded=False)
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not running:
+        time.sleep(0.02)
+    assert running == [job_a.id], running
+    # Вторая задача уже разобрана диспетчером, но ждёт свободного слота.
+    assert manager.get(job_a.id).status == "running"
+    assert manager.get(job_b.id).status == "queued"
+    assert manager.get(job_b.id).paused is False
+
+    gate.set()
+    wait_done(manager, job_a.id)
+    wait_done(manager, job_b.id)
+    manager.shutdown()
+
+
+def test_queue_respects_concurrency_setting(tmp_path: Path) -> None:
+    """Лимит из настроек: две задачи идут параллельно при max_concurrent_jobs=2."""
+    paths = paths_for(tmp_path)
+    gate = threading.Event()
+    lock = threading.Lock()
+    running: list[str] = []
+
+    def gating_transcriber(source: Path, **kwargs: object) -> TranscriptionResult:
+        with lock:
+            running.append(source.parent.name)
+        gate.wait(5)
+        with lock:
+            running.remove(source.parent.name)
+        return TranscriptionResult(
+            text="ок", model_id="m", duration_s=1.0, elapsed_s=0.1, rtf=1.0
+        )
+
+    manager = JobManager(
+        paths, lambda: Settings(max_concurrent_jobs=2), transcriber=gating_transcriber
+    )
+    a = tmp_path / "a.wav"
+    a.write_bytes(b"RIFF....WAVEfmt ")
+    b = tmp_path / "b.wav"
+    b.write_bytes(b"RIFF....WAVEfmt ")
+    job_a = manager.submit(a, "a.wav", "m", move_uploaded=False)
+    job_b = manager.submit(b, "b.wav", "m", move_uploaded=False)
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and len(running) < 2:
+        time.sleep(0.02)
+    assert sorted(running) == sorted([job_a.id, job_b.id]), running
+
+    gate.set()
+    wait_done(manager, job_a.id)
+    wait_done(manager, job_b.id)
+    manager.shutdown()
+
+
+def test_duration_known_before_recognition(tmp_path: Path) -> None:
+    """Длительность WAV читается из заголовка при добавлении, а не после прогона."""
+    paths = paths_for(tmp_path)
+    manager = JobManager(
+        paths, lambda: Settings(recognize_immediately=False), transcriber=fake_transcriber
+    )
+    import wave as wave_mod
+
+    wav = tmp_path / "tone.wav"
+    with wave_mod.open(str(wav), "wb") as fh:
+        fh.setnchannels(1)
+        fh.setsampwidth(2)
+        fh.setframerate(8000)
+        fh.writeframes(b"\x00\x00" * 8000)  # ровно 1 секунда
+    job = manager.submit(wav, "tone.wav", "m", move_uploaded=False)
+
+    deadline = time.monotonic() + 5
+    current = manager.get(job.id)
+    while time.monotonic() < deadline:
+        current = manager.get(job.id)
+        if current.duration_s is not None:
+            break
+        time.sleep(0.02)
+    assert current.duration_s is not None
+    assert abs(current.duration_s - 1.0) < 0.05
+    # Задача по-прежнему ждёт запуска: проб длительности ничего не стартовал.
+    assert current.status == "queued"
+    manager.shutdown()

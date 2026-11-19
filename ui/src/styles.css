@@ -931,13 +931,13 @@ textarea {
   padding: 0;
 }
 
-/* Группа параметров диаризации вынесена из карточки этапа в тулбар. */
-.job-profile-row {
+/* Группа параметров диаризации — в одном ряду с кнопками тулбара. */
+.job-profile-inline {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
+  margin-left: 4px;
 }
 
 .job-profile-label {
@@ -946,13 +946,13 @@ textarea {
   white-space: nowrap;
 }
 
-.job-profile-row .fui-Dropdown {
-  width: 260px;
+.job-profile-inline .fui-Dropdown {
+  width: 250px;
   min-width: 0;
   max-width: 100%;
 }
 
-.job-profile-row .fui-Dropdown__button {
+.job-profile-inline .fui-Dropdown__button {
   grid-template-columns: '[content] minmax(0, 1fr) [icon] auto [end]';
   overflow: hidden;
   white-space: nowrap;
